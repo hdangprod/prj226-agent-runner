@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunState",
+  "description": "Lifecycle state snapshot for an active or completed orchestration run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "state",
+    "updated_at",
+    "last_event",
+    "stop_reason"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "CREATED",
+        "BASELINE_VERIFIED",
+        "PLANNING_RUNNING",
+        "PLANNING_COMPLETE",
+        "PLAN_REVIEW_RUNNING",
+        "PLAN_READY",
+        "HUMAN_GATE",
+        "DISPATCH_READY",
+        "BUILDER_RUNNING",
+        "CANDIDATE_FROZEN",
+        "DETERMINISTIC_GATES",
+        "DV_RUNNING",
+        "DV_PASS",
+        "SOS_RUNNING",
+        "SOS_PASS",
+        "ACCEPTANCE_READY",
+        "STOPPED"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_event": {
+      "type": "string"
+    },
+    "stop_reason": {
+      "type": ["string", "null"]
+    }
+  }
+}

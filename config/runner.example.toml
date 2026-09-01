@@ -1,0 +1,37 @@
+# Example configuration for prj226-agent-runner
+# Readable via standard-library tomllib in Python >= 3.12
+
+[runner]
+runs_dir = "runs"
+
+[target]
+repo = "/Users/dangnguyen/Desktop/prj226-gen2"
+canonical_branch = "foundation/product-foundation"
+
+# Expected baseline values used for verification before dispatch.
+# Future execution MUST independently verify these against actual Git state.
+[expected_baseline]
+head = "c838e8fad91571a75152ddc7f3e8b4984ae2c92f"
+tree = "6cde18be3bbeb1df62f4e907c2984aeab2c4f7cf"
+
+[tools]
+codex = "/usr/local/bin/codex"
+antigravity = "agy"
+opencode = "opencode"
+
+[models]
+planner = "gemini-pro"
+builder = "gemini-pro"
+verifier = "gemini-pro"
+sos = "gemini-pro"
+
+[timeouts]
+planner = 300
+builder = 600
+verifier = 300
+sos = 300
+
+[permissions]
+push = false
+destructive_git = false
+auto_repair = false

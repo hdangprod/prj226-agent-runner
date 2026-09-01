@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BuilderResult",
+  "description": "Structured output contract produced by the Builder agent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "task",
+    "result",
+    "base_sha",
+    "candidate_sha",
+    "candidate_tree",
+    "changed_paths",
+    "tests",
+    "blockers"
+  ],
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": ["builder"]
+    },
+    "task": {
+      "type": "string"
+    },
+    "result": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED", "BLOCKED"]
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "candidate_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "candidate_tree": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "changed_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "SKIP"] },
+          "output": { "type": "string" }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

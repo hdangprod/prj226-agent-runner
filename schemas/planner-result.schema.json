@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlannerResult",
+  "description": "Structured output contract produced by the Planner agent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "task",
+    "result",
+    "authority",
+    "production_change",
+    "migration",
+    "blockers",
+    "recommended_next_state"
+  ],
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": ["planner"]
+    },
+    "task": {
+      "type": "string"
+    },
+    "result": {
+      "type": "string",
+      "enum": ["READY", "NOT_READY", "ERROR"]
+    },
+    "authority": {
+      "type": "string"
+    },
+    "production_change": {
+      "type": "boolean"
+    },
+    "migration": {
+      "type": "boolean"
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_next_state": {
+      "type": "string"
+    }
+  }
+}

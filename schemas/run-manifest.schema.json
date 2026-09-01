@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunManifest",
+  "description": "Immutable identity and configuration snapshot for an orchestration run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "task",
+    "created_at",
+    "runner_version",
+    "repo_path",
+    "canonical_branch",
+    "expected_head",
+    "expected_tree",
+    "phase",
+    "agents"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "pattern": "^run-[0-9a-zA-Z_-]+$"
+    },
+    "task": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "runner_version": {
+      "type": "string"
+    },
+    "repo_path": {
+      "type": "string"
+    },
+    "canonical_branch": {
+      "type": "string"
+    },
+    "expected_head": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "expected_tree": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "phase": {
+      "type": "string"
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool", "model"],
+        "properties": {
+          "tool": { "type": "string" },
+          "model": { "type": "string" },
+          "timeout_seconds": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

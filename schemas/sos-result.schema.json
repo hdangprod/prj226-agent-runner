@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SosResult",
+  "description": "Structured output contract produced by the Security/Operability/Semantic (SOS) Reviewer",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "task",
+    "candidate_sha",
+    "result",
+    "security",
+    "operability",
+    "semantics",
+    "blocking_findings",
+    "non_blocking_findings"
+  ],
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": ["sos-reviewer"]
+    },
+    "task": {
+      "type": "string"
+    },
+    "candidate_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "result": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "BLOCKED"]
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": { "type": "string", "enum": ["PASS", "FAIL", "NEEDS_REVIEW"] },
+        "summary": { "type": "string" }
+      }
+    },
+    "operability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": { "type": "string", "enum": ["PASS", "FAIL", "NEEDS_REVIEW"] },
+        "summary": { "type": "string" }
+      }
+    },
+    "semantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": { "type": "string", "enum": ["PASS", "FAIL", "NEEDS_REVIEW"] },
+        "summary": { "type": "string" }
+      }
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "non_blocking_findings": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
