@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CalibrationResult",
+  "description": "Normalized contract produced by the runner after executing an agent CLI calibration test",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "calibration_id",
+    "tool",
+    "executable_path",
+    "version",
+    "working_dir",
+    "status",
+    "error_class",
+    "timed_out",
+    "duration_ms",
+    "structured_output_valid"
+  ],
+  "properties": {
+    "calibration_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool": {
+      "type": "string",
+      "enum": ["codex", "agy", "opencode2", "mock"]
+    },
+    "executable_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "type": ["string", "null"]
+    },
+    "working_dir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "TASK_FAILURE",
+        "TOOL_FAILURE",
+        "TIMEOUT",
+        "OUTPUT_INVALID",
+        "PERMISSION_DENIED"
+      ]
+    },
+    "error_class": {
+      "type": ["string", "null"],
+      "enum": [
+        "ENVIRONMENT_ERROR",
+        "AGENT_EXECUTION_ERROR",
+        "ARTIFACT_VALIDATION_ERROR",
+        "IMPLEMENTATION_FAILURE",
+        "GOVERNANCE_BLOCKER",
+        null
+      ]
+    },
+    "exit_code": {
+      "type": ["integer", "null"]
+    },
+    "timed_out": {
+      "type": "boolean"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "structured_output_valid": {
+      "type": "boolean"
+    },
+    "extracted_payload": {
+      "type": ["object", "null"]
+    },
+    "stdout_artifact": {
+      "type": ["string", "null"]
+    },
+    "stderr_artifact": {
+      "type": ["string", "null"]
+    }
+  }
+}
