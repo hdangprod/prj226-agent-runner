@@ -67,16 +67,17 @@ def map_status_to_error_class(
     """
     Deterministically map operational CalibrationStatus to runner ErrorClass.
 
-    Returns None if status is PASS.
+    If an unexpected prohibited mutation occurs, GOVERNANCE_BLOCKER is returned unconditionally.
+    Returns None only for PASS when no unexpected mutation occurred.
     """
+    if is_unexpected_mutation:
+        return ErrorClass.GOVERNANCE_BLOCKER
+
     if status == CalibrationStatus.PASS:
         return None
 
     if is_missing_binary:
         return ErrorClass.ENVIRONMENT_ERROR
-
-    if is_unexpected_mutation:
-        return ErrorClass.GOVERNANCE_BLOCKER
 
     match status:
         case CalibrationStatus.TIMEOUT:
@@ -130,18 +131,25 @@ def hash_directory_tree(directory_path: Path | str) -> str:
     """
     Compute a deterministic SHA-256 tree hash of all files within a directory.
 
-    Files are sorted by relative path and hashed deterministically.
+    Traversal ordering sorts explicitly by normalized relative path.
+    Hash identity depends strictly on relative path and file bytes, independent
+    of absolute root, mtime, or filesystem directory traversal order.
     """
     root = Path(directory_path).resolve()
     if not root.exists():
         raise FileNotFoundError(f"Directory not found for hashing: {root}")
 
     hasher = hashlib.sha256()
-    files = sorted([p for p in root.rglob("*") if p.is_file()])
+    # Collect all regular files and sort strictly by relative path string
+    file_rel_pairs = [
+        (str(p.relative_to(root).as_posix()), p)
+        for p in root.rglob("*")
+        if p.is_file()
+    ]
+    file_rel_pairs.sort(key=lambda pair: pair[0])
 
-    for file_path in files:
-        rel_path_bytes = str(file_path.relative_to(root)).encode("utf-8")
-        hasher.update(rel_path_bytes)
+    for rel_path_str, file_path in file_rel_pairs:
+        hasher.update(rel_path_str.encode("utf-8"))
         with open(file_path, "rb") as f:
             while chunk := f.read(65536):
                 hasher.update(chunk)
@@ -160,7 +168,8 @@ def run_calibration_subprocess(
     """
     Execute a child CLI process within an isolated process group.
 
-    Handles graceful SIGTERM + SIGKILL process-group cleanup on timeout.
+    Handles graceful SIGTERM + SIGKILL process-group cleanup on timeout,
+    ensuring bounded wait and complete reaping of the spawned child process.
     Streams stdout and stderr directly to disk files.
     Returns (exit_code, timed_out, duration_ms).
     """
@@ -185,31 +194,56 @@ def run_calibration_subprocess(
             start_new_session=True,
         )
 
+        spawned_pid = proc.pid
+
         try:
             exit_code = proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
+            # Safely identify the process group created for the spawned child
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                pgid = os.getpgid(spawned_pid)
+                # Verify pgid corresponds to child session before signaling group
+                if pgid == spawned_pid:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    proc.terminate()
             except ProcessLookupError:
                 pass
+            except Exception:
+                proc.terminate()
 
+            # Bounded grace period for graceful termination
             grace_start = time.monotonic()
             while time.monotonic() - grace_start < 2.0:
-                if proc.poll() is not None:
+                try:
+                    exit_code = proc.wait(timeout=0.05)
                     break
-                time.sleep(0.05)
+                except subprocess.TimeoutExpired:
+                    pass
 
+            # Force kill process group if child is still alive
             if proc.poll() is None:
                 try:
-                    pgid = os.getpgid(proc.pid)
-                    os.killpg(pgid, signal.SIGKILL)
+                    pgid = os.getpgid(spawned_pid)
+                    if pgid == spawned_pid:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                 except ProcessLookupError:
                     pass
-                proc.poll()
+                except Exception:
+                    proc.kill()
 
-            exit_code = proc.returncode
+                # Bounded wait to reap child process
+                try:
+                    exit_code = proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    # Final poll fallback
+                    proc.poll()
+                    exit_code = proc.returncode
+            else:
+                exit_code = proc.returncode
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
     return exit_code, timed_out, duration_ms
@@ -257,31 +291,55 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
     """
     Parse OpenCode event stream and extract the terminal/final response payload.
 
+    Safely parses JSONL, recognizes only explicitly supported terminal payload forms,
+    ignores recognized non-terminal/intermediate events (e.g. init, step, thought),
+    and rejects malformed JSON, empty streams, init-only streams, or streams with no
+    recognized terminal payload.
+
     Raises ValueError if event stream is malformed or contains no terminal payload.
     """
-    lines = [line.strip() for line in raw_json_events.strip().splitlines() if line.strip()]
-    if not lines:
+    stripped = raw_json_events.strip()
+    if not stripped:
         raise ValueError("OpenCode output is empty")
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("OpenCode output contains no non-empty lines")
 
     terminal_payload: dict[str, Any] | None = None
 
     for line in lines:
-        event = json.loads(line)
-        if isinstance(event, dict):
-            # Check for terminal event or response message
-            if event.get("type") == "message" or event.get("event") == "message":
-                payload = event.get("data") or event.get("message") or event.get("payload") or event
-                if isinstance(payload, dict):
-                    terminal_payload = payload
-            elif "payload" in event and isinstance(event["payload"], dict):
-                terminal_payload = event["payload"]
-            elif "data" in event and isinstance(event["data"], dict):
-                terminal_payload = event["data"]
-            else:
-                terminal_payload = event
+        try:
+            event = json.loads(line)
+        except Exception as e:
+            raise ValueError(f"OpenCode output contains malformed JSON line: {line}") from e
+
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("type") or event.get("event")
+
+        # Explicitly supported terminal / final response message formats
+        if event_type == "message":
+            # Candidate payload forms under message event
+            candidate = event.get("data") if "data" in event else (
+                event.get("message") if "message" in event else event.get("payload")
+            )
+            if isinstance(candidate, dict):
+                terminal_payload = candidate
+            elif candidate is None and isinstance(event, dict):
+                # If message event itself has direct payload fields
+                payload_subset = {k: v for k, v in event.items() if k not in ("type", "event")}
+                if payload_subset:
+                    terminal_payload = payload_subset
+        elif "payload" in event and isinstance(event["payload"], dict):
+            # Direct payload wrapper
+            terminal_payload = event["payload"]
+        elif "data" in event and isinstance(event["data"], dict) and event_type in ("final_response", "result", "terminal"):
+            terminal_payload = event["data"]
 
     if terminal_payload is None:
-        raise ValueError("No terminal message event found in OpenCode event stream")
+        raise ValueError("No recognized terminal response payload found in OpenCode event stream")
 
     return terminal_payload
 
@@ -290,7 +348,8 @@ def validate_calibration_result(result: CalibrationResult) -> None:
     """
     Programmatically validate CalibrationResult invariants using Python standard library.
 
-    Enforces required non-empty fields, enum memberships, duration bounds, and state consistency.
+    Enforces required non-empty fields, enum memberships, duration bounds, state consistency,
+    and valid artifact path representations.
     Raises ValueError on validation failure.
     """
     if not isinstance(result.calibration_id, str) or not result.calibration_id.strip():
@@ -311,14 +370,31 @@ def validate_calibration_result(result: CalibrationResult) -> None:
     if not isinstance(result.status, CalibrationStatus):
         raise ValueError(f"Invalid status: {result.status}")
 
-    if result.duration_ms < 0:
-        raise ValueError(f"duration_ms cannot be negative: {result.duration_ms}")
+    if not isinstance(result.duration_ms, int) or result.duration_ms < 0:
+        raise ValueError(f"duration_ms must be a non-negative integer: {result.duration_ms}")
+
+    if result.stdout_artifact is not None:
+        if not isinstance(result.stdout_artifact, str) or not result.stdout_artifact.strip():
+            raise ValueError("stdout_artifact must be a non-empty string when present")
+
+    if result.stderr_artifact is not None:
+        if not isinstance(result.stderr_artifact, str) or not result.stderr_artifact.strip():
+            raise ValueError("stderr_artifact must be a non-empty string when present")
+
+    if result.model is not None:
+        if not isinstance(result.model, str) or not result.model.strip():
+            raise ValueError("model must be a non-empty string when present")
+
+    if result.exit_code is not None and not isinstance(result.exit_code, int):
+        raise ValueError("exit_code must be an integer when present")
 
     if result.status == CalibrationStatus.PASS:
         if result.error_class is not None:
             raise ValueError(f"PASS status must have error_class=None, got {result.error_class}")
         if result.timed_out:
             raise ValueError("PASS status cannot have timed_out=True")
+        if result.exit_code is not None and result.exit_code != 0:
+            raise ValueError(f"PASS status cannot have non-zero exit_code: {result.exit_code}")
     else:
         if result.error_class is None:
             raise ValueError(f"Non-PASS status ({result.status}) must specify error_class")
@@ -341,22 +417,40 @@ def serialize_calibration_result(result: CalibrationResult) -> str:
     return json.dumps(raw_dict, indent=2)
 
 
-def discover_tools(custom_paths: Mapping[str, str] | None = None) -> dict[str, ToolSpec]:
+def discover_tools(
+    custom_paths: Mapping[str, str] | None = None,
+    tool_names: list[str] | None = None,
+) -> dict[str, ToolSpec]:
     """
     Discover installed CLI tools and retrieve their version information safely.
 
+    Resolves executables dynamically via shutil.which() or explicit absolute paths.
     Does NOT execute model prompts or tasks.
     """
     tools: dict[str, ToolSpec] = {}
-    paths_to_check = {
-        "codex": "/Users/dangnguyen/.nvm/versions/node/v20.5.0/bin/codex",
-        "agy": "/Users/dangnguyen/.local/bin/agy",
-        "opencode2": "/Users/dangnguyen/.nvm/versions/node/v20.5.0/bin/opencode2",
-    }
-    if custom_paths:
-        paths_to_check.update(custom_paths)
 
-    for tool_name, exe_path in paths_to_check.items():
+    # Target tool names to resolve
+    names = tool_names if tool_names is not None else ["codex", "agy", "opencode2"]
+
+    # Candidate lookup map: either custom path or resolution via shutil.which
+    candidates: dict[str, str | None] = {}
+    for name in names:
+        if custom_paths and name in custom_paths:
+            candidates[name] = custom_paths[name]
+        else:
+            resolved = shutil.which(name)
+            candidates[name] = resolved
+
+    # Also include any additional custom paths provided
+    if custom_paths:
+        for name, path in custom_paths.items():
+            if name not in candidates:
+                candidates[name] = path
+
+    for tool_name, exe_path_or_none in candidates.items():
+        if not exe_path_or_none:
+            continue
+        exe_path = str(Path(exe_path_or_none).resolve())
         if Path(exe_path).is_file() and os.access(exe_path, os.X_OK):
             try:
                 res = subprocess.run(
@@ -367,7 +461,7 @@ def discover_tools(custom_paths: Mapping[str, str] | None = None) -> dict[str, T
                     check=False,
                 )
                 ver_str = res.stdout.strip() or res.stderr.strip() or "unknown"
-                # Keep first line of version
+                # Keep first line of version output
                 first_line = ver_str.splitlines()[0] if ver_str.splitlines() else "unknown"
                 tools[tool_name] = ToolSpec(
                     tool_name=tool_name,
