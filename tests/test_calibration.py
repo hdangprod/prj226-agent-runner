@@ -177,6 +177,37 @@ class TestCalibrationHarness(unittest.TestCase):
             parse_opencode_output(metadata_only_stream)
         self.assertIn("no recognized terminal", str(ctx.exception).lower())
 
+    def test_opencode_arbitrary_message_fields_rejected_regression_r002(self) -> None:
+        """Verify OpenCode message events with arbitrary/unsupported fields are rejected (CAL1B-PRE-R002)."""
+        # Exact defect case from R002
+        malformed1 = (
+            '{"type": "message", "session": "s1", "custom_field": "evil_payload", "another": 123}\n'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(malformed1)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+        malformed2 = '{"type": "message", "session": "s1", "custom_field": "x"}\n'
+        with self.assertRaises(ValueError):
+            parse_opencode_output(malformed2)
+
+        malformed3 = '{"type": "message", "timestamp": 1, "future_field": {"x": 1}}\n'
+        with self.assertRaises(ValueError):
+            parse_opencode_output(malformed3)
+
+        malformed4 = '{"type": "message", "metadata": {}, "unknown": "x"}\n'
+        with self.assertRaises(ValueError):
+            parse_opencode_output(malformed4)
+
+        # Multi-event stream with intermediate + malformed message event
+        multi_stream = (
+            '{"type": "init", "session": "s1"}\n'
+            '{"type": "step", "step_number": 1}\n'
+            '{"type": "message", "session": "s1", "custom_field": "evil_payload", "another": 123}\n'
+        )
+        with self.assertRaises(ValueError):
+            parse_opencode_output(multi_stream)
+
     def test_opencode_supported_payload_forms_parsed(self) -> None:
         """Verify supported OpenCode terminal forms are parsed properly."""
         stream1 = '{"type": "message", "data": {"key": "alpha_7729"}}\n'
@@ -567,7 +598,7 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertEqual(len(ready_payload.unresolved_parameters), 0)
 
     # -------------------------------------------------------------------------
-    # Runtime Root Lifecycle
+    # Runtime Root Lifecycle & Security (CAL1B-PRE-R001)
     # -------------------------------------------------------------------------
 
     def test_runtime_root_run_id_collision_fails_closed(self) -> None:
@@ -581,6 +612,75 @@ class TestCalibrationHarness(unittest.TestCase):
 
         with self.assertRaises(FileExistsError):
             prepare_runtime_root(self.test_root, run_id)
+
+    def test_runtime_root_valid_run_id(self) -> None:
+        """Verify valid run ID creates directories only under base."""
+        run_id = "CAL1B-20260902-001"
+        root = prepare_runtime_root(self.test_root, run_id)
+        self.assertEqual(root, self.test_root.resolve() / run_id)
+        self.assertTrue(root.is_dir())
+        self.assertTrue((root / "workspace").is_dir())
+        self.assertTrue((root / "raw_logs").is_dir())
+        self.assertTrue((root / "config").is_dir())
+
+    def test_runtime_root_invalid_run_ids_rejected(self) -> None:
+        """Verify invalid, nested, absolute, and traversal run IDs are rejected."""
+        invalid_ids = [
+            "",
+            "   ",
+            "\t\n",
+            ".",
+            "..",
+            "../evil",
+            "../../evil",
+            "/tmp/absolute_evil",
+            "a/b",
+            "a/b/c",
+            "a\\b",
+            "a\\b\\c",
+            "evil/../target",
+            "run id with spaces",
+            "-leading-dash",
+            ".leading-dot",
+            "/evil",
+        ]
+        for invalid_id in invalid_ids:
+            with self.subTest(invalid_id=invalid_id):
+                with self.assertRaises((ValueError, Exception)):
+                    prepare_runtime_root(self.test_root, invalid_id)
+
+    def test_runtime_root_no_escape_side_effects(self) -> None:
+        """Verify invalid run IDs fail before creating any filesystem artifacts."""
+        # Controlled sentinel structure under self.test_root
+        parent = self.test_root / "controlled_parent"
+        base_dir = parent / "runtime_base"
+        sentinel_dir = parent / "sentinel"
+        parent.mkdir()
+        base_dir.mkdir()
+        sentinel_dir.mkdir()
+
+        # Track existing entries in parent before invalid attempts
+        parent_children_before = set(parent.rglob("*"))
+
+        malicious_ids = [
+            "../sentinel_escaped",
+            "../../outside_escaped",
+            str(sentinel_dir / "evil"),
+            "sub1/sub2",
+            ".",
+            "..",
+            "   ",
+            "nested/dir",
+        ]
+
+        for mal_id in malicious_ids:
+            with self.subTest(malicious_id=mal_id):
+                with self.assertRaises(ValueError):
+                    prepare_runtime_root(base_dir, mal_id)
+
+        # Confirm no unexpected directories or files were created anywhere in the controlled parent
+        parent_children_after = set(parent.rglob("*"))
+        self.assertEqual(parent_children_before, parent_children_after)
 
     # -------------------------------------------------------------------------
     # Subprocess Execution & Parsers

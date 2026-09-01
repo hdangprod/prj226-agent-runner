@@ -462,7 +462,7 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
 
     Safely parses JSONL, recognizes only explicitly supported terminal payload forms,
     and rejects malformed JSON, empty streams, init-only streams, intermediate events,
-    or streams without a supported response payload form.
+    or streams without an explicitly supported response payload form.
 
     Raises ValueError if event stream is malformed or contains no supported terminal payload.
     """
@@ -494,15 +494,6 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
             )
             if isinstance(candidate, dict):
                 terminal_payload = candidate
-            elif candidate is None:
-                # Direct payload fields: reject metadata-only dictionaries
-                excluded_metadata_keys = {
-                    "type", "event", "session", "timestamp", "id", "duration",
-                    "metadata", "created_at", "updated_at",
-                }
-                payload_subset = {k: v for k, v in event.items() if k not in excluded_metadata_keys}
-                if payload_subset:
-                    terminal_payload = payload_subset
         elif event_type in ("final_response", "result", "terminal"):
             candidate = event.get("data") if "data" in event else event.get("payload")
             if isinstance(candidate, dict):
@@ -994,25 +985,53 @@ def serialize_human_gate_payload(payload: HumanGatePayload) -> str:
     return json.dumps(raw_dict, indent=2)
 
 
-# -----------------------------------------------------------------------------
-# Runtime Root Lifecycle & Collision Safety
-# -----------------------------------------------------------------------------
+_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def validate_run_id(run_id: str) -> None:
+    """
+    Validate that run_id is exactly one safe path component.
+
+    Rejects empty/whitespace strings, '.', '..', absolute paths, path separators,
+    traversal components, or anything not matching the safe component pattern.
+    """
+    if not isinstance(run_id, str):
+        raise ValueError("run_id must be a string")
+    if not run_id or not run_id.strip():
+        raise ValueError("run_id must be a non-empty string")
+    if run_id in (".", ".."):
+        raise ValueError("run_id cannot be '.' or '..'")
+    if "/" in run_id or "\\" in run_id:
+        raise ValueError("run_id cannot contain path separators ('/' or '\\')")
+    if not _RUN_ID_PATTERN.match(run_id):
+        raise ValueError(f"run_id '{run_id}' contains invalid characters or format")
+
 
 def prepare_runtime_root(base_dir: Path | str, run_id: str) -> Path:
     """
     Create disposable external runtime root directory for a given run ID.
 
+    Validates that run_id is a single safe path component and does not escape base_dir.
     Fails closed if the run ID directory already exists (immutable run history invariant).
     """
-    if not run_id or not run_id.strip():
-        raise ValueError("run_id must be a non-empty string")
+    validate_run_id(run_id)
 
-    root = Path(base_dir).resolve() / run_id
+    base = Path(base_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    root = (base / run_id).resolve()
+
+    # Structural containment invariant: target must be directly under base
+    if root.parent != base:
+        raise ValueError(f"Resolved run path '{root}' is not directly under base '{base}'")
+
     if root.exists():
         raise FileExistsError(f"Runtime root for run ID '{run_id}' already exists: {root}")
 
-    (root / "workspace").mkdir(parents=True, exist_ok=False)
-    (root / "raw_logs").mkdir(parents=True, exist_ok=False)
-    (root / "config").mkdir(parents=True, exist_ok=False)
+    # Create root without parents=True to prevent nested path creation
+    root.mkdir(exist_ok=False)
+    (root / "workspace").mkdir(exist_ok=False)
+    (root / "raw_logs").mkdir(exist_ok=False)
+    (root / "config").mkdir(exist_ok=False)
 
     return root
