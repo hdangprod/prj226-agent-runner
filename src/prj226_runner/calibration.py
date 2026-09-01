@@ -293,8 +293,8 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
 
     Safely parses JSONL, recognizes only explicitly supported terminal payload forms,
     ignores recognized non-terminal/intermediate events (e.g. init, step, thought),
-    and rejects malformed JSON, empty streams, init-only streams, or streams with no
-    recognized terminal payload.
+    and rejects malformed JSON, empty streams, init-only streams, intermediate events
+    bearing arbitrary payloads/data, or streams with no recognized terminal payload.
 
     Raises ValueError if event stream is malformed or contains no terminal payload.
     """
@@ -327,16 +327,15 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
             )
             if isinstance(candidate, dict):
                 terminal_payload = candidate
-            elif candidate is None and isinstance(event, dict):
+            elif candidate is None:
                 # If message event itself has direct payload fields
                 payload_subset = {k: v for k, v in event.items() if k not in ("type", "event")}
                 if payload_subset:
                     terminal_payload = payload_subset
-        elif "payload" in event and isinstance(event["payload"], dict):
-            # Direct payload wrapper
-            terminal_payload = event["payload"]
-        elif "data" in event and isinstance(event["data"], dict) and event_type in ("final_response", "result", "terminal"):
-            terminal_payload = event["data"]
+        elif event_type in ("final_response", "result", "terminal"):
+            candidate = event.get("data") if "data" in event else event.get("payload")
+            if isinstance(candidate, dict):
+                terminal_payload = candidate
 
     if terminal_payload is None:
         raise ValueError("No recognized terminal response payload found in OpenCode event stream")

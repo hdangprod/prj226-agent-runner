@@ -261,7 +261,7 @@ class TestCalibrationHarness(unittest.TestCase):
             parse_agy_output("[1, 2, 3]")
 
     # -------------------------------------------------------------------------
-    # B-001 & B-002: OpenCode Terminal Output Parsing
+    # B-001, B-002, & CAL1A-R2-B001: OpenCode Terminal Output Parsing
     # -------------------------------------------------------------------------
 
     def test_parse_opencode_output_valid_formats(self) -> None:
@@ -292,6 +292,10 @@ class TestCalibrationHarness(unittest.TestCase):
         # 5. Terminal/final_response event with data dict
         stream5 = '{"type": "final_response", "data": {"status": "success"}}\n'
         self.assertEqual(parse_opencode_output(stream5), {"status": "success"})
+
+        # 6. Terminal event with payload dict
+        stream6 = '{"type": "terminal", "payload": {"summary": "completed"}}\n'
+        self.assertEqual(parse_opencode_output(stream6), {"summary": "completed"})
 
     def test_parse_opencode_output_invalid_and_incomplete_streams(self) -> None:
         """Verify rejection of empty, malformed, init-only, and intermediate-only streams."""
@@ -333,6 +337,46 @@ class TestCalibrationHarness(unittest.TestCase):
         empty_message = '{"type": "message"}\n'
         with self.assertRaises(ValueError) as ctx:
             parse_opencode_output(empty_message)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+    def test_parse_opencode_output_cal1a_r2_b001_discrimination(self) -> None:
+        """Verify CAL1A-R2-B001 rejection of non-terminal events bearing arbitrary payload/data."""
+        # 1. Init event containing a payload dict
+        init_with_payload = '{"type": "init", "payload": {"x": 1}}\n'
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(init_with_payload)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+        # 2. Recognized intermediate event (thought/step/tool_call) containing a payload dict
+        thought_with_payload = (
+            '{"type": "init", "session": "s1"}\n'
+            '{"type": "step", "payload": {"step_num": 1}}\n'
+            '{"type": "thought", "payload": {"thought": "analyzing"}}\n'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(thought_with_payload)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+        # 3. Unsupported event containing {"payload": {...}}
+        unsupported_with_payload = '{"type": "unknown_event", "payload": {"data": 123}}\n'
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(unsupported_with_payload)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+        # 4. Unsupported event containing {"data": {...}}
+        unsupported_with_data = '{"type": "telemetry", "data": {"cpu": 90}}\n'
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(unsupported_with_data)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+        # 5. Multi-event stream with intermediate payloads but no supported terminal event
+        multi_intermediate = (
+            '{"type": "init", "payload": {"session": "abc"}}\n'
+            '{"type": "tool_call", "data": {"tool": "cat"}}\n'
+            '{"type": "tool_result", "payload": {"out": "done"}}\n'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(multi_intermediate)
         self.assertIn("no recognized terminal", str(ctx.exception).lower())
 
     # -------------------------------------------------------------------------
