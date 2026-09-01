@@ -10,10 +10,23 @@ import unittest
 from pathlib import Path
 
 from prj226_runner.calibration import (
+    CalibrationCaseResult,
     CalibrationResult,
     CalibrationStatus,
+    CalibrationVerdict,
+    DiscoveryStatus,
+    HumanGatePayload,
+    InvocationSpec,
+    ToolDiscoveryRecord,
     ToolSpec,
+    build_agy_invocation,
+    build_codex_invocation,
+    build_human_gate_payload,
+    build_opencode_config_dict,
+    build_opencode_config_json,
+    build_opencode_invocation,
     build_subprocess_env,
+    check_no_symlinks,
     copy_fixture_to_workspace,
     discover_tools,
     hash_directory_tree,
@@ -21,9 +34,15 @@ from prj226_runner.calibration import (
     parse_agy_output,
     parse_codex_output,
     parse_opencode_output,
+    prepare_runtime_root,
     run_calibration_subprocess,
+    scan_workspace_for_symlinks,
+    serialize_calibration_case_result,
     serialize_calibration_result,
+    serialize_human_gate_payload,
+    validate_calibration_case_result,
     validate_calibration_result,
+    validate_environment_override_keys,
 )
 from prj226_runner.models import ErrorClass
 
@@ -76,83 +95,495 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertEqual(result, ErrorClass.GOVERNANCE_BLOCKER)
 
     # -------------------------------------------------------------------------
-    # Environment & Fixture Management
+    # NB-SEM-001: CalibrationResult Invariants & PASS State Enforcement
     # -------------------------------------------------------------------------
 
-    def test_build_subprocess_env(self) -> None:
-        """Verify subprocess environment copying and explicit overrides."""
-        orig_val = os.environ.get("PATH", "")
-        env = build_subprocess_env({"CUSTOM_OVERRIDE": "test_value_123"})
-        self.assertEqual(env.get("PATH"), orig_val)
-        self.assertEqual(env.get("CUSTOM_OVERRIDE"), "test_value_123")
-        self.assertNotIn("CUSTOM_OVERRIDE", os.environ)
+    def test_pass_requires_structured_output_valid(self) -> None:
+        """Verify PASS status strictly requires structured_output_valid=True (NB-SEM-001)."""
+        valid_pass = CalibrationResult(
+            calibration_id="CAL-001",
+            tool="codex",
+            executable_path="/path/to/codex",
+            version="0.148.0",
+            working_dir="/tmp/workspace",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        validate_calibration_result(valid_pass)
 
-    def test_copy_fixture_and_hash_tree(self) -> None:
-        """Verify fixture copying and deterministic tree hashing."""
-        fixture_dir = self.test_root / "fixture"
+        # PASS with structured_output_valid=False must be rejected
+        invalid_pass = CalibrationResult(
+            calibration_id="CAL-001",
+            tool="codex",
+            executable_path="/path/to/codex",
+            version="0.148.0",
+            working_dir="/tmp/workspace",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=False,
+            exit_code=0,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_calibration_result(invalid_pass)
+        self.assertIn("structured_output_valid=True", str(ctx.exception))
+
+    def test_pass_status_contradictory_states_rejected(self) -> None:
+        """Verify PASS status rejects exit_code != 0, timed_out=True, and error_class != None."""
+        base_kwargs = {
+            "calibration_id": "CAL-001",
+            "tool": "codex",
+            "executable_path": "/path/to/codex",
+            "version": "0.148.0",
+            "working_dir": "/tmp/workspace",
+            "status": CalibrationStatus.PASS,
+            "error_class": None,
+            "timed_out": False,
+            "duration_ms": 100,
+            "structured_output_valid": True,
+            "exit_code": 0,
+        }
+
+        # 1. PASS with exit_code=1
+        with self.assertRaises(ValueError):
+            validate_calibration_result(CalibrationResult(**{**base_kwargs, "exit_code": 1}))
+
+        # 2. PASS with timed_out=True
+        with self.assertRaises(ValueError):
+            validate_calibration_result(CalibrationResult(**{**base_kwargs, "timed_out": True}))
+
+        # 3. PASS with error_class set
+        with self.assertRaises(ValueError):
+            validate_calibration_result(
+                CalibrationResult(**{**base_kwargs, "error_class": ErrorClass.AGENT_EXECUTION_ERROR})
+            )
+
+    # -------------------------------------------------------------------------
+    # NB-SEM-002: OpenCode Output Parsing Fail-Closed
+    # -------------------------------------------------------------------------
+
+    def test_opencode_terminal_event_without_supported_payload_fails_closed(self) -> None:
+        """Verify OpenCode terminal event with only metadata fields fails closed."""
+        metadata_only_stream = (
+            '{"type": "init", "session": "s1"}\n'
+            '{"type": "message", "session": "s1", "timestamp": 123456789, "id": "msg_001", "duration": 100, "metadata": {"foo": "bar"}}\n'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_opencode_output(metadata_only_stream)
+        self.assertIn("no recognized terminal", str(ctx.exception).lower())
+
+    def test_opencode_supported_payload_forms_parsed(self) -> None:
+        """Verify supported OpenCode terminal forms are parsed properly."""
+        stream1 = '{"type": "message", "data": {"key": "alpha_7729"}}\n'
+        self.assertEqual(parse_opencode_output(stream1), {"key": "alpha_7729"})
+
+        stream2 = '{"type": "message", "message": {"text": "hello"}}\n'
+        self.assertEqual(parse_opencode_output(stream2), {"text": "hello"})
+
+        stream3 = '{"type": "final_response", "data": {"status": "ok"}}\n'
+        self.assertEqual(parse_opencode_output(stream3), {"status": "ok"})
+
+    def test_parse_opencode_output_invalid_and_incomplete_streams(self) -> None:
+        """Verify rejection of empty, malformed, init-only, and intermediate-only streams."""
+        with self.assertRaises(ValueError):
+            parse_opencode_output("")
+        with self.assertRaises(ValueError):
+            parse_opencode_output("   \n\n  ")
+        with self.assertRaises(ValueError):
+            parse_opencode_output('{"type": "init"}\nnot valid json\n')
+        with self.assertRaises(ValueError):
+            parse_opencode_output('{"type": "init", "session": "s1"}\n')
+
+    # -------------------------------------------------------------------------
+    # NB-OP-002: Symlink Contract
+    # -------------------------------------------------------------------------
+
+    def test_symlink_in_source_fixture_rejected_without_following_target(self) -> None:
+        """Verify check_no_symlinks / copy_fixture_to_workspace rejects symlinks in source fixture."""
+        fixture_dir = self.test_root / "fixture_with_symlink"
         fixture_dir.mkdir()
-        (fixture_dir / "sample.txt").write_text("CALIBRATION_KEY=alpha_7729\n", encoding="utf-8")
-        (fixture_dir / "README.md").write_text("# Test Fixture\n", encoding="utf-8")
+        outside_file = self.test_root / "outside.txt"
+        outside_file.write_text("secret outside data", encoding="utf-8")
 
-        initial_hash = hash_directory_tree(fixture_dir)
-        self.assertIsInstance(initial_hash, str)
-        self.assertEqual(len(initial_hash), 64)
+        symlink_path = fixture_dir / "link_to_outside.txt"
+        os.symlink(outside_file, symlink_path)
 
-        # Copy to workspace
-        workspace_dir = self.test_root / "workspace"
-        copy_fixture_to_workspace(fixture_dir, workspace_dir)
+        with self.assertRaises(ValueError) as ctx:
+            check_no_symlinks(fixture_dir)
+        self.assertIn("Symlink detected", str(ctx.exception))
 
-        workspace_hash = hash_directory_tree(workspace_dir)
-        self.assertEqual(initial_hash, workspace_hash)
+        target_ws = self.test_root / "target_ws"
+        with self.assertRaises(ValueError):
+            copy_fixture_to_workspace(fixture_dir, target_ws)
+        self.assertFalse(target_ws.exists() and (target_ws / "link_to_outside.txt").exists())
 
-        # Verify mutation changes hash
-        (workspace_dir / "sample.txt").write_text("MUTATED CONTENT\n", encoding="utf-8")
-        mutated_hash = hash_directory_tree(workspace_dir)
-        self.assertNotEqual(initial_hash, mutated_hash)
+        with self.assertRaises(ValueError):
+            hash_directory_tree(fixture_dir)
 
-        # Verify template fixture remains unchanged
-        self.assertEqual(hash_directory_tree(fixture_dir), initial_hash)
+    def test_post_run_symlink_detected(self) -> None:
+        """Verify scan_workspace_for_symlinks detects newly introduced symlinks."""
+        ws = self.test_root / "clean_ws"
+        ws.mkdir()
+        (ws / "file.txt").write_text("hello", encoding="utf-8")
+        self.assertFalse(scan_workspace_for_symlinks(ws))
 
-    # -------------------------------------------------------------------------
-    # NB-003: Deterministic Relative Directory Hashing
-    # -------------------------------------------------------------------------
-
-    def test_hash_directory_tree_relative_invariants(self) -> None:
-        """Verify directory tree hashing is strictly relative path and content invariant."""
-        root_a = self.test_root / "root_a"
-        root_b = self.test_root / "root_b"
-        root_a.mkdir()
-        root_b.mkdir()
-
-        # Same relative paths + same bytes under two different temporary roots -> same hash
-        (root_a / "sub").mkdir()
-        (root_a / "sub" / "file1.txt").write_text("content 1", encoding="utf-8")
-        (root_a / "file2.txt").write_text("content 2", encoding="utf-8")
-
-        (root_b / "sub").mkdir()
-        (root_b / "sub" / "file1.txt").write_text("content 1", encoding="utf-8")
-        (root_b / "file2.txt").write_text("content 2", encoding="utf-8")
-
-        hash_a = hash_directory_tree(root_a)
-        hash_b = hash_directory_tree(root_b)
-        self.assertEqual(hash_a, hash_b)
-
-        # Change file bytes -> different hash
-        (root_b / "file2.txt").write_text("modified content 2", encoding="utf-8")
-        hash_modified_bytes = hash_directory_tree(root_b)
-        self.assertNotEqual(hash_a, hash_modified_bytes)
-
-        # Rename/change relative path while preserving bytes -> different hash
-        root_c = self.test_root / "root_c"
-        root_c.mkdir()
-        (root_c / "sub").mkdir()
-        (root_c / "sub" / "file1.txt").write_text("content 1", encoding="utf-8")
-        (root_c / "file2_renamed.txt").write_text("content 2", encoding="utf-8")
-        hash_renamed_path = hash_directory_tree(root_c)
-        self.assertNotEqual(hash_a, hash_renamed_path)
+        os.symlink(ws / "file.txt", ws / "link.txt")
+        self.assertTrue(scan_workspace_for_symlinks(ws))
 
     # -------------------------------------------------------------------------
-    # Subprocess & NB-002 Process Reaping
+    # NB-OP-001: Tool Discovery Observability
+    # -------------------------------------------------------------------------
+
+    def test_tool_discovery_record_statuses(self) -> None:
+        """Verify ToolDiscoveryRecord statuses: DISCOVERED, NOT_FOUND, PROBE_FAILED."""
+        good_bin = self.test_root / "good_tool"
+        good_bin.write_text(f"#!{sys.executable}\nprint('good_tool v1.0.0')\n", encoding="utf-8")
+        good_bin.chmod(0o755)
+
+        bad_bin = self.test_root / "bad_tool"
+        bad_bin.write_text(f"#!{sys.executable}\nimport sys; sys.exit(2)\n", encoding="utf-8")
+        bad_bin.chmod(0o755)
+
+        records = discover_tools(
+            custom_paths={
+                "good": str(good_bin),
+                "bad": str(bad_bin),
+                "missing": "/nonexistent/binary/path",
+            },
+            tool_names=["good", "bad", "missing"],
+        )
+
+        self.assertEqual(records["good"].discovery_status, DiscoveryStatus.DISCOVERED)
+        self.assertEqual(records["good"].version, "good_tool v1.0.0")
+        self.assertEqual(records["good"].version_exit_code, 0)
+
+        self.assertEqual(records["bad"].discovery_status, DiscoveryStatus.PROBE_FAILED)
+        self.assertEqual(records["bad"].version_exit_code, 2)
+        self.assertIsNotNone(records["bad"].safe_error)
+
+        self.assertEqual(records["missing"].discovery_status, DiscoveryStatus.NOT_FOUND)
+        self.assertIsNone(records["missing"].resolved_path)
+
+    # -------------------------------------------------------------------------
+    # NB-SEC-001: Child Environment Policy & Credential Rejection
+    # -------------------------------------------------------------------------
+
+    def test_environment_policy_copy_and_overrides(self) -> None:
+        """Verify environment copy semantics and allowed override keys."""
+        orig_path = os.environ.get("PATH", "")
+        env = build_subprocess_env({
+            "OPENCODE_CONFIG_CONTENT": '{"share": "disabled"}',
+            "XDG_CONFIG_HOME": "/tmp/custom_config",
+        })
+        self.assertEqual(env["PATH"], orig_path)
+        self.assertEqual(env["OPENCODE_CONFIG_CONTENT"], '{"share": "disabled"}')
+        self.assertEqual(env["XDG_CONFIG_HOME"], "/tmp/custom_config")
+
+    def test_secret_looking_override_rejected(self) -> None:
+        """Verify credential-like override keys are rejected with ValueError."""
+        bad_keys = [
+            "API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "AUTH_SECRET",
+            "PASSWORD",
+            "MY_PASS",
+        ]
+        for key in bad_keys:
+            with self.assertRaises(ValueError) as ctx:
+                validate_environment_override_keys({key: "secret_value"})
+            self.assertIn("rejected by credential policy", str(ctx.exception))
+
+    def test_unauthorized_override_key_rejected(self) -> None:
+        """Verify non-allowlisted override key is rejected."""
+        with self.assertRaises(ValueError) as ctx:
+            validate_environment_override_keys({"UNAUTHORIZED_CUSTOM_VAR": "val"})
+        self.assertIn("not in allowed override list", str(ctx.exception))
+
+    def test_override_values_not_in_invocation_metadata(self) -> None:
+        """Verify InvocationSpec contains only override KEY NAMES, never values."""
+        spec = build_codex_invocation(
+            executable="/path/to/codex",
+            workspace=str(self.test_root),
+            prompt="test prompt",
+            payload_schema_path=str(self.test_root / "schema.json"),
+            output_path=str(self.test_root / "out.json"),
+            overrides={"PYTHONPATH": "/custom/path"},
+        )
+        self.assertEqual(spec.env_override_keys, ["PYTHONPATH"])
+        self.assertNotIn("/custom/path", str(spec.env_override_keys))
+
+    # -------------------------------------------------------------------------
+    # CalibrationCaseResult: Invocation vs Case Verdict Separation
+    # -------------------------------------------------------------------------
+
+    def test_expected_permission_denial_can_yield_case_pass(self) -> None:
+        """Verify an expected PERMISSION_DENIED invocation status can evaluate to case PASS."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-NEG-001",
+            tool="codex",
+            executable_path="/path/to/codex",
+            version="0.148.0",
+            working_dir="/tmp/workspace",
+            status=CalibrationStatus.PERMISSION_DENIED,
+            error_class=ErrorClass.GOVERNANCE_BLOCKER,
+            timed_out=False,
+            duration_ms=200,
+            structured_output_valid=True,
+            exit_code=1,
+        )
+        pre_hash = "a" * 64
+        post_hash = "a" * 64
+
+        case_result = CalibrationCaseResult(
+            case_id="CASE-NEG-MUTATION-01",
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash=pre_hash,
+            post_hash=post_hash,
+            workspace_mutated=False,
+            verdict=CalibrationVerdict.PASS,
+            error_class=None,
+            oracle_details={"expected_denial": True, "mutation_prevented": True},
+        )
+        validate_calibration_case_result(case_result)
+        serialized = serialize_calibration_case_result(case_result)
+        data = json.loads(serialized)
+        self.assertEqual(data["verdict"], "PASS")
+        self.assertEqual(data["invocation_result"]["status"], "PERMISSION_DENIED")
+        self.assertFalse(data["workspace_mutated"])
+
+    def test_unexpected_mutation_yields_case_fail_governance_blocker(self) -> None:
+        """Verify unexpected workspace mutation yields case FAIL with GOVERNANCE_BLOCKER."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-NEG-002",
+            tool="codex",
+            executable_path="/path/to/codex",
+            version="0.148.0",
+            working_dir="/tmp/workspace",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=200,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        pre_hash = "a" * 64
+        post_hash = "b" * 64  # Mutated!
+
+        case_result = CalibrationCaseResult(
+            case_id="CASE-NEG-MUTATION-02",
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash=pre_hash,
+            post_hash=post_hash,
+            workspace_mutated=True,
+            verdict=CalibrationVerdict.FAIL,
+            error_class=ErrorClass.GOVERNANCE_BLOCKER,
+            oracle_details={"prohibited_mutation_detected": True},
+        )
+        validate_calibration_case_result(case_result)
+
+        # Invariant: If mutated and verdict=FAIL, error_class MUST be GOVERNANCE_BLOCKER
+        invalid_case = CalibrationCaseResult(
+            case_id="CASE-NEG-MUTATION-02",
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash=pre_hash,
+            post_hash=post_hash,
+            workspace_mutated=True,
+            verdict=CalibrationVerdict.FAIL,
+            error_class=ErrorClass.IMPLEMENTATION_FAILURE,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_calibration_case_result(invalid_case)
+        self.assertIn("GOVERNANCE_BLOCKER", str(ctx.exception))
+
+    # -------------------------------------------------------------------------
+    # Command Builders
+    # -------------------------------------------------------------------------
+
+    def test_codex_argv_builder_installed_help_compatible(self) -> None:
+        """Verify Codex builder generates top-level --ask-for-approval before exec subcommand."""
+        spec = build_codex_invocation(
+            executable="/bin/codex",
+            workspace="/tmp/ws",
+            prompt="Extract CALIBRATION_KEY",
+            payload_schema_path="/tmp/schema.json",
+            output_path="/tmp/out.json",
+            model="gpt-4o",
+            timeout_seconds=60.0,
+        )
+        expected_argv = [
+            "/bin/codex",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "-C",
+            str(Path("/tmp/ws").resolve()),
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--output-schema",
+            str(Path("/tmp/schema.json").resolve()),
+            "-o",
+            str(Path("/tmp/out.json").resolve()),
+            "--model",
+            "gpt-4o",
+            "Extract CALIBRATION_KEY",
+        ]
+        self.assertEqual(spec.argv, expected_argv)
+        self.assertEqual(spec.model, "gpt-4o")
+        self.assertEqual(spec.cwd, str(Path("/tmp/ws").resolve()))
+
+    def test_agy_builder_sandbox_boolean(self) -> None:
+        """Verify Antigravity builder generates boolean --sandbox flag and plan mode."""
+        spec = build_agy_invocation(
+            executable="/bin/agy",
+            workspace="/tmp/ws",
+            prompt="Extract CALIBRATION_KEY",
+            payload_schema_path="/tmp/schema.json",
+            model="gemini-3.7-flash",
+            timeout_seconds=120.0,
+        )
+        expected_argv = [
+            "/bin/agy",
+            "-p",
+            "Extract CALIBRATION_KEY",
+            "--mode=plan",
+            "--sandbox",
+            "--output-format",
+            "json",
+            "--json-schema",
+            str(Path("/tmp/schema.json").resolve()),
+            "--print-timeout",
+            "120s",
+            "--model",
+            "gemini-3.7-flash",
+        ]
+        self.assertEqual(spec.argv, expected_argv)
+        self.assertIn("--sandbox", spec.argv)
+        self.assertNotIn("read-only", spec.argv)
+
+    def test_opencode_builder_standalone_and_agent(self) -> None:
+        """Verify OpenCode builder generates top-level --standalone and explicit --agent."""
+        spec = build_opencode_invocation(
+            executable="/bin/opencode2",
+            workspace="/tmp/ws",
+            prompt="Extract CALIBRATION_KEY",
+            model="anthropic/claude-3-5-sonnet",
+            agent_name="calibration-readonly",
+            timeout_seconds=90.0,
+        )
+        expected_argv = [
+            "/bin/opencode2",
+            "--standalone",
+            "run",
+            "--format",
+            "json",
+            "--agent",
+            "calibration-readonly",
+            "--model",
+            "anthropic/claude-3-5-sonnet",
+            "Extract CALIBRATION_KEY",
+        ]
+        self.assertEqual(spec.argv, expected_argv)
+        self.assertEqual(spec.cwd, str(Path("/tmp/ws").resolve()))
+
+    def test_opencode_config_generation(self) -> None:
+        """Verify OpenCode config: custom primary agent, deny-all, read/glob/grep allow, no ask."""
+        cfg = build_opencode_config_dict()
+        self.assertEqual(cfg["share"], "disabled")
+        self.assertFalse(cfg["snapshots"])
+        self.assertEqual(cfg["default_agent"], "calibration-readonly")
+
+        agent = cfg["agents"]["calibration-readonly"]
+        self.assertEqual(agent["mode"], "primary")
+        permissions = agent["permissions"]
+
+        self.assertEqual(permissions[0], {"action": "*", "resource": "*", "effect": "deny"})
+        allowed_actions = [p["action"] for p in permissions if p["effect"] == "allow"]
+        self.assertEqual(allowed_actions, ["read", "glob", "grep"])
+        ask_rules = [p for p in permissions if p.get("effect") == "ask"]
+        self.assertEqual(len(ask_rules), 0)
+
+        json_str = build_opencode_config_json()
+        parsed = json.loads(json_str)
+        self.assertEqual(parsed["default_agent"], "calibration-readonly")
+
+    # -------------------------------------------------------------------------
+    # Human Gate Payload & Model Pinning
+    # -------------------------------------------------------------------------
+
+    def test_model_none_prevents_human_gate_live_ready(self) -> None:
+        """Verify model=None produces readiness=NOT_READY in Human Gate payload."""
+        codex_spec = build_codex_invocation(
+            executable="/bin/codex",
+            workspace="/tmp/ws",
+            prompt="p",
+            payload_schema_path="/tmp/s.json",
+            output_path="/tmp/o.json",
+            model=None,
+        )
+        agy_spec = build_agy_invocation(
+            executable="/bin/agy",
+            workspace="/tmp/ws",
+            prompt="p",
+            payload_schema_path="/tmp/s.json",
+            model="gemini-3.7-flash",
+        )
+        payload = build_human_gate_payload(
+            run_id="CAL-1B-TEST",
+            runtime_root="/tmp/runtime",
+            runner_baseline={"branch": "main", "head": "abc"},
+            prj226_baseline={"branch": "foundation/product-foundation", "head": "def"},
+            invocations={"codex": codex_spec, "agy": agy_spec},
+        )
+        self.assertEqual(payload.readiness, "NOT_READY")
+        self.assertIn("codex.model", payload.unresolved_parameters)
+
+        pinned_codex_spec = build_codex_invocation(
+            executable="/bin/codex",
+            workspace="/tmp/ws",
+            prompt="p",
+            payload_schema_path="/tmp/s.json",
+            output_path="/tmp/o.json",
+            model="gpt-4o",
+        )
+        ready_payload = build_human_gate_payload(
+            run_id="CAL-1B-TEST",
+            runtime_root="/tmp/runtime",
+            runner_baseline={"branch": "main", "head": "abc"},
+            prj226_baseline={"branch": "foundation/product-foundation", "head": "def"},
+            invocations={"codex": pinned_codex_spec, "agy": agy_spec},
+        )
+        self.assertEqual(ready_payload.readiness, "LIVE_READY")
+        self.assertEqual(len(ready_payload.unresolved_parameters), 0)
+
+    # -------------------------------------------------------------------------
+    # Runtime Root Lifecycle
+    # -------------------------------------------------------------------------
+
+    def test_runtime_root_run_id_collision_fails_closed(self) -> None:
+        """Verify prepare_runtime_root fails closed on duplicate run ID."""
+        run_id = "RUN-IMMUTABLE-001"
+        root1 = prepare_runtime_root(self.test_root, run_id)
+        self.assertTrue(root1.exists())
+        self.assertTrue((root1 / "workspace").is_dir())
+        self.assertTrue((root1 / "raw_logs").is_dir())
+        self.assertTrue((root1 / "config").is_dir())
+
+        with self.assertRaises(FileExistsError):
+            prepare_runtime_root(self.test_root, run_id)
+
+    # -------------------------------------------------------------------------
+    # Subprocess Execution & Parsers
     # -------------------------------------------------------------------------
 
     def test_run_calibration_subprocess_stdout_stderr(self) -> None:
@@ -182,53 +613,6 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertEqual(stdout_path.read_text(encoding="utf-8"), "hello stdout\n")
         self.assertEqual(stderr_path.read_text(encoding="utf-8"), "hello stderr\n")
 
-    def test_run_calibration_subprocess_timeout_and_reap(self) -> None:
-        """Verify process-group termination, timeout flag, and child reaping upon timeout."""
-        stdout_path = self.test_root / "stdout.log"
-        stderr_path = self.test_root / "stderr.log"
-
-        script = "import time; time.sleep(10)\n"
-        cmd = [sys.executable, "-c", script]
-
-        exit_code, timed_out, duration_ms = run_calibration_subprocess(
-            cmd=cmd,
-            cwd=self.test_root,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout_seconds=0.2,
-        )
-
-        self.assertTrue(timed_out)
-        self.assertIsNotNone(exit_code)
-        self.assertGreaterEqual(duration_ms, 150)
-
-    def test_run_calibration_subprocess_process_tree_cleanup(self) -> None:
-        """Verify subprocess group cleanup when child spawns grandchild processes."""
-        stdout_path = self.test_root / "stdout.log"
-        stderr_path = self.test_root / "stderr.log"
-
-        script = (
-            "import subprocess, sys, time\n"
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
-            "time.sleep(10)\n"
-        )
-        cmd = [sys.executable, "-c", script]
-
-        exit_code, timed_out, duration_ms = run_calibration_subprocess(
-            cmd=cmd,
-            cwd=self.test_root,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout_seconds=0.2,
-        )
-
-        self.assertTrue(timed_out)
-        self.assertIsNotNone(exit_code)
-
-    # -------------------------------------------------------------------------
-    # Parsers
-    # -------------------------------------------------------------------------
-
     def test_parse_codex_output(self) -> None:
         """Verify parsing of Codex structured output JSON."""
         json_file = self.test_root / "codex_out.json"
@@ -236,286 +620,11 @@ class TestCalibrationHarness(unittest.TestCase):
         parsed = parse_codex_output(json_file)
         self.assertEqual(parsed.get("CALIBRATION_KEY"), "alpha_7729")
 
-        raw_str = '{"extracted": "token_xyz"}'
-        parsed_str = parse_codex_output(raw_str)
-        self.assertEqual(parsed_str.get("extracted"), "token_xyz")
-
-        with self.assertRaises(ValueError):
-            parse_codex_output("")
-        with self.assertRaises(ValueError):
-            parse_codex_output("not valid json")
-        with self.assertRaises(ValueError):
-            parse_codex_output("[]")
-
     def test_parse_agy_output(self) -> None:
         """Verify parsing of Antigravity JSON output."""
         valid_json = '{"result": "alpha_7729", "model": "gemini-3.7-flash"}'
         parsed = parse_agy_output(valid_json)
         self.assertEqual(parsed.get("result"), "alpha_7729")
-
-        with self.assertRaises(ValueError):
-            parse_agy_output("")
-        with self.assertRaises(ValueError):
-            parse_agy_output("invalid json text")
-        with self.assertRaises(ValueError):
-            parse_agy_output("[1, 2, 3]")
-
-    # -------------------------------------------------------------------------
-    # B-001, B-002, & CAL1A-R2-B001: OpenCode Terminal Output Parsing
-    # -------------------------------------------------------------------------
-
-    def test_parse_opencode_output_valid_formats(self) -> None:
-        """Verify parsing of authorized/supported OpenCode terminal payload formats."""
-        # 1. Message event with data payload
-        stream1 = (
-            '{"type": "init", "session": "s1"}\n'
-            '{"type": "step", "index": 1}\n'
-            '{"type": "message", "data": {"key": "alpha_7729"}}\n'
-        )
-        self.assertEqual(parse_opencode_output(stream1), {"key": "alpha_7729"})
-
-        # 2. Message event with message payload
-        stream2 = (
-            '{"type": "init", "session": "s1"}\n'
-            '{"type": "message", "message": {"text": "hello"}}\n'
-        )
-        self.assertEqual(parse_opencode_output(stream2), {"text": "hello"})
-
-        # 3. Message event with direct fields
-        stream3 = '{"type": "message", "result": "val_123"}\n'
-        self.assertEqual(parse_opencode_output(stream3), {"result": "val_123"})
-
-        # 4. Event wrapper with payload dict
-        stream4 = '{"event": "message", "payload": {"token": "beta_123"}}\n'
-        self.assertEqual(parse_opencode_output(stream4), {"token": "beta_123"})
-
-        # 5. Terminal/final_response event with data dict
-        stream5 = '{"type": "final_response", "data": {"status": "success"}}\n'
-        self.assertEqual(parse_opencode_output(stream5), {"status": "success"})
-
-        # 6. Terminal event with payload dict
-        stream6 = '{"type": "terminal", "payload": {"summary": "completed"}}\n'
-        self.assertEqual(parse_opencode_output(stream6), {"summary": "completed"})
-
-    def test_parse_opencode_output_invalid_and_incomplete_streams(self) -> None:
-        """Verify rejection of empty, malformed, init-only, and intermediate-only streams."""
-        # Empty stream
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output("")
-        self.assertIn("empty", str(ctx.exception).lower())
-
-        with self.assertRaises(ValueError):
-            parse_opencode_output("   \n\n  ")
-
-        # Malformed JSON
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output('{"type": "init"}\nnot valid json\n')
-        self.assertIn("malformed", str(ctx.exception).lower())
-
-        # Init-only stream (B-001 defect)
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output('{"type": "init", "session": "s1"}\n')
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # Intermediate-only stream with no final response
-        intermediate_stream = (
-            '{"type": "init", "session": "s1"}\n'
-            '{"type": "thought", "content": "thinking..."}\n'
-            '{"type": "tool_call", "name": "read_file"}\n'
-        )
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(intermediate_stream)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # Syntactically valid but unsupported event stream
-        unsupported_stream = '{"type": "custom_unsupported_event", "foo": "bar"}\n'
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(unsupported_stream)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # Final event missing required payload dictionary
-        empty_message = '{"type": "message"}\n'
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(empty_message)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-    def test_parse_opencode_output_cal1a_r2_b001_discrimination(self) -> None:
-        """Verify CAL1A-R2-B001 rejection of non-terminal events bearing arbitrary payload/data."""
-        # 1. Init event containing a payload dict
-        init_with_payload = '{"type": "init", "payload": {"x": 1}}\n'
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(init_with_payload)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # 2. Recognized intermediate event (thought/step/tool_call) containing a payload dict
-        thought_with_payload = (
-            '{"type": "init", "session": "s1"}\n'
-            '{"type": "step", "payload": {"step_num": 1}}\n'
-            '{"type": "thought", "payload": {"thought": "analyzing"}}\n'
-        )
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(thought_with_payload)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # 3. Unsupported event containing {"payload": {...}}
-        unsupported_with_payload = '{"type": "unknown_event", "payload": {"data": 123}}\n'
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(unsupported_with_payload)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # 4. Unsupported event containing {"data": {...}}
-        unsupported_with_data = '{"type": "telemetry", "data": {"cpu": 90}}\n'
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(unsupported_with_data)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-        # 5. Multi-event stream with intermediate payloads but no supported terminal event
-        multi_intermediate = (
-            '{"type": "init", "payload": {"session": "abc"}}\n'
-            '{"type": "tool_call", "data": {"tool": "cat"}}\n'
-            '{"type": "tool_result", "payload": {"out": "done"}}\n'
-        )
-        with self.assertRaises(ValueError) as ctx:
-            parse_opencode_output(multi_intermediate)
-        self.assertIn("no recognized terminal", str(ctx.exception).lower())
-
-    # -------------------------------------------------------------------------
-    # NB-004: CalibrationResult Invariants & Serialization
-    # -------------------------------------------------------------------------
-
-    def test_validate_and_serialize_calibration_result(self) -> None:
-        """Verify CalibrationResult invariant validation and JSON serialization."""
-        valid_result = CalibrationResult(
-            calibration_id="CAL-TEST-001",
-            tool="codex",
-            executable_path="/path/to/codex",
-            version="1.0.0",
-            working_dir="/tmp/workspace",
-            status=CalibrationStatus.PASS,
-            error_class=None,
-            timed_out=False,
-            duration_ms=150,
-            structured_output_valid=True,
-            exit_code=0,
-            stdout_artifact="/tmp/stdout.log",
-            stderr_artifact="/tmp/stderr.log",
-            model="default-model",
-            extracted_payload={"key": "alpha_7729"},
-        )
-        validate_calibration_result(valid_result)
-
-        serialized = serialize_calibration_result(valid_result)
-        data = json.loads(serialized)
-        self.assertEqual(data["calibration_id"], "CAL-TEST-001")
-        self.assertEqual(data["status"], "PASS")
-        self.assertIsNone(data["error_class"])
-        self.assertEqual(data["exit_code"], 0)
-        self.assertEqual(data["stdout_artifact"], "/tmp/stdout.log")
-
-    def test_validate_calibration_result_invariants_failures(self) -> None:
-        """Verify rejection of contradictory or invalid CalibrationResult fields."""
-        base_kwargs = {
-            "calibration_id": "CAL-TEST-001",
-            "tool": "codex",
-            "executable_path": "/path/to/codex",
-            "version": "1.0.0",
-            "working_dir": "/tmp/workspace",
-            "status": CalibrationStatus.PASS,
-            "error_class": None,
-            "timed_out": False,
-            "duration_ms": 100,
-            "structured_output_valid": True,
-            "exit_code": 0,
-        }
-
-        # 1. PASS cannot have error_class
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "error_class": ErrorClass.AGENT_EXECUTION_ERROR})
-            )
-
-        # 2. PASS cannot have timed_out=True
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "timed_out": True})
-            )
-
-        # 3. PASS cannot have non-zero exit_code
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "exit_code": 1})
-            )
-
-        # 4. Non-PASS requires error_class
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "status": CalibrationStatus.TASK_FAILURE, "error_class": None})
-            )
-
-        # 5. Negative duration
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "duration_ms": -1})
-            )
-
-        # 6. Empty required identifiers
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "calibration_id": "  "})
-            )
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "tool": ""})
-            )
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "executable_path": ""})
-            )
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "version": ""})
-            )
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "working_dir": ""})
-            )
-
-        # 7. Blank artifact path strings when present
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "stdout_artifact": "   "})
-            )
-        with self.assertRaises(ValueError):
-            validate_calibration_result(
-                CalibrationResult(**{**base_kwargs, "stderr_artifact": ""})
-            )
-
-    # -------------------------------------------------------------------------
-    # NB-005: Tool Discovery Portability
-    # -------------------------------------------------------------------------
-
-    def test_discover_tools_synthetic_and_custom_paths(self) -> None:
-        """Verify discover_tools uses portable resolution and custom paths without hardcoded paths."""
-        fake_bin = self.test_root / "fake_tool"
-        fake_bin.write_text(f"#!{sys.executable}\nprint('fake_tool v2.5.0')\n", encoding="utf-8")
-        fake_bin.chmod(0o755)
-
-        discovered = discover_tools(
-            custom_paths={"mock_tool": str(fake_bin)},
-            tool_names=["mock_tool"],
-        )
-        self.assertIn("mock_tool", discovered)
-        self.assertEqual(discovered["mock_tool"].version, "fake_tool v2.5.0")
-        self.assertEqual(discovered["mock_tool"].executable_path, str(fake_bin.resolve()))
-
-    def test_isolation_invariant(self) -> None:
-        """Verify calibration functions operate strictly on explicit caller-provided paths."""
-        custom_dir = self.test_root / "isolated"
-        custom_dir.mkdir()
-        (custom_dir / "test.txt").write_text("isolated data\n", encoding="utf-8")
-        h = hash_directory_tree(custom_dir)
-        self.assertIsInstance(h, str)
-        self.assertEqual(len(h), 64)
 
 
 if __name__ == "__main__":

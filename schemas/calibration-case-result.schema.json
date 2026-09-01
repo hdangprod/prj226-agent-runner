@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CalibrationCaseResult",
+  "description": "Normalized calibration case evaluation record separating tool invocation execution from test case verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id",
+    "tool",
+    "invocation_result",
+    "pre_hash",
+    "post_hash",
+    "workspace_mutated",
+    "verdict"
+  ],
+  "properties": {
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool": {
+      "type": "string",
+      "enum": ["codex", "agy", "opencode2", "mock"]
+    },
+    "invocation_result": {
+      "type": "object",
+      "description": "The normalized CalibrationResult for this invocation"
+    },
+    "pre_hash": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "post_hash": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "workspace_mutated": {
+      "type": "boolean"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"]
+    },
+    "error_class": {
+      "type": ["string", "null"],
+      "enum": [
+        "ENVIRONMENT_ERROR",
+        "AGENT_EXECUTION_ERROR",
+        "ARTIFACT_VALIDATION_ERROR",
+        "IMPLEMENTATION_FAILURE",
+        "GOVERNANCE_BLOCKER",
+        null
+      ]
+    },
+    "oracle_details": {
+      "type": ["object", "null"]
+    }
+  }
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,21 @@ class CalibrationStatus(str, Enum):
     PERMISSION_DENIED = "PERMISSION_DENIED"
 
 
+class CalibrationVerdict(str, Enum):
+    """Evaluation verdict for a calibration test case."""
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+
+
+class DiscoveryStatus(str, Enum):
+    """Discovery status classifications for CLI tool probing."""
+
+    DISCOVERED = "DISCOVERED"
+    NOT_FOUND = "NOT_FOUND"
+    PROBE_FAILED = "PROBE_FAILED"
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """Immutable specification of an external agent CLI tool."""
@@ -39,8 +55,21 @@ class ToolSpec:
 
 
 @dataclass(frozen=True)
+class ToolDiscoveryRecord:
+    """Detailed record of CLI tool discovery and safe version probing."""
+
+    tool_name: str
+    requested_executable: str
+    resolved_path: str | None
+    version_exit_code: int | None
+    version: str | None
+    discovery_status: DiscoveryStatus
+    safe_error: str | None = None
+
+
+@dataclass(frozen=True)
 class CalibrationResult:
-    """Normalized result record produced by the calibration runner."""
+    """Normalized result record produced by the calibration runner for a single invocation."""
 
     calibration_id: str
     tool: str
@@ -58,6 +87,215 @@ class CalibrationResult:
     stdout_artifact: str | None = None
     stderr_artifact: str | None = None
 
+
+@dataclass(frozen=True)
+class CalibrationCaseResult:
+    """Normalized calibration case evaluation record separating tool invocation from test verdict."""
+
+    case_id: str
+    tool: str
+    invocation_result: CalibrationResult
+    pre_hash: str
+    post_hash: str
+    workspace_mutated: bool
+    verdict: CalibrationVerdict
+    error_class: ErrorClass | None = None
+    oracle_details: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class InvocationSpec:
+    """Immutable invocation specification produced by command builders."""
+
+    tool: str
+    executable: str
+    argv: list[str]
+    cwd: str
+    model: str | None
+    timeout_seconds: float
+    env_override_keys: list[str]
+    permission_summary: str
+    expected_raw_output_mode: str
+
+
+@dataclass(frozen=True)
+class HumanGatePayload:
+    """Two-phase Human Gate payload presenting frozen invocation specifications."""
+
+    run_id: str
+    runtime_root: str
+    runner_baseline: dict[str, str]
+    prj226_baseline: dict[str, str]
+    invocations: dict[str, InvocationSpec]
+    readiness: str
+    unresolved_parameters: list[str]
+
+
+# -----------------------------------------------------------------------------
+# Environment Policy & Invariants
+# -----------------------------------------------------------------------------
+
+ALLOWED_PRE_OVERRIDE_KEYS = {
+    "OPENCODE_CONFIG_CONTENT",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "PYTHONPATH",
+}
+
+FORBIDDEN_KEY_PATTERN = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|AUTH|API_KEY)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def validate_environment_override_keys(overrides: Mapping[str, str] | None) -> list[str]:
+    """
+    Validate environment override keys against allowlist and credential pattern rejection.
+
+    Returns the list of valid override key names.
+    Raises ValueError if any key is forbidden or not in allowlist.
+    """
+    if not overrides:
+        return []
+
+    override_keys: list[str] = []
+    for key in sorted(overrides.keys()):
+        # Check credential pattern
+        if FORBIDDEN_KEY_PATTERN.search(key):
+            raise ValueError(f"Environment override key '{key}' rejected by credential policy")
+        if key not in ALLOWED_PRE_OVERRIDE_KEYS:
+            raise ValueError(f"Environment override key '{key}' is not in allowed override list")
+        override_keys.append(key)
+    return override_keys
+
+
+def build_subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """
+    Construct child process environment by copying current environment and applying validated overrides.
+
+    Guarantees that full environment dumps are not serialized or logged.
+    """
+    validate_environment_override_keys(overrides)
+    env = os.environ.copy()
+    if overrides:
+        env.update(overrides)
+    return env
+
+
+# -----------------------------------------------------------------------------
+# Filesystem, Symlinks, & Fixtures
+# -----------------------------------------------------------------------------
+
+def check_no_symlinks(root_dir: Path | str) -> None:
+    """
+    Inspect directory tree using lstat semantics.
+
+    Raises ValueError (artifact validation failure) if any symlink exists.
+    """
+    root = Path(root_dir).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Directory not found: {root}")
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dp = Path(dirpath)
+        # Check if dirpath itself is a symlink (except when root itself was resolved)
+        if dp != root and os.path.islink(dp):
+            raise ValueError(f"Symlink detected in directory tree: {dp}")
+
+        for d in dirnames:
+            p = dp / d
+            if os.path.islink(p):
+                raise ValueError(f"Symlink detected in directory tree: {p}")
+
+        for f in filenames:
+            p = dp / f
+            if os.path.islink(p):
+                raise ValueError(f"Symlink detected in directory tree: {p}")
+
+
+def scan_workspace_for_symlinks(root_dir: Path | str) -> bool:
+    """
+    Scan directory tree using lstat semantics to detect any symlinks.
+
+    Returns True if any symlink is found, False otherwise.
+    """
+    root = Path(root_dir).resolve()
+    if not root.exists():
+        return False
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dp = Path(dirpath)
+        if dp != root and os.path.islink(dp):
+            return True
+        for d in dirnames:
+            if os.path.islink(dp / d):
+                return True
+        for f in filenames:
+            if os.path.islink(dp / f):
+                return True
+    return False
+
+
+def copy_fixture_to_workspace(fixture_dir: Path | str, target_dir: Path | str) -> Path:
+    """
+    Copy files from the committed fixture template into a disposable runtime workspace.
+
+    Verifies lstat symlink policy before copying.
+    The tracked fixture template remains untouched.
+    """
+    src = Path(fixture_dir).resolve()
+    dst = Path(target_dir).resolve()
+
+    # Pre-copy symlink check
+    check_no_symlinks(src)
+
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for item in src.rglob("*"):
+        rel_path = item.relative_to(src)
+        target_path = dst / rel_path
+        if item.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+        else:
+            shutil.copy2(item, target_path)
+
+    return dst
+
+
+def hash_directory_tree(directory_path: Path | str) -> str:
+    """
+    Compute a deterministic SHA-256 tree hash of all files within a directory.
+
+    Enforces symlink check using lstat semantics before hashing.
+    Traversal ordering sorts explicitly by normalized relative path.
+    """
+    root = Path(directory_path).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Directory not found for hashing: {root}")
+
+    check_no_symlinks(root)
+
+    hasher = hashlib.sha256()
+    file_rel_pairs = [
+        (str(p.relative_to(root).as_posix()), p)
+        for p in root.rglob("*")
+        if p.is_file()
+    ]
+    file_rel_pairs.sort(key=lambda pair: pair[0])
+
+    for rel_path_str, file_path in file_rel_pairs:
+        hasher.update(rel_path_str.encode("utf-8"))
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Status Mapping & Output Parsers
+# -----------------------------------------------------------------------------
 
 def map_status_to_error_class(
     status: CalibrationStatus,
@@ -92,69 +330,6 @@ def map_status_to_error_class(
             return ErrorClass.AGENT_EXECUTION_ERROR
         case _:
             return ErrorClass.AGENT_EXECUTION_ERROR
-
-
-def build_subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
-    """
-    Construct child process environment by copying current environment and applying overrides.
-
-    Guarantees that full environment dumps are not serialized or logged.
-    """
-    env = os.environ.copy()
-    if overrides:
-        env.update(overrides)
-    return env
-
-
-def copy_fixture_to_workspace(fixture_dir: Path | str, target_dir: Path | str) -> Path:
-    """
-    Copy files from the committed fixture template into a disposable runtime workspace.
-
-    The tracked fixture template remains untouched.
-    """
-    src = Path(fixture_dir).resolve()
-    dst = Path(target_dir).resolve()
-    dst.mkdir(parents=True, exist_ok=True)
-
-    for item in src.rglob("*"):
-        rel_path = item.relative_to(src)
-        target_path = dst / rel_path
-        if item.is_dir():
-            target_path.mkdir(parents=True, exist_ok=True)
-        else:
-            shutil.copy2(item, target_path)
-
-    return dst
-
-
-def hash_directory_tree(directory_path: Path | str) -> str:
-    """
-    Compute a deterministic SHA-256 tree hash of all files within a directory.
-
-    Traversal ordering sorts explicitly by normalized relative path.
-    Hash identity depends strictly on relative path and file bytes, independent
-    of absolute root, mtime, or filesystem directory traversal order.
-    """
-    root = Path(directory_path).resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"Directory not found for hashing: {root}")
-
-    hasher = hashlib.sha256()
-    # Collect all regular files and sort strictly by relative path string
-    file_rel_pairs = [
-        (str(p.relative_to(root).as_posix()), p)
-        for p in root.rglob("*")
-        if p.is_file()
-    ]
-    file_rel_pairs.sort(key=lambda pair: pair[0])
-
-    for rel_path_str, file_path in file_rel_pairs:
-        hasher.update(rel_path_str.encode("utf-8"))
-        with open(file_path, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-
-    return hasher.hexdigest()
 
 
 def run_calibration_subprocess(
@@ -200,10 +375,8 @@ def run_calibration_subprocess(
             exit_code = proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            # Safely identify the process group created for the spawned child
             try:
                 pgid = os.getpgid(spawned_pid)
-                # Verify pgid corresponds to child session before signaling group
                 if pgid == spawned_pid:
                     os.killpg(pgid, signal.SIGTERM)
                 else:
@@ -213,7 +386,6 @@ def run_calibration_subprocess(
             except Exception:
                 proc.terminate()
 
-            # Bounded grace period for graceful termination
             grace_start = time.monotonic()
             while time.monotonic() - grace_start < 2.0:
                 try:
@@ -222,7 +394,6 @@ def run_calibration_subprocess(
                 except subprocess.TimeoutExpired:
                     pass
 
-            # Force kill process group if child is still alive
             if proc.poll() is None:
                 try:
                     pgid = os.getpgid(spawned_pid)
@@ -235,11 +406,9 @@ def run_calibration_subprocess(
                 except Exception:
                     proc.kill()
 
-                # Bounded wait to reap child process
                 try:
                     exit_code = proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
-                    # Final poll fallback
                     proc.poll()
                     exit_code = proc.returncode
             else:
@@ -292,11 +461,10 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
     Parse OpenCode event stream and extract the terminal/final response payload.
 
     Safely parses JSONL, recognizes only explicitly supported terminal payload forms,
-    ignores recognized non-terminal/intermediate events (e.g. init, step, thought),
-    and rejects malformed JSON, empty streams, init-only streams, intermediate events
-    bearing arbitrary payloads/data, or streams with no recognized terminal payload.
+    and rejects malformed JSON, empty streams, init-only streams, intermediate events,
+    or streams without a supported response payload form.
 
-    Raises ValueError if event stream is malformed or contains no terminal payload.
+    Raises ValueError if event stream is malformed or contains no supported terminal payload.
     """
     stripped = raw_json_events.strip()
     if not stripped:
@@ -321,15 +489,18 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
 
         # Explicitly supported terminal / final response message formats
         if event_type == "message":
-            # Candidate payload forms under message event
             candidate = event.get("data") if "data" in event else (
                 event.get("message") if "message" in event else event.get("payload")
             )
             if isinstance(candidate, dict):
                 terminal_payload = candidate
             elif candidate is None:
-                # If message event itself has direct payload fields
-                payload_subset = {k: v for k, v in event.items() if k not in ("type", "event")}
+                # Direct payload fields: reject metadata-only dictionaries
+                excluded_metadata_keys = {
+                    "type", "event", "session", "timestamp", "id", "duration",
+                    "metadata", "created_at", "updated_at",
+                }
+                payload_subset = {k: v for k, v in event.items() if k not in excluded_metadata_keys}
                 if payload_subset:
                     terminal_payload = payload_subset
         elif event_type in ("final_response", "result", "terminal"):
@@ -343,13 +514,16 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
     return terminal_payload
 
 
+# -----------------------------------------------------------------------------
+# Validation & Serialization (NB-SEM-001 & Case Result)
+# -----------------------------------------------------------------------------
+
 def validate_calibration_result(result: CalibrationResult) -> None:
     """
     Programmatically validate CalibrationResult invariants using Python standard library.
 
-    Enforces required non-empty fields, enum memberships, duration bounds, state consistency,
-    and valid artifact path representations.
-    Raises ValueError on validation failure.
+    Enforces NB-SEM-001: status == PASS requires exit_code == 0, timed_out == False,
+    error_class is None, and structured_output_valid == True.
     """
     if not isinstance(result.calibration_id, str) or not result.calibration_id.strip():
         raise ValueError("calibration_id must be a non-empty string")
@@ -371,6 +545,9 @@ def validate_calibration_result(result: CalibrationResult) -> None:
 
     if not isinstance(result.duration_ms, int) or result.duration_ms < 0:
         raise ValueError(f"duration_ms must be a non-negative integer: {result.duration_ms}")
+
+    if not isinstance(result.structured_output_valid, bool):
+        raise ValueError("structured_output_valid must be a boolean")
 
     if result.stdout_artifact is not None:
         if not isinstance(result.stdout_artifact, str) or not result.stdout_artifact.strip():
@@ -394,6 +571,8 @@ def validate_calibration_result(result: CalibrationResult) -> None:
             raise ValueError("PASS status cannot have timed_out=True")
         if result.exit_code is not None and result.exit_code != 0:
             raise ValueError(f"PASS status cannot have non-zero exit_code: {result.exit_code}")
+        if not result.structured_output_valid:
+            raise ValueError("PASS status requires structured_output_valid=True (NB-SEM-001)")
     else:
         if result.error_class is None:
             raise ValueError(f"Non-PASS status ({result.status}) must specify error_class")
@@ -408,66 +587,432 @@ def serialize_calibration_result(result: CalibrationResult) -> str:
     """
     validate_calibration_result(result)
     raw_dict = asdict(result)
-
-    # Convert Enums to string values
     raw_dict["status"] = result.status.value
     raw_dict["error_class"] = result.error_class.value if result.error_class else None
-
     return json.dumps(raw_dict, indent=2)
 
+
+def validate_calibration_case_result(case_result: CalibrationCaseResult) -> None:
+    """
+    Programmatically validate CalibrationCaseResult invariants.
+
+    Ensures operational invocation outcome and test verdict remain distinct,
+    and enforces governance blocker if unexpected mutation occurs.
+    """
+    if not isinstance(case_result.case_id, str) or not case_result.case_id.strip():
+        raise ValueError("case_id must be a non-empty string")
+
+    if not isinstance(case_result.tool, str) or not case_result.tool.strip():
+        raise ValueError("tool must be a non-empty string")
+
+    if not isinstance(case_result.pre_hash, str) or len(case_result.pre_hash) != 64:
+        raise ValueError("pre_hash must be a 64-character hex string")
+
+    if not isinstance(case_result.post_hash, str) or len(case_result.post_hash) != 64:
+        raise ValueError("post_hash must be a 64-character hex string")
+
+    if not isinstance(case_result.workspace_mutated, bool):
+        raise ValueError("workspace_mutated must be a boolean")
+
+    # Verify workspace_mutated is consistent with pre/post hash equality
+    expected_mutated = (case_result.pre_hash != case_result.post_hash)
+    if case_result.workspace_mutated != expected_mutated:
+        raise ValueError(
+            f"workspace_mutated ({case_result.workspace_mutated}) contradicts hash comparison ({expected_mutated})"
+        )
+
+    if not isinstance(case_result.verdict, CalibrationVerdict):
+        raise ValueError(f"Invalid verdict: {case_result.verdict}")
+
+    # Validate underlying invocation result
+    validate_calibration_result(case_result.invocation_result)
+
+    # Invariant: If workspace was unexpectedly mutated and verdict is FAIL, error_class must be GOVERNANCE_BLOCKER
+    if case_result.workspace_mutated and case_result.verdict == CalibrationVerdict.FAIL:
+        if case_result.error_class != ErrorClass.GOVERNANCE_BLOCKER:
+            raise ValueError(
+                f"Unexpected mutation on FAIL case must have error_class=GOVERNANCE_BLOCKER, got {case_result.error_class}"
+            )
+
+    if case_result.verdict == CalibrationVerdict.PASS:
+        if case_result.error_class is not None:
+            raise ValueError(f"PASS verdict must have error_class=None, got {case_result.error_class}")
+
+
+def serialize_calibration_case_result(case_result: CalibrationCaseResult) -> str:
+    """
+    Validate and serialize CalibrationCaseResult to formatted JSON string.
+    """
+    validate_calibration_case_result(case_result)
+    raw_dict = asdict(case_result)
+    raw_dict["verdict"] = case_result.verdict.value
+    raw_dict["error_class"] = case_result.error_class.value if case_result.error_class else None
+    raw_dict["invocation_result"]["status"] = case_result.invocation_result.status.value
+    raw_dict["invocation_result"]["error_class"] = (
+        case_result.invocation_result.error_class.value if case_result.invocation_result.error_class else None
+    )
+    return json.dumps(raw_dict, indent=2)
+
+
+# -----------------------------------------------------------------------------
+# Tool Discovery (NB-OP-001)
+# -----------------------------------------------------------------------------
 
 def discover_tools(
     custom_paths: Mapping[str, str] | None = None,
     tool_names: list[str] | None = None,
-) -> dict[str, ToolSpec]:
+) -> dict[str, ToolDiscoveryRecord]:
     """
-    Discover installed CLI tools and retrieve their version information safely.
+    Discover installed CLI tools and retrieve safe version probe records.
 
-    Resolves executables dynamically via shutil.which() or explicit absolute paths.
-    Does NOT execute model prompts or tasks.
+    Produces explicit ToolDiscoveryRecord for each tool with DISCOVERED, NOT_FOUND,
+    or PROBE_FAILED status without hiding probe errors.
     """
-    tools: dict[str, ToolSpec] = {}
-
-    # Target tool names to resolve
+    records: dict[str, ToolDiscoveryRecord] = {}
     names = tool_names if tool_names is not None else ["codex", "agy", "opencode2"]
 
-    # Candidate lookup map: either custom path or resolution via shutil.which
     candidates: dict[str, str | None] = {}
     for name in names:
         if custom_paths and name in custom_paths:
             candidates[name] = custom_paths[name]
         else:
-            resolved = shutil.which(name)
-            candidates[name] = resolved
+            candidates[name] = shutil.which(name)
 
-    # Also include any additional custom paths provided
     if custom_paths:
         for name, path in custom_paths.items():
             if name not in candidates:
                 candidates[name] = path
 
-    for tool_name, exe_path_or_none in candidates.items():
-        if not exe_path_or_none:
+    for tool_name, exe_candidate in candidates.items():
+        if not exe_candidate:
+            records[tool_name] = ToolDiscoveryRecord(
+                tool_name=tool_name,
+                requested_executable=tool_name,
+                resolved_path=None,
+                version_exit_code=None,
+                version=None,
+                discovery_status=DiscoveryStatus.NOT_FOUND,
+                safe_error="Executable not found on PATH or custom location",
+            )
             continue
-        exe_path = str(Path(exe_path_or_none).resolve())
-        if Path(exe_path).is_file() and os.access(exe_path, os.X_OK):
-            try:
-                res = subprocess.run(
-                    [exe_path, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5.0,
-                    check=False,
-                )
-                ver_str = res.stdout.strip() or res.stderr.strip() or "unknown"
-                # Keep first line of version output
-                first_line = ver_str.splitlines()[0] if ver_str.splitlines() else "unknown"
-                tools[tool_name] = ToolSpec(
-                    tool_name=tool_name,
-                    executable_path=exe_path,
-                    version=first_line,
-                )
-            except Exception:
-                pass
 
-    return tools
+        resolved_file = Path(exe_candidate).resolve()
+        if not resolved_file.is_file() or not os.access(resolved_file, os.X_OK):
+            records[tool_name] = ToolDiscoveryRecord(
+                tool_name=tool_name,
+                requested_executable=exe_candidate,
+                resolved_path=None,
+                version_exit_code=None,
+                version=None,
+                discovery_status=DiscoveryStatus.NOT_FOUND,
+                safe_error="Path exists but is not an executable file" if resolved_file.exists() else "File not found",
+            )
+            continue
+
+        try:
+            res = subprocess.run(
+                [str(resolved_file), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            if res.returncode == 0:
+                ver_str = res.stdout.strip() or res.stderr.strip() or "unknown"
+                first_line = ver_str.splitlines()[0] if ver_str.splitlines() else "unknown"
+                records[tool_name] = ToolDiscoveryRecord(
+                    tool_name=tool_name,
+                    requested_executable=exe_candidate,
+                    resolved_path=str(resolved_file),
+                    version_exit_code=res.returncode,
+                    version=first_line,
+                    discovery_status=DiscoveryStatus.DISCOVERED,
+                )
+            else:
+                records[tool_name] = ToolDiscoveryRecord(
+                    tool_name=tool_name,
+                    requested_executable=exe_candidate,
+                    resolved_path=str(resolved_file),
+                    version_exit_code=res.returncode,
+                    version=None,
+                    discovery_status=DiscoveryStatus.PROBE_FAILED,
+                    safe_error=f"Version probe exited with code {res.returncode}",
+                )
+        except subprocess.TimeoutExpired:
+            records[tool_name] = ToolDiscoveryRecord(
+                tool_name=tool_name,
+                requested_executable=exe_candidate,
+                resolved_path=str(resolved_file),
+                version_exit_code=None,
+                version=None,
+                discovery_status=DiscoveryStatus.PROBE_FAILED,
+                safe_error="Version probe timed out after 5.0s",
+            )
+        except Exception as e:
+            records[tool_name] = ToolDiscoveryRecord(
+                tool_name=tool_name,
+                requested_executable=exe_candidate,
+                resolved_path=str(resolved_file),
+                version_exit_code=None,
+                version=None,
+                discovery_status=DiscoveryStatus.PROBE_FAILED,
+                safe_error=f"Version probe failed: {type(e).__name__}",
+            )
+
+    return records
+
+
+# -----------------------------------------------------------------------------
+# OpenCode Config & Agent Generator
+# -----------------------------------------------------------------------------
+
+def build_opencode_config_dict() -> dict[str, Any]:
+    """
+    Generate the strict run-scoped OpenCode configuration dictionary with custom primary agent.
+
+    Denies all actions by default, allows only read, glob, and grep, and includes no ask rules.
+    """
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "share": "disabled",
+        "snapshots": False,
+        "default_agent": "calibration-readonly",
+        "agents": {
+            "calibration-readonly": {
+                "description": "Synthetic read-only calibration agent",
+                "mode": "primary",
+                "permissions": [
+                    {
+                        "action": "*",
+                        "resource": "*",
+                        "effect": "deny",
+                    },
+                    {
+                        "action": "read",
+                        "resource": "*",
+                        "effect": "allow",
+                    },
+                    {
+                        "action": "glob",
+                        "resource": "*",
+                        "effect": "allow",
+                    },
+                    {
+                        "action": "grep",
+                        "resource": "*",
+                        "effect": "allow",
+                    },
+                ],
+            }
+        },
+    }
+
+
+def build_opencode_config_json() -> str:
+    """Generate compact/serialized OpenCode config JSON for OPENCODE_CONFIG_CONTENT."""
+    return json.dumps(build_opencode_config_dict())
+
+
+# -----------------------------------------------------------------------------
+# Pure Command Builders
+# -----------------------------------------------------------------------------
+
+def build_codex_invocation(
+    executable: str,
+    workspace: str,
+    prompt: str,
+    payload_schema_path: str,
+    output_path: str,
+    model: str | None = None,
+    timeout_seconds: float = 300.0,
+    overrides: Mapping[str, str] | None = None,
+) -> InvocationSpec:
+    """
+    Pure command builder for Codex CLI matching installed 0.148.0 contract.
+
+    Produces argv as a list without executing subprocess.
+    """
+    override_keys = validate_environment_override_keys(overrides)
+
+    argv = [
+        executable,
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "-C",
+        str(Path(workspace).resolve()),
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--output-schema",
+        str(Path(payload_schema_path).resolve()),
+        "-o",
+        str(Path(output_path).resolve()),
+    ]
+    if model is not None:
+        argv.extend(["--model", model])
+    argv.append(prompt)
+
+    return InvocationSpec(
+        tool="codex",
+        executable=executable,
+        argv=argv,
+        cwd=str(Path(workspace).resolve()),
+        model=model,
+        timeout_seconds=timeout_seconds,
+        env_override_keys=override_keys,
+        permission_summary="sandbox=read-only, ask-for-approval=never, ephemeral=true",
+        expected_raw_output_mode="output_last_message_json",
+    )
+
+
+def build_agy_invocation(
+    executable: str,
+    workspace: str,
+    prompt: str,
+    payload_schema_path: str,
+    model: str | None = None,
+    timeout_seconds: float = 300.0,
+    overrides: Mapping[str, str] | None = None,
+) -> InvocationSpec:
+    """
+    Pure command builder for Antigravity CLI matching installed 1.1.23 contract.
+
+    Uses boolean --sandbox flag and plan mode for read-only evaluation.
+    """
+    override_keys = validate_environment_override_keys(overrides)
+
+    argv = [
+        executable,
+        "-p",
+        prompt,
+        "--mode=plan",
+        "--sandbox",
+        "--output-format",
+        "json",
+        "--json-schema",
+        str(Path(payload_schema_path).resolve()),
+        "--print-timeout",
+        f"{int(timeout_seconds)}s",
+    ]
+    if model is not None:
+        argv.extend(["--model", model])
+
+    return InvocationSpec(
+        tool="agy",
+        executable=executable,
+        argv=argv,
+        cwd=str(Path(workspace).resolve()),
+        model=model,
+        timeout_seconds=timeout_seconds,
+        env_override_keys=override_keys,
+        permission_summary="mode=plan, sandbox=true(boolean)",
+        expected_raw_output_mode="stdout_json",
+    )
+
+
+def build_opencode_invocation(
+    executable: str,
+    workspace: str,
+    prompt: str,
+    model: str | None = None,
+    agent_name: str = "calibration-readonly",
+    timeout_seconds: float = 300.0,
+    overrides: Mapping[str, str] | None = None,
+) -> InvocationSpec:
+    """
+    Pure command builder for OpenCode CLI matching installed v0.0.0-beta-18743 contract.
+
+    Uses top-level --standalone, run subcommand with --format json and --agent calibration-readonly.
+    """
+    override_keys = validate_environment_override_keys(overrides)
+
+    argv = [
+        executable,
+        "--standalone",
+        "run",
+        "--format",
+        "json",
+        "--agent",
+        agent_name,
+    ]
+    if model is not None:
+        argv.extend(["--model", model])
+    argv.append(prompt)
+
+    return InvocationSpec(
+        tool="opencode2",
+        executable=executable,
+        argv=argv,
+        cwd=str(Path(workspace).resolve()),
+        model=model,
+        timeout_seconds=timeout_seconds,
+        env_override_keys=override_keys,
+        permission_summary=f"standalone=true, agent={agent_name}, config=deny-all+read/glob/grep",
+        expected_raw_output_mode="stdout_json_events",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Human Gate Payload Generator & Two-Phase Invariant
+# -----------------------------------------------------------------------------
+
+def build_human_gate_payload(
+    run_id: str,
+    runtime_root: str,
+    runner_baseline: dict[str, str],
+    prj226_baseline: dict[str, str],
+    invocations: dict[str, InvocationSpec],
+) -> HumanGatePayload:
+    """
+    Construct immutable Human Gate payload presenting frozen invocation specifications.
+
+    Evaluates readiness: if any model parameter is None/unresolved, readiness is NOT_READY.
+    """
+    unresolved_parameters: list[str] = []
+    for tool_name, spec in invocations.items():
+        if spec.model is None or not spec.model.strip():
+            unresolved_parameters.append(f"{tool_name}.model")
+
+    readiness = "LIVE_READY" if not unresolved_parameters else "NOT_READY"
+
+    return HumanGatePayload(
+        run_id=run_id,
+        runtime_root=str(Path(runtime_root).resolve()),
+        runner_baseline=dict(runner_baseline),
+        prj226_baseline=dict(prj226_baseline),
+        invocations=dict(invocations),
+        readiness=readiness,
+        unresolved_parameters=unresolved_parameters,
+    )
+
+
+def serialize_human_gate_payload(payload: HumanGatePayload) -> str:
+    """Serialize HumanGatePayload to formatted JSON string without secret values."""
+    raw_dict = asdict(payload)
+    return json.dumps(raw_dict, indent=2)
+
+
+# -----------------------------------------------------------------------------
+# Runtime Root Lifecycle & Collision Safety
+# -----------------------------------------------------------------------------
+
+def prepare_runtime_root(base_dir: Path | str, run_id: str) -> Path:
+    """
+    Create disposable external runtime root directory for a given run ID.
+
+    Fails closed if the run ID directory already exists (immutable run history invariant).
+    """
+    if not run_id or not run_id.strip():
+        raise ValueError("run_id must be a non-empty string")
+
+    root = Path(base_dir).resolve() / run_id
+    if root.exists():
+        raise FileExistsError(f"Runtime root for run ID '{run_id}' already exists: {root}")
+
+    (root / "workspace").mkdir(parents=True, exist_ok=False)
+    (root / "raw_logs").mkdir(parents=True, exist_ok=False)
+    (root / "config").mkdir(parents=True, exist_ok=False)
+
+    return root
