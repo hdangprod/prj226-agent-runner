@@ -441,6 +441,7 @@ def run_calibration_subprocess(
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             stdout=out_f,
             stderr=err_f,
             env=sub_env,

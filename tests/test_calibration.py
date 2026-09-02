@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from prj226_runner.calibration import (
     ALL_CASE_IDS,
@@ -719,6 +720,63 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertGreaterEqual(duration_ms, 0)
         self.assertEqual(stdout_path.read_text(encoding="utf-8"), "hello stdout\n")
         self.assertEqual(stderr_path.read_text(encoding="utf-8"), "hello stderr\n")
+
+    def test_subprocess_popen_stdin_devnull_policy(self) -> None:
+        """Verify run_calibration_subprocess explicitly passes stdin=subprocess.DEVNULL to Popen."""
+        import subprocess as sp
+        stdout_path = self.test_root / "mock_stdout.log"
+        stderr_path = self.test_root / "mock_stderr.log"
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.wait.return_value = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            exit_code, timed_out, duration_ms = run_calibration_subprocess(
+                cmd=["dummy_exe"],
+                cwd=self.test_root,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5.0,
+            )
+
+            mock_popen.assert_called_once()
+            call_kwargs = mock_popen.call_args.kwargs
+            self.assertIn("stdin", call_kwargs, "Popen must be called with an explicit stdin argument")
+            self.assertIs(
+                call_kwargs["stdin"],
+                sp.DEVNULL,
+                f"Popen stdin argument must be subprocess.DEVNULL, got {call_kwargs['stdin']}",
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(timed_out)
+
+    def test_subprocess_behavioral_immediate_eof(self) -> None:
+        """Verify real child process reading stdin observes immediate EOF (0 bytes read) and does not hang."""
+        stdout_path = self.test_root / "eof_stdout.log"
+        stderr_path = self.test_root / "eof_stderr.log"
+
+        child_code = (
+            "import sys\n"
+            "data = sys.stdin.read()\n"
+            "print(f'READ_BYTES={len(data)}')\n"
+        )
+        cmd = [sys.executable, "-c", child_code]
+
+        exit_code, timed_out, duration_ms = run_calibration_subprocess(
+            cmd=cmd,
+            cwd=self.test_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=5.0,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(timed_out)
+        self.assertTrue(stdout_path.exists())
+        stdout_content = stdout_path.read_text(encoding="utf-8").strip()
+        self.assertEqual(stdout_content, "READ_BYTES=0")
+        self.assertEqual(stderr_path.read_text(encoding="utf-8"), "")
 
     def test_parse_codex_output(self) -> None:
         """Verify parsing of Codex structured output JSON."""
