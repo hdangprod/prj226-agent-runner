@@ -14,6 +14,7 @@ from unittest.mock import patch
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.runner import (
     RoleConfig,
+    _fresh_reviewer_env,
     build_builder_invocation,
     build_reviewer_invocation,
     candidate_branch_name,
@@ -272,9 +273,31 @@ class TestHarn001Runner(unittest.TestCase):
                 self.assertLess(argv.index("--format"), argv.index("--agent"))
                 self.assertLess(argv.index("--agent"), argv.index("--model"))
 
-    def test_reviewer_has_fresh_xdg_configuration(self) -> None:
-        self.execute_runner()
-        self.assertTrue((self.runtime / "HARN-TEST-001" / "dv" / "xdg-config" / "opencode.json").exists())
+    def test_reviewer_delivers_readonly_policy_in_env_and_correct_xdg_path(self) -> None:
+        expected_permissions = [
+            {"action": "*", "resource": "*", "effect": "deny"},
+            {"action": "read", "resource": "*", "effect": "allow"},
+            {"action": "glob", "resource": "*", "effect": "allow"},
+            {"action": "grep", "resource": "*", "effect": "allow"},
+        ]
+        for role in ("dv", "sos"):
+            with self.subTest(role=role):
+                role_runtime = self.runtime / "HARN-TEST-001" / role
+                env = _fresh_reviewer_env(role_runtime)
+                policy = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+                persisted = role_runtime / "xdg-config" / "opencode" / "opencode.json"
+
+                self.assertEqual(env["XDG_CONFIG_HOME"], str(role_runtime / "xdg-config"))
+                self.assertEqual(env["XDG_DATA_HOME"], str(role_runtime / "xdg-data"))
+                self.assertEqual(env["XDG_STATE_HOME"], str(role_runtime / "xdg-state"))
+                self.assertEqual(policy["default_agent"], "harn-readonly")
+                self.assertIn("harn-readonly", policy["agents"])
+                self.assertEqual(policy["agents"]["harn-readonly"]["mode"], "primary")
+                self.assertEqual(policy["agents"]["harn-readonly"]["permissions"], expected_permissions)
+                self.assertTrue(persisted.is_file())
+                self.assertFalse((role_runtime / "xdg-config" / "opencode.json").exists())
+                self.assertEqual(persisted.read_text(encoding="utf-8"), env["OPENCODE_CONFIG_CONTENT"])
+                self.assertEqual(json.loads(persisted.read_text(encoding="utf-8")), policy)
 
     def test_manifest_excludes_environment_values(self) -> None:
         self.execute_runner(SECRET_TOKEN="do-not-record")

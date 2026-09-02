@@ -378,8 +378,14 @@ def _fresh_reviewer_env(directory: Path) -> dict[str, str]:
     policy = build_opencode_config_dict()
     policy["default_agent"] = "harn-readonly"
     policy["agents"]["harn-readonly"] = policy["agents"].pop("calibration-readonly")
-    _write_json(config_dir / "opencode.json", policy)
-    return build_subprocess_env({"XDG_CONFIG_HOME": str(config_dir), "XDG_DATA_HOME": str(data_dir), "XDG_STATE_HOME": str(state_dir)})
+    policy_json = json.dumps(policy, sort_keys=True)
+    _write_text(config_dir / "opencode" / "opencode.json", policy_json)
+    return build_subprocess_env({
+        "OPENCODE_CONFIG_CONTENT": policy_json,
+        "XDG_CONFIG_HOME": str(config_dir),
+        "XDG_DATA_HOME": str(data_dir),
+        "XDG_STATE_HOME": str(state_dir),
+    })
 
 
 def _parse_reviewer_result(path: Path, kind: str) -> tuple[str, list[Any]]:
