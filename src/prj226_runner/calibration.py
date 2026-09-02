@@ -1015,14 +1015,14 @@ def build_opencode_invocation(
     """
     Pure command builder for OpenCode CLI matching installed v0.0.0-beta-18743 contract.
 
-    Uses top-level --standalone, run subcommand with --format json and --agent calibration-readonly.
+    Uses the run subcommand with --standalone, --format json, and --agent calibration-readonly.
     """
     override_keys = validate_environment_override_keys(overrides)
 
     argv = [
         executable,
-        "--standalone",
         "run",
+        "--standalone",
         "--format",
         "json",
         "--agent",

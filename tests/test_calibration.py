@@ -518,7 +518,7 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertNotIn("read-only", spec.argv)
 
     def test_opencode_builder_standalone_and_agent(self) -> None:
-        """Verify OpenCode builder generates top-level --standalone and explicit --agent."""
+        """Verify OpenCode builder generates run-level --standalone and explicit --agent."""
         spec = build_opencode_invocation(
             executable="/bin/opencode2",
             workspace="/tmp/ws",
@@ -529,8 +529,8 @@ class TestCalibrationHarness(unittest.TestCase):
         )
         expected_argv = [
             "/bin/opencode2",
-            "--standalone",
             "run",
+            "--standalone",
             "--format",
             "json",
             "--agent",
@@ -540,6 +540,11 @@ class TestCalibrationHarness(unittest.TestCase):
             "Extract CALIBRATION_KEY",
         ]
         self.assertEqual(spec.argv, expected_argv)
+        self.assertEqual(spec.argv[0], "/bin/opencode2")
+        self.assertLess(spec.argv.index("run"), spec.argv.index("--standalone"))
+        self.assertLess(spec.argv.index("--standalone"), spec.argv.index("--format"))
+        self.assertLess(spec.argv.index("--format"), spec.argv.index("--agent"))
+        self.assertLess(spec.argv.index("--agent"), spec.argv.index("--model"))
         self.assertEqual(spec.cwd, str(Path("/tmp/ws").resolve()))
 
     def test_opencode_config_generation(self) -> None:

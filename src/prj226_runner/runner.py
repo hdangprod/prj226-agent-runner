@@ -301,7 +301,7 @@ def build_builder_invocation(role: RoleConfig, workspace: Path, packet: TaskPack
 def build_reviewer_invocation(role: RoleConfig, prompt: str) -> list[str]:
     """Build a provider invocation kept separate from lifecycle semantics."""
     if role.tool == "opencode2":
-        return [role.executable, "--standalone", "run", "--format", "json", "--agent", "harn-readonly",
+        return [role.executable, "run", "--standalone", "--format", "json", "--agent", "harn-readonly",
                 "--model", role.model, prompt]
     return [role.executable, "--model", role.model, prompt]
 

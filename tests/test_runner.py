@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.runner import (
+    RoleConfig,
     build_builder_invocation,
+    build_reviewer_invocation,
     candidate_branch_name,
     inspect_packet,
     load_config,
@@ -257,6 +259,18 @@ class TestHarn001Runner(unittest.TestCase):
 
     def test_candidate_branch_is_deterministic(self) -> None:
         self.assertEqual(candidate_branch_name(parse_task_packet(self.packet_path)), "harn-candidate/HARN-TEST-HARN-TEST-001")
+
+    def test_dv_and_sos_reviewer_argv_places_standalone_after_run(self) -> None:
+        """Both OpenCode reviewer roles must use the current run-level standalone contract."""
+        for name, model in (("dv", "fake-muse"), ("sos", "fake-mimo")):
+            with self.subTest(role=name):
+                role = RoleConfig("opencode2", "/bin/opencode2", model, 20)
+                argv = build_reviewer_invocation(role, "Review this candidate")
+                self.assertEqual(argv[0], "/bin/opencode2")
+                self.assertLess(argv.index("run"), argv.index("--standalone"))
+                self.assertLess(argv.index("--standalone"), argv.index("--format"))
+                self.assertLess(argv.index("--format"), argv.index("--agent"))
+                self.assertLess(argv.index("--agent"), argv.index("--model"))
 
     def test_reviewer_has_fresh_xdg_configuration(self) -> None:
         self.execute_runner()
