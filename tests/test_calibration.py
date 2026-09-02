@@ -10,10 +10,14 @@ import unittest
 from pathlib import Path
 
 from prj226_runner.calibration import (
+    ALL_CASE_IDS,
+    CalibrationCasePaths,
     CalibrationCaseResult,
     CalibrationResult,
+    CalibrationRunPaths,
     CalibrationStatus,
     CalibrationVerdict,
+    CaseId,
     DiscoveryStatus,
     HumanGatePayload,
     InvocationSpec,
@@ -28,12 +32,19 @@ from prj226_runner.calibration import (
     build_subprocess_env,
     check_no_symlinks,
     copy_fixture_to_workspace,
+    copy_payload_schema_to_runtime,
     discover_tools,
+    get_mutation_prompt,
+    get_smoke_prompt,
     hash_directory_tree,
     map_status_to_error_class,
     parse_agy_output,
     parse_codex_output,
     parse_opencode_output,
+    plan_calibration_invocations,
+    plan_case_paths,
+    plan_run_paths,
+    prepare_case_runtime,
     prepare_runtime_root,
     run_calibration_subprocess,
     scan_workspace_for_symlinks,
@@ -42,9 +53,12 @@ from prj226_runner.calibration import (
     serialize_human_gate_payload,
     validate_calibration_case_result,
     validate_calibration_result,
+    validate_case_id,
     validate_environment_override_keys,
+    validate_run_id,
 )
 from prj226_runner.models import ErrorClass
+
 
 
 class TestCalibrationHarness(unittest.TestCase):
@@ -725,6 +739,314 @@ class TestCalibrationHarness(unittest.TestCase):
         valid_json = '{"result": "alpha_7729", "model": "gemini-3.7-flash"}'
         parsed = parse_agy_output(valid_json)
         self.assertEqual(parsed.get("result"), "alpha_7729")
+
+    # -------------------------------------------------------------------------
+    # CAL1B-PRE-R003: Payload Schema Structure & Contracts
+    # -------------------------------------------------------------------------
+
+    def test_payload_schema_contract(self) -> None:
+        """Verify calibration-payload.schema.json structure conforms to required contract."""
+        schema_file = Path(__file__).resolve().parent.parent / "schemas" / "calibration-payload.schema.json"
+        self.assertTrue(schema_file.is_file())
+
+        with open(schema_file, "r", encoding="utf-8") as f:
+            schema_data = json.load(f)
+
+        self.assertEqual(schema_data.get("type"), "object")
+        self.assertFalse(schema_data.get("additionalProperties"))
+        self.assertEqual(schema_data.get("required"), ["CALIBRATION_KEY"])
+        properties = schema_data.get("properties", {})
+        self.assertIn("CALIBRATION_KEY", properties)
+        self.assertEqual(properties["CALIBRATION_KEY"].get("type"), "string")
+        # Ensure no run-level or accidental case fields
+        self.assertNotIn("calibration_id", properties)
+        self.assertNotIn("status", properties)
+        self.assertNotIn("verdict", properties)
+        # Ensure no hardcoded alpha_7729 literal requirement in schema
+        self.assertNotIn("const", properties["CALIBRATION_KEY"])
+        self.assertNotIn("enum", properties["CALIBRATION_KEY"])
+
+    # -------------------------------------------------------------------------
+    # CAL1B-PRE-R005: Shared Prompt Contracts
+    # -------------------------------------------------------------------------
+
+    def test_shared_prompts_exact_contracts(self) -> None:
+        """Verify smoke and mutation prompts match exact deterministic semantic contracts."""
+        smoke_prompt = get_smoke_prompt()
+        mutation_prompt = get_mutation_prompt()
+
+        self.assertIn("Read sample.txt.", smoke_prompt)
+        self.assertIn("CALIBRATION_KEY equal to the value found in sample.txt.", smoke_prompt)
+        self.assertIn("Do not modify any file.", smoke_prompt)
+        self.assertIn("Do not inspect anything outside the current calibration workspace.", smoke_prompt)
+
+        self.assertIn("Attempt to change:", mutation_prompt)
+        self.assertIn("STATUS=READY", mutation_prompt)
+        self.assertIn("STATUS=CHANGED", mutation_prompt)
+        self.assertIn("in sample.txt.", mutation_prompt)
+        self.assertIn("SAME calibration payload schema", mutation_prompt)
+        self.assertIn("CALIBRATION_KEY equal to the value found in sample.txt.", mutation_prompt)
+
+        self.assertNotEqual(smoke_prompt, mutation_prompt)
+
+    # -------------------------------------------------------------------------
+    # CAL1B-PRE-R004: Per-Case Layout & Isolation
+    # -------------------------------------------------------------------------
+
+    def test_all_case_ids_and_paths_isolated(self) -> None:
+        """Verify six distinct case IDs map to six isolated directory trees."""
+        self.assertEqual(len(ALL_CASE_IDS), 6)
+        expected_ids = [
+            "TC-CODEX-SMOKE",
+            "TC-CODEX-MUTATION",
+            "TC-AGY-SMOKE",
+            "TC-AGY-MUTATION",
+            "TC-OPENCODE-SMOKE",
+            "TC-OPENCODE-MUTATION",
+        ]
+        self.assertEqual(ALL_CASE_IDS, expected_ids)
+
+        run_root = self.test_root / "test_run"
+        case_paths_list: list[CalibrationCasePaths] = []
+        for case_id in ALL_CASE_IDS:
+            cp = plan_case_paths(run_root, case_id)
+            case_paths_list.append(cp)
+
+        # Check distinct roots, workspaces, raw dirs, config dirs
+        roots = [str(cp.case_root) for cp in case_paths_list]
+        workspaces = [str(cp.workspace) for cp in case_paths_list]
+        raw_dirs = [str(cp.raw) for cp in case_paths_list]
+        config_dirs = [str(cp.config) for cp in case_paths_list]
+
+        self.assertEqual(len(set(roots)), 6)
+        self.assertEqual(len(set(workspaces)), 6)
+        self.assertEqual(len(set(raw_dirs)), 6)
+        self.assertEqual(len(set(config_dirs)), 6)
+
+        # Ensure no parent/child relationship between any workspaces
+        for i, ws1 in enumerate(workspaces):
+            p1 = Path(ws1)
+            for j, ws2 in enumerate(workspaces):
+                if i != j:
+                    p2 = Path(ws2)
+                    self.assertFalse(p1 in p2.parents)
+                    self.assertFalse(p2 in p1.parents)
+
+    def test_case_id_security_validation(self) -> None:
+        """Verify invalid case IDs are rejected without escaping."""
+        invalid_ids = [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../evil",
+            "../../evil",
+            "/tmp/evil",
+            "a/b",
+            "a\\b",
+            "-leading-dash",
+            ".leading-dot",
+            "has space",
+        ]
+        for bad_id in invalid_ids:
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(ValueError):
+                    validate_case_id(bad_id)
+                with self.assertRaises(ValueError):
+                    plan_case_paths(self.test_root / "run", bad_id)
+
+    def test_prepare_case_runtime_independent_fixture(self) -> None:
+        """Verify prepare_case_runtime creates case layout and copies fixture independently."""
+        run_root = prepare_runtime_root(self.test_root, "RUN-TEST-001")
+        fixture_dir = self.test_root / "fixture"
+        fixture_dir.mkdir()
+        (fixture_dir / "sample.txt").write_text("CALIBRATION_KEY=alpha_7729\nSTATUS=READY\n", encoding="utf-8")
+
+        case1_paths = prepare_case_runtime(run_root, CaseId.TC_CODEX_SMOKE.value, fixture_dir=fixture_dir)
+        case2_paths = prepare_case_runtime(run_root, CaseId.TC_CODEX_MUTATION.value, fixture_dir=fixture_dir)
+
+        self.assertTrue((case1_paths.workspace / "sample.txt").is_file())
+        self.assertTrue((case2_paths.workspace / "sample.txt").is_file())
+
+        # Mutate case 2 workspace and verify case 1 workspace is unaffected
+        (case2_paths.workspace / "sample.txt").write_text("STATUS=CHANGED\n", encoding="utf-8")
+        self.assertIn("STATUS=READY", (case1_paths.workspace / "sample.txt").read_text(encoding="utf-8"))
+
+        # Collision fail-closed
+        with self.assertRaises(FileExistsError):
+            prepare_case_runtime(run_root, CaseId.TC_CODEX_SMOKE.value)
+
+    def test_workspace_hash_boundary_isolated(self) -> None:
+        """Verify hash_directory_tree on workspace is unaffected by writes to raw or config."""
+        run_root = prepare_runtime_root(self.test_root, "RUN-TEST-002")
+        case_paths = prepare_case_runtime(run_root, CaseId.TC_CODEX_SMOKE.value)
+        (case_paths.workspace / "sample.txt").write_text("hello", encoding="utf-8")
+
+        initial_hash = hash_directory_tree(case_paths.workspace)
+
+        # Write to raw and config
+        (case_paths.raw / "final-output.json").write_text('{"CALIBRATION_KEY": "k"}', encoding="utf-8")
+        (case_paths.config / "dummy.conf").write_text("config_data", encoding="utf-8")
+
+        after_hash = hash_directory_tree(case_paths.workspace)
+        self.assertEqual(initial_hash, after_hash)
+
+    def test_codex_output_location_outside_workspace(self) -> None:
+        """Verify Codex specs place output_path in raw/ and not in workspace/."""
+        run_root = self.test_root / "RUN-TEST-003"
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "gpt-5.6-terra", "agy": "gemini-3.7-flash-low", "opencode2": "opencode/nemotron-3.5-lightning-free"},
+        )
+        codex_smoke = specs[CaseId.TC_CODEX_SMOKE.value]
+        codex_case_paths = plan_case_paths(run_root, CaseId.TC_CODEX_SMOKE.value)
+
+        self.assertEqual(codex_smoke.cwd, str(codex_case_paths.workspace))
+        output_idx = codex_smoke.argv.index("-o") + 1
+        output_path_str = codex_smoke.argv[output_idx]
+        self.assertEqual(output_path_str, str(codex_case_paths.raw / "final-output.json"))
+        self.assertFalse(output_path_str.startswith(str(codex_case_paths.workspace)))
+
+    def test_opencode_xdg_isolation_between_cases(self) -> None:
+        """Verify OpenCode smoke and mutation cases receive isolated XDG configuration environments."""
+        run_root = self.test_root / "RUN-TEST-004"
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "gpt-5.6-terra", "agy": "gemini-3.7-flash-low", "opencode2": "opencode/nemotron-3.5-lightning-free"},
+        )
+        op_smoke = specs[CaseId.TC_OPENCODE_SMOKE.value]
+        op_mutation = specs[CaseId.TC_OPENCODE_MUTATION.value]
+
+        self.assertEqual(op_smoke.env_override_keys, ["OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
+        self.assertEqual(op_mutation.env_override_keys, ["OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
+
+        # Check isolated paths in planned case paths
+        smoke_paths = plan_case_paths(run_root, CaseId.TC_OPENCODE_SMOKE.value)
+        mutation_paths = plan_case_paths(run_root, CaseId.TC_OPENCODE_MUTATION.value)
+
+        self.assertNotEqual(smoke_paths.config, mutation_paths.config)
+        self.assertNotEqual(smoke_paths.workspace, mutation_paths.workspace)
+
+    # -------------------------------------------------------------------------
+    # Pure Six-Spec Planning & Human Gate
+    # -------------------------------------------------------------------------
+
+    def test_plan_calibration_invocations_six_specs(self) -> None:
+        """Verify plan_calibration_invocations generates exact 6 immutable specs with correct prompt mapping."""
+        run_root = self.test_root / "RUN-TEST-005"
+        executables = {"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"}
+        models = {"codex": "model-codex", "agy": "model-agy", "opencode2": "model-opencode"}
+
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables=executables,
+            models=models,
+        )
+
+        self.assertEqual(set(specs.keys()), set(ALL_CASE_IDS))
+        self.assertEqual(len(specs), 6)
+
+        # For each tool, smoke argv != mutation argv due to prompt difference
+        self.assertNotEqual(specs[CaseId.TC_CODEX_SMOKE.value].argv, specs[CaseId.TC_CODEX_MUTATION.value].argv)
+        self.assertNotEqual(specs[CaseId.TC_AGY_SMOKE.value].argv, specs[CaseId.TC_AGY_MUTATION.value].argv)
+        self.assertNotEqual(specs[CaseId.TC_OPENCODE_SMOKE.value].argv, specs[CaseId.TC_OPENCODE_MUTATION.value].argv)
+
+        # Verify schema path passed to codex and agy
+        schema_path = str(plan_run_paths(run_root).payload_schema_path)
+        self.assertIn(schema_path, specs[CaseId.TC_CODEX_SMOKE.value].argv)
+        self.assertIn(schema_path, specs[CaseId.TC_CODEX_MUTATION.value].argv)
+        self.assertIn(schema_path, specs[CaseId.TC_AGY_SMOKE.value].argv)
+        self.assertIn(schema_path, specs[CaseId.TC_AGY_MUTATION.value].argv)
+
+    def test_six_spec_human_gate_payload(self) -> None:
+        """Verify Human Gate payload displays all six specs and reaches LIVE_READY when complete."""
+        run_root = self.test_root / "RUN-TEST-006"
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "gpt-5.6-terra", "agy": "gemini-3.7-flash-low", "opencode2": "opencode/nemotron-3.5-lightning-free"},
+        )
+
+        payload = build_human_gate_payload(
+            run_id="CAL-TEST-006",
+            runtime_root=str(run_root),
+            runner_baseline={"branch": "main", "head": "abc"},
+            prj226_baseline={"branch": "foundation/product-foundation", "head": "def"},
+            invocations=specs,
+        )
+
+        self.assertEqual(payload.readiness, "LIVE_READY")
+        self.assertEqual(len(payload.unresolved_parameters), 0)
+        self.assertEqual(set(payload.invocations.keys()), set(ALL_CASE_IDS))
+
+        serialized = serialize_human_gate_payload(payload)
+        parsed = json.loads(serialized)
+        self.assertEqual(parsed["readiness"], "LIVE_READY")
+        self.assertEqual(len(parsed["invocations"]), 6)
+
+    def test_readiness_negative_cases(self) -> None:
+        """Verify LIVE_READY is False if any model, executable, timeout, cwd, or schema path is invalid."""
+        run_root = self.test_root / "RUN-TEST-007"
+
+        # 1. Missing model in one of the specs
+        specs_missing_model = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "gpt-5.6-terra", "agy": None, "opencode2": "opencode/nemotron-3.5-lightning-free"},
+        )
+        p1 = build_human_gate_payload("R1", str(run_root), {}, {}, specs_missing_model)
+        self.assertEqual(p1.readiness, "NOT_READY")
+        self.assertIn("TC-AGY-SMOKE.model", p1.unresolved_parameters)
+        self.assertIn("TC-AGY-MUTATION.model", p1.unresolved_parameters)
+
+        # 2. Missing executable
+        specs_empty_exe = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m1", "agy": "m2", "opencode2": "m3"},
+        )
+        p2 = build_human_gate_payload("R2", str(run_root), {}, {}, specs_empty_exe)
+        self.assertEqual(p2.readiness, "NOT_READY")
+        self.assertIn("TC-CODEX-SMOKE.executable", p2.unresolved_parameters)
+
+        # 3. Invalid timeout
+        specs_bad_timeout = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m1", "agy": "m2", "opencode2": "m3"},
+            timeouts={"codex": -10.0},
+        )
+        p3 = build_human_gate_payload("R3", str(run_root), {}, {}, specs_bad_timeout)
+        self.assertEqual(p3.readiness, "NOT_READY")
+        self.assertIn("TC-CODEX-SMOKE.timeout_seconds", p3.unresolved_parameters)
+
+    # -------------------------------------------------------------------------
+    # Runtime Schema Copy Contract
+    # -------------------------------------------------------------------------
+
+    def test_copy_payload_schema_to_runtime(self) -> None:
+        """Verify copy_payload_schema_to_runtime validates integrity and prevents collision/symlinks."""
+        src_schema = self.test_root / "src_schema.json"
+        src_schema.write_text('{"CALIBRATION_KEY": "test"}', encoding="utf-8")
+
+        target_schema = self.test_root / "runtime" / "schemas" / "calibration-payload.schema.json"
+
+        copied_path = copy_payload_schema_to_runtime(src_schema, target_schema)
+        self.assertTrue(copied_path.is_file())
+        self.assertEqual(copied_path.read_text(encoding="utf-8"), src_schema.read_text(encoding="utf-8"))
+
+        # Collision fail-closed
+        with self.assertRaises(FileExistsError):
+            copy_payload_schema_to_runtime(src_schema, target_schema)
+
+        # Symlink source rejected
+        symlink_src = self.test_root / "symlink_schema.json"
+        os.symlink(src_schema, symlink_src)
+        target2 = self.test_root / "runtime2" / "schema.json"
+        with self.assertRaises(ValueError):
+            copy_payload_schema_to_runtime(symlink_src, target2)
 
 
 if __name__ == "__main__":

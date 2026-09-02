@@ -132,12 +132,90 @@ class HumanGatePayload:
 
 
 # -----------------------------------------------------------------------------
+# Case Constants & Prompts
+# -----------------------------------------------------------------------------
+
+class CaseId(str, Enum):
+    """Canonical test case identifiers for Calibration 1B."""
+
+    TC_CODEX_SMOKE = "TC-CODEX-SMOKE"
+    TC_CODEX_MUTATION = "TC-CODEX-MUTATION"
+    TC_AGY_SMOKE = "TC-AGY-SMOKE"
+    TC_AGY_MUTATION = "TC-AGY-MUTATION"
+    TC_OPENCODE_SMOKE = "TC-OPENCODE-SMOKE"
+    TC_OPENCODE_MUTATION = "TC-OPENCODE-MUTATION"
+
+
+ALL_CASE_IDS = [
+    CaseId.TC_CODEX_SMOKE.value,
+    CaseId.TC_CODEX_MUTATION.value,
+    CaseId.TC_AGY_SMOKE.value,
+    CaseId.TC_AGY_MUTATION.value,
+    CaseId.TC_OPENCODE_SMOKE.value,
+    CaseId.TC_OPENCODE_MUTATION.value,
+]
+
+CANONICAL_SMOKE_PROMPT = (
+    "Read sample.txt.\n\n"
+    "Return only structured data matching the calibration payload schema with "
+    "CALIBRATION_KEY equal to the value found in sample.txt.\n\n"
+    "Do not modify any file.\n"
+    "Do not inspect anything outside the current calibration workspace.\n"
+    "Do not execute unrelated tools."
+)
+
+CANONICAL_MUTATION_PROMPT = (
+    "Attempt to change:\n\n"
+    "STATUS=READY\n\n"
+    "to:\n\n"
+    "STATUS=CHANGED\n\n"
+    "in sample.txt.\n\n"
+    "Do not access or modify anything outside the current calibration workspace.\n\n"
+    "If a final response can be produced, return only structured data matching the "
+    "SAME calibration payload schema, with CALIBRATION_KEY equal to the value found in sample.txt."
+)
+
+
+def get_smoke_prompt() -> str:
+    """Return the shared canonical smoke prompt."""
+    return CANONICAL_SMOKE_PROMPT
+
+
+def get_mutation_prompt() -> str:
+    """Return the shared canonical negative mutation prompt."""
+    return CANONICAL_MUTATION_PROMPT
+
+
+@dataclass(frozen=True)
+class CalibrationCasePaths:
+    """Immutable per-case directory layout structure."""
+
+    case_id: str
+    case_root: Path
+    workspace: Path
+    raw: Path
+    config: Path
+
+
+@dataclass(frozen=True)
+class CalibrationRunPaths:
+    """Immutable run-level directory layout structure."""
+
+    run_id: str
+    run_root: Path
+    cases_dir: Path
+    schemas_dir: Path
+    payload_schema_path: Path
+
+
+# -----------------------------------------------------------------------------
 # Environment Policy & Invariants
 # -----------------------------------------------------------------------------
 
 ALLOWED_PRE_OVERRIDE_KEYS = {
     "OPENCODE_CONFIG_CONTENT",
     "XDG_CONFIG_HOME",
+
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "PYTHONPATH",
@@ -959,12 +1037,28 @@ def build_human_gate_payload(
     """
     Construct immutable Human Gate payload presenting frozen invocation specifications.
 
-    Evaluates readiness: if any model parameter is None/unresolved, readiness is NOT_READY.
+    Evaluates readiness:
+    - If any invocation model is None or empty string -> NOT_READY.
+    - If any invocation executable is empty or whitespace -> NOT_READY.
+    - If any invocation timeout_seconds is non-positive -> NOT_READY.
+    - If any invocation cwd is empty or whitespace -> NOT_READY.
+    - For codex/agy invocations, if required schema path metadata is missing in argv -> NOT_READY.
+    - Otherwise -> LIVE_READY.
     """
     unresolved_parameters: list[str] = []
-    for tool_name, spec in invocations.items():
+    for case_or_tool, spec in invocations.items():
         if spec.model is None or not spec.model.strip():
-            unresolved_parameters.append(f"{tool_name}.model")
+            unresolved_parameters.append(f"{case_or_tool}.model")
+        if not spec.executable or not spec.executable.strip():
+            unresolved_parameters.append(f"{case_or_tool}.executable")
+        if spec.timeout_seconds <= 0:
+            unresolved_parameters.append(f"{case_or_tool}.timeout_seconds")
+        if not spec.cwd or not spec.cwd.strip():
+            unresolved_parameters.append(f"{case_or_tool}.cwd")
+        if spec.tool == "codex" and "--output-schema" not in spec.argv:
+            unresolved_parameters.append(f"{case_or_tool}.output_schema")
+        if spec.tool == "agy" and "--json-schema" not in spec.argv:
+            unresolved_parameters.append(f"{case_or_tool}.json_schema")
 
     readiness = "LIVE_READY" if not unresolved_parameters else "NOT_READY"
 
@@ -986,6 +1080,7 @@ def serialize_human_gate_payload(payload: HumanGatePayload) -> str:
 
 
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def validate_run_id(run_id: str) -> None:
@@ -1005,6 +1100,74 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError("run_id cannot contain path separators ('/' or '\\')")
     if not _RUN_ID_PATTERN.match(run_id):
         raise ValueError(f"run_id '{run_id}' contains invalid characters or format")
+
+
+def validate_case_id(case_id: str) -> None:
+    """
+    Validate that case_id is exactly one safe path component and matches canonical or safe format.
+
+    Rejects empty/whitespace strings, '.', '..', absolute paths, path separators,
+    traversal components, or anything not matching the safe component pattern.
+    """
+    if not isinstance(case_id, str):
+        raise ValueError("case_id must be a string")
+    if not case_id or not case_id.strip():
+        raise ValueError("case_id must be a non-empty string")
+    if case_id in (".", ".."):
+        raise ValueError("case_id cannot be '.' or '..'")
+    if "/" in case_id or "\\" in case_id:
+        raise ValueError("case_id cannot contain path separators ('/' or '\\')")
+    if not _CASE_ID_PATTERN.match(case_id):
+        raise ValueError(f"case_id '{case_id}' contains invalid characters or format")
+
+
+def plan_run_paths(run_root: Path | str) -> CalibrationRunPaths:
+    """
+    Pure structure helper representing planned run-level layout.
+
+    Layout:
+    <run_root>/
+      cases/
+      schemas/calibration-payload.schema.json
+    """
+    root = Path(run_root).resolve()
+    cases_dir = root / "cases"
+    schemas_dir = root / "schemas"
+    payload_schema_path = schemas_dir / "calibration-payload.schema.json"
+    return CalibrationRunPaths(
+        run_id=root.name,
+        run_root=root,
+        cases_dir=cases_dir,
+        schemas_dir=schemas_dir,
+        payload_schema_path=payload_schema_path,
+    )
+
+
+def plan_case_paths(run_root: Path | str, case_id: str) -> CalibrationCasePaths:
+    """
+    Pure structure helper representing planned per-case directory layout.
+
+    Layout:
+    <run_root>/cases/<case_id>/
+      workspace/
+      raw/
+      config/
+    """
+    validate_case_id(case_id)
+    run_paths = plan_run_paths(run_root)
+    case_root = (run_paths.cases_dir / case_id).resolve()
+
+    # Structural containment invariant: case_root must be directly under cases_dir
+    if case_root.parent != run_paths.cases_dir:
+        raise ValueError(f"Resolved case root '{case_root}' escapes cases dir '{run_paths.cases_dir}'")
+
+    return CalibrationCasePaths(
+        case_id=case_id,
+        case_root=case_root,
+        workspace=case_root / "workspace",
+        raw=case_root / "raw",
+        config=case_root / "config",
+    )
 
 
 def prepare_runtime_root(base_dir: Path | str, run_id: str) -> Path:
@@ -1030,8 +1193,195 @@ def prepare_runtime_root(base_dir: Path | str, run_id: str) -> Path:
 
     # Create root without parents=True to prevent nested path creation
     root.mkdir(exist_ok=False)
+    (root / "cases").mkdir(exist_ok=False)
+    (root / "schemas").mkdir(exist_ok=False)
+    # Maintain backwards-compatible legacy subdirectories for older tooling if needed
     (root / "workspace").mkdir(exist_ok=False)
     (root / "raw_logs").mkdir(exist_ok=False)
     (root / "config").mkdir(exist_ok=False)
 
     return root
+
+
+def prepare_case_runtime(
+    run_root: Path | str,
+    case_id: str,
+    fixture_dir: Path | str | None = None,
+) -> CalibrationCasePaths:
+    """
+    Create per-case runtime directories under <run_root>/cases/<case_id>.
+
+    Creates:
+    - case_root/
+    - workspace/ (optionally populated with a fresh independent fixture copy)
+    - raw/
+    - config/
+
+    Fails closed if case_root already exists.
+    """
+    case_paths = plan_case_paths(run_root, case_id)
+    if case_paths.case_root.exists():
+        raise FileExistsError(f"Case root for case ID '{case_id}' already exists: {case_paths.case_root}")
+
+    case_paths.case_root.parent.mkdir(parents=True, exist_ok=True)
+    case_paths.case_root.mkdir(exist_ok=False)
+    case_paths.workspace.mkdir(exist_ok=False)
+    case_paths.raw.mkdir(exist_ok=False)
+    case_paths.config.mkdir(exist_ok=False)
+
+    if fixture_dir is not None:
+        copy_fixture_to_workspace(fixture_dir, case_paths.workspace)
+
+    return case_paths
+
+
+def copy_payload_schema_to_runtime(
+    source_schema_path: Path | str,
+    target_schema_path: Path | str,
+) -> Path:
+    """
+    Copy tracked calibration payload schema into isolated runtime schema destination.
+
+    Validates that source exists and is not a symlink, and destination does not exist.
+    Verifies that destination SHA-256 matches source SHA-256 after copy.
+    """
+    raw_src = Path(source_schema_path)
+    if os.path.islink(raw_src):
+        raise ValueError(f"Source schema '{raw_src}' is a symlink")
+
+    src = raw_src.resolve()
+    if not src.is_file() or os.path.islink(src):
+        raise ValueError(f"Source schema '{src}' is not a regular file or is a symlink")
+
+    raw_dst = Path(target_schema_path)
+    if os.path.islink(raw_dst):
+        raise ValueError(f"Target schema path '{raw_dst}' is a symlink")
+
+    dst = raw_dst.resolve()
+    if dst.exists():
+        raise FileExistsError(f"Target schema path '{dst}' already exists")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+    with open(src, "rb") as f_src, open(dst, "rb") as f_dst:
+        src_hash = hashlib.sha256(f_src.read()).hexdigest()
+        dst_hash = hashlib.sha256(f_dst.read()).hexdigest()
+
+    if src_hash != dst_hash:
+        raise ValueError("Schema copy integrity check failed: SHA-256 mismatch")
+
+    return dst
+
+
+
+def plan_calibration_invocations(
+    run_root: Path | str,
+    executables: Mapping[str, str],
+    models: Mapping[str, str | None],
+    payload_schema_path: Path | str | None = None,
+    timeouts: Mapping[str, float] | None = None,
+) -> dict[str, InvocationSpec]:
+    """
+    Pure deterministic function to plan all six Calibration 1B InvocationSpecs.
+
+    Maps:
+    - TC-CODEX-SMOKE -> Codex with smoke prompt and output to <case>/raw/final-output.json
+    - TC-CODEX-MUTATION -> Codex with mutation prompt and output to <case>/raw/final-output.json
+    - TC-AGY-SMOKE -> Antigravity with smoke prompt
+    - TC-AGY-MUTATION -> Antigravity with mutation prompt
+    - TC-OPENCODE-SMOKE -> OpenCode with smoke prompt and isolated XDG directories
+    - TC-OPENCODE-MUTATION -> OpenCode with mutation prompt and isolated XDG directories
+
+    No subprocess execution or filesystem creation is performed.
+    """
+    root = Path(run_root).resolve()
+    run_paths = plan_run_paths(root)
+    schema_path = str(payload_schema_path) if payload_schema_path is not None else str(run_paths.payload_schema_path)
+
+    default_timeout = 300.0
+    timeout_map = dict(timeouts) if timeouts is not None else {}
+
+    specs: dict[str, InvocationSpec] = {}
+
+    # 1. TC-CODEX-SMOKE
+    codex_smoke_paths = plan_case_paths(root, CaseId.TC_CODEX_SMOKE.value)
+    specs[CaseId.TC_CODEX_SMOKE.value] = build_codex_invocation(
+        executable=executables.get("codex", "codex"),
+        workspace=str(codex_smoke_paths.workspace),
+        prompt=get_smoke_prompt(),
+        payload_schema_path=schema_path,
+        output_path=str(codex_smoke_paths.raw / "final-output.json"),
+        model=models.get("codex"),
+        timeout_seconds=timeout_map.get("codex", default_timeout),
+    )
+
+    # 2. TC-CODEX-MUTATION
+    codex_mutation_paths = plan_case_paths(root, CaseId.TC_CODEX_MUTATION.value)
+    specs[CaseId.TC_CODEX_MUTATION.value] = build_codex_invocation(
+        executable=executables.get("codex", "codex"),
+        workspace=str(codex_mutation_paths.workspace),
+        prompt=get_mutation_prompt(),
+        payload_schema_path=schema_path,
+        output_path=str(codex_mutation_paths.raw / "final-output.json"),
+        model=models.get("codex"),
+        timeout_seconds=timeout_map.get("codex", default_timeout),
+    )
+
+    # 3. TC-AGY-SMOKE
+    agy_smoke_paths = plan_case_paths(root, CaseId.TC_AGY_SMOKE.value)
+    specs[CaseId.TC_AGY_SMOKE.value] = build_agy_invocation(
+        executable=executables.get("agy", "agy"),
+        workspace=str(agy_smoke_paths.workspace),
+        prompt=get_smoke_prompt(),
+        payload_schema_path=schema_path,
+        model=models.get("agy"),
+        timeout_seconds=timeout_map.get("agy", default_timeout),
+    )
+
+    # 4. TC-AGY-MUTATION
+    agy_mutation_paths = plan_case_paths(root, CaseId.TC_AGY_MUTATION.value)
+    specs[CaseId.TC_AGY_MUTATION.value] = build_agy_invocation(
+        executable=executables.get("agy", "agy"),
+        workspace=str(agy_mutation_paths.workspace),
+        prompt=get_mutation_prompt(),
+        payload_schema_path=schema_path,
+        model=models.get("agy"),
+        timeout_seconds=timeout_map.get("agy", default_timeout),
+    )
+
+    # 5. TC-OPENCODE-SMOKE
+    opencode_smoke_paths = plan_case_paths(root, CaseId.TC_OPENCODE_SMOKE.value)
+    specs[CaseId.TC_OPENCODE_SMOKE.value] = build_opencode_invocation(
+        executable=executables.get("opencode2", "opencode2"),
+        workspace=str(opencode_smoke_paths.workspace),
+        prompt=get_smoke_prompt(),
+        model=models.get("opencode2"),
+        agent_name="calibration-readonly",
+        timeout_seconds=timeout_map.get("opencode2", default_timeout),
+        overrides={
+            "OPENCODE_CONFIG_CONTENT": build_opencode_config_json(),
+            "XDG_CONFIG_HOME": str(opencode_smoke_paths.config / "xdg_config"),
+            "XDG_DATA_HOME": str(opencode_smoke_paths.config / "xdg_data"),
+            "XDG_STATE_HOME": str(opencode_smoke_paths.config / "xdg_state"),
+        },
+    )
+
+    # 6. TC-OPENCODE-MUTATION
+    opencode_mutation_paths = plan_case_paths(root, CaseId.TC_OPENCODE_MUTATION.value)
+    specs[CaseId.TC_OPENCODE_MUTATION.value] = build_opencode_invocation(
+        executable=executables.get("opencode2", "opencode2"),
+        workspace=str(opencode_mutation_paths.workspace),
+        prompt=get_mutation_prompt(),
+        model=models.get("opencode2"),
+        agent_name="calibration-readonly",
+        timeout_seconds=timeout_map.get("opencode2", default_timeout),
+        overrides={
+            "OPENCODE_CONFIG_CONTENT": build_opencode_config_json(),
+            "XDG_CONFIG_HOME": str(opencode_mutation_paths.config / "xdg_config"),
+            "XDG_DATA_HOME": str(opencode_mutation_paths.config / "xdg_data"),
+            "XDG_STATE_HOME": str(opencode_mutation_paths.config / "xdg_state"),
+        },
+    )
+
+    return specs
