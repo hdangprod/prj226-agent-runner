@@ -12,6 +12,8 @@ class RunState(str, Enum):
     """Lifecycle state definitions for an orchestration run."""
 
     CREATED = "CREATED"
+    PREFLIGHT = "PREFLIGHT"
+    HUMAN_AUTHORIZED = "HUMAN_AUTHORIZED"
     BASELINE_VERIFIED = "BASELINE_VERIFIED"
     PLANNING_RUNNING = "PLANNING_RUNNING"
     PLANNING_COMPLETE = "PLANNING_COMPLETE"

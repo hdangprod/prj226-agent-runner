@@ -26,6 +26,11 @@ def get_run_dir(run_id: str) -> Path:
     return get_runs_dir() / run_id
 
 
+def get_runtime_root(configured_path: str | Path | None = None) -> Path:
+    """Return the external, immutable runtime evidence root for Runner V1."""
+    return Path(configured_path).resolve() if configured_path else Path("/tmp/prj226_agent_runner")
+
+
 def get_schemas_dir() -> Path:
     """Return the directory containing JSON schema contract definitions."""
     return get_runner_root() / "schemas"

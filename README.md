@@ -50,4 +50,25 @@ prj226-agent-runner/
 
 ## Configuration
 
-Runner configuration is defined in TOML (parsed using Python standard-library `tomllib`). See `config/runner.example.toml` for configurable parameters including target repository location, canonical branch, baseline verification hashes, and tool/model bindings.
+Runner configuration is defined in TOML (parsed using Python standard-library `tomllib`). See `config/runner.example.toml` for the external runtime root and role tool/model bindings.
+
+## HARN-001 Runner V1
+
+Runner V1 consumes a human-approved Task Packet and deliberately separates the
+deterministic lifecycle from provider-specific command construction:
+
+```text
+Task Packet → preflight → --authorize → isolated Builder → candidate freeze
+→ deterministic gates → read-only DV → read-only S/O/S → ACCEPTANCE_READY
+```
+
+Use `prj226-runner inspect task-packet.json` for a read-only preflight. It
+creates no runtime directory or worktree and returns either
+`READY_FOR_HUMAN_AUTHORIZATION` or a failure. Execute only with the explicit
+human boundary: `prj226-runner run task-packet.json --authorize`.
+
+The packet schema is [schemas/task-packet.schema.json](schemas/task-packet.schema.json).
+Provider executables and models are configured only in `runner.toml`; they are
+never accepted from a packet. Runtime evidence is immutable under the configured
+external `runtime_root`. The runner never retries, repairs, merges, rebases,
+cherry-picks, canonicalizes, or pushes a product repository.
