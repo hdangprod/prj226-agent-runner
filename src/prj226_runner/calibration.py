@@ -661,12 +661,30 @@ def serialize_calibration_result(result: CalibrationResult) -> str:
     return json.dumps(raw_dict, indent=2)
 
 
+REQUIRED_CASE_TOOL_MAPPING: dict[str, str] = {
+    CaseId.TC_CODEX_SMOKE.value: "codex",
+    CaseId.TC_CODEX_MUTATION.value: "codex",
+    CaseId.TC_AGY_SMOKE.value: "agy",
+    CaseId.TC_AGY_MUTATION.value: "agy",
+    CaseId.TC_OPENCODE_SMOKE.value: "opencode2",
+    CaseId.TC_OPENCODE_MUTATION.value: "opencode2",
+}
+
+REQUIRED_OPENCODE_ENV_KEYS: set[str] = {
+    "OPENCODE_CONFIG_CONTENT",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+}
+
+
 def validate_calibration_case_result(case_result: CalibrationCaseResult) -> None:
     """
     Programmatically validate CalibrationCaseResult invariants.
 
     Ensures operational invocation outcome and test verdict remain distinct,
-    and enforces governance blocker if unexpected mutation occurs.
+    enforces hash/workspace_mutated consistency, and enforces that workspace_mutated
+    or hash change cannot result in a PASS verdict.
     """
     if not isinstance(case_result.case_id, str) or not case_result.case_id.strip():
         raise ValueError("case_id must be a non-empty string")
@@ -693,6 +711,13 @@ def validate_calibration_case_result(case_result: CalibrationCaseResult) -> None
     if not isinstance(case_result.verdict, CalibrationVerdict):
         raise ValueError(f"Invalid verdict: {case_result.verdict}")
 
+    # Invariant: verdict == PASS requires workspace_mutated == False and pre_hash == post_hash
+    if case_result.verdict == CalibrationVerdict.PASS:
+        if case_result.workspace_mutated or case_result.pre_hash != case_result.post_hash:
+            raise ValueError("PASS verdict cannot have mutated workspace or hash mismatch")
+        if case_result.error_class is not None:
+            raise ValueError(f"PASS verdict must have error_class=None, got {case_result.error_class}")
+
     # Validate underlying invocation result
     validate_calibration_result(case_result.invocation_result)
 
@@ -702,10 +727,6 @@ def validate_calibration_case_result(case_result: CalibrationCaseResult) -> None
             raise ValueError(
                 f"Unexpected mutation on FAIL case must have error_class=GOVERNANCE_BLOCKER, got {case_result.error_class}"
             )
-
-    if case_result.verdict == CalibrationVerdict.PASS:
-        if case_result.error_class is not None:
-            raise ValueError(f"PASS verdict must have error_class=None, got {case_result.error_class}")
 
 
 def serialize_calibration_case_result(case_result: CalibrationCaseResult) -> str:
@@ -1038,15 +1059,37 @@ def build_human_gate_payload(
     Construct immutable Human Gate payload presenting frozen invocation specifications.
 
     Evaluates readiness:
+    - Invocations must contain exactly the six canonical Calibration 1B case IDs.
+    - Each canonical case ID must map to its exact expected tool.
     - If any invocation model is None or empty string -> NOT_READY.
     - If any invocation executable is empty or whitespace -> NOT_READY.
     - If any invocation timeout_seconds is non-positive -> NOT_READY.
     - If any invocation cwd is empty or whitespace -> NOT_READY.
     - For codex/agy invocations, if required schema path metadata is missing in argv -> NOT_READY.
+    - For opencode2 invocations, required environment override keys (OPENCODE_CONFIG_CONTENT,
+      XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME) and explicit agent 'calibration-readonly'
+      must be present -> NOT_READY otherwise.
     - Otherwise -> LIVE_READY.
     """
     unresolved_parameters: list[str] = []
+
+    # Check closed canonical case set
+    canonical_cases_set = set(ALL_CASE_IDS)
+    actual_cases_set = set(invocations.keys())
+
+    missing_cases = canonical_cases_set - actual_cases_set
+    for c in sorted(missing_cases):
+        unresolved_parameters.append(f"missing_case:{c}")
+
+    unknown_cases = actual_cases_set - canonical_cases_set
+    for c in sorted(unknown_cases):
+        unresolved_parameters.append(f"unknown_case:{c}")
+
     for case_or_tool, spec in invocations.items():
+        expected_tool = REQUIRED_CASE_TOOL_MAPPING.get(case_or_tool)
+        if expected_tool is not None and spec.tool != expected_tool:
+            unresolved_parameters.append(f"{case_or_tool}.tool_mismatch")
+
         if spec.model is None or not spec.model.strip():
             unresolved_parameters.append(f"{case_or_tool}.model")
         if not spec.executable or not spec.executable.strip():
@@ -1059,6 +1102,21 @@ def build_human_gate_payload(
             unresolved_parameters.append(f"{case_or_tool}.output_schema")
         if spec.tool == "agy" and "--json-schema" not in spec.argv:
             unresolved_parameters.append(f"{case_or_tool}.json_schema")
+        if spec.tool == "opencode2":
+            # Check required env keys
+            spec_env_keys = set(spec.env_override_keys)
+            for req_key in sorted(REQUIRED_OPENCODE_ENV_KEYS):
+                if req_key not in spec_env_keys:
+                    unresolved_parameters.append(f"{case_or_tool}.env_missing_{req_key}")
+
+            # Check agent selection in argv
+            agent_valid = False
+            for idx, token in enumerate(spec.argv):
+                if token == "--agent" and idx + 1 < len(spec.argv) and spec.argv[idx + 1] == "calibration-readonly":
+                    agent_valid = True
+                    break
+            if not agent_valid:
+                unresolved_parameters.append(f"{case_or_tool}.agent_mismatch")
 
     readiness = "LIVE_READY" if not unresolved_parameters else "NOT_READY"
 

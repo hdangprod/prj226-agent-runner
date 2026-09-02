@@ -568,45 +568,38 @@ class TestCalibrationHarness(unittest.TestCase):
 
     def test_model_none_prevents_human_gate_live_ready(self) -> None:
         """Verify model=None produces readiness=NOT_READY in Human Gate payload."""
-        codex_spec = build_codex_invocation(
-            executable="/bin/codex",
-            workspace="/tmp/ws",
-            prompt="p",
-            payload_schema_path="/tmp/s.json",
-            output_path="/tmp/o.json",
-            model=None,
+        specs = plan_calibration_invocations(
+            run_root=self.test_root / "RUN-GATE",
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "gpt-5.6-terra", "agy": "gemini-3.7-flash-low", "opencode2": "opencode/nemotron-3.5-lightning-free"},
         )
-        agy_spec = build_agy_invocation(
-            executable="/bin/agy",
-            workspace="/tmp/ws",
+        # Unpin codex model in smoke spec
+        unpinned_specs = dict(specs)
+        unpinned_specs[CaseId.TC_CODEX_SMOKE.value] = build_codex_invocation(
+            executable="/bin/codex",
+            workspace=specs[CaseId.TC_CODEX_SMOKE.value].cwd,
             prompt="p",
-            payload_schema_path="/tmp/s.json",
-            model="gemini-3.7-flash",
+            payload_schema_path=str(plan_run_paths(self.test_root / "RUN-GATE").payload_schema_path),
+            output_path=str(plan_case_paths(self.test_root / "RUN-GATE", CaseId.TC_CODEX_SMOKE.value).raw / "out.json"),
+            model=None,
         )
         payload = build_human_gate_payload(
             run_id="CAL-1B-TEST",
             runtime_root="/tmp/runtime",
             runner_baseline={"branch": "main", "head": "abc"},
             prj226_baseline={"branch": "foundation/product-foundation", "head": "def"},
-            invocations={"codex": codex_spec, "agy": agy_spec},
+            invocations=unpinned_specs,
         )
         self.assertEqual(payload.readiness, "NOT_READY")
-        self.assertIn("codex.model", payload.unresolved_parameters)
+        self.assertIn("TC-CODEX-SMOKE.model", payload.unresolved_parameters)
 
-        pinned_codex_spec = build_codex_invocation(
-            executable="/bin/codex",
-            workspace="/tmp/ws",
-            prompt="p",
-            payload_schema_path="/tmp/s.json",
-            output_path="/tmp/o.json",
-            model="gpt-4o",
-        )
+        # Full 6-spec pinned gate must be LIVE_READY
         ready_payload = build_human_gate_payload(
             run_id="CAL-1B-TEST",
             runtime_root="/tmp/runtime",
             runner_baseline={"branch": "main", "head": "abc"},
             prj226_baseline={"branch": "foundation/product-foundation", "head": "def"},
-            invocations={"codex": pinned_codex_spec, "agy": agy_spec},
+            invocations=specs,
         )
         self.assertEqual(ready_payload.readiness, "LIVE_READY")
         self.assertEqual(len(ready_payload.unresolved_parameters), 0)
@@ -1023,6 +1016,281 @@ class TestCalibrationHarness(unittest.TestCase):
         self.assertIn("TC-CODEX-SMOKE.timeout_seconds", p3.unresolved_parameters)
 
     # -------------------------------------------------------------------------
+    # R006: Exact Six-Case Readiness & Case-Tool Identity Tests
+    # -------------------------------------------------------------------------
+
+    def test_r006_exact_six_cases_each_missing_case_blocks_ready(self) -> None:
+        """Verify removing each canonical case individually causes NOT_READY (CAL1B-PRE-R006)."""
+        run_root = self.test_root / "RUN-R006"
+        valid_specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m_codex", "agy": "m_agy", "opencode2": "m_opencode"},
+        )
+
+        base_payload = build_human_gate_payload("R-BASE", str(run_root), {}, {}, valid_specs)
+        self.assertEqual(base_payload.readiness, "LIVE_READY")
+
+        for case_id in ALL_CASE_IDS:
+            with self.subTest(removed_case=case_id):
+                subset_specs = {k: v for k, v in valid_specs.items() if k != case_id}
+                payload = build_human_gate_payload("R-SUB", str(run_root), {}, {}, subset_specs)
+                self.assertEqual(payload.readiness, "NOT_READY")
+                self.assertIn(f"missing_case:{case_id}", payload.unresolved_parameters)
+
+    def test_r006_unknown_seventh_case_blocks_ready(self) -> None:
+        """Verify unknown case ID in invocations causes NOT_READY."""
+        run_root = self.test_root / "RUN-R006-EXTRA"
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m_codex", "agy": "m_agy", "opencode2": "m_opencode"},
+        )
+        extra_specs = dict(specs)
+        extra_specs["TC-EXTRA-CASE"] = specs[CaseId.TC_CODEX_SMOKE.value]
+
+        payload = build_human_gate_payload("R-EXTRA", str(run_root), {}, {}, extra_specs)
+        self.assertEqual(payload.readiness, "NOT_READY")
+        self.assertIn("unknown_case:TC-EXTRA-CASE", payload.unresolved_parameters)
+
+    def test_r006_case_tool_identity_mapping(self) -> None:
+        """Verify case to tool identity is enforced; mismatch causes NOT_READY."""
+        run_root = self.test_root / "RUN-R006-TOOL"
+        specs = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m_codex", "agy": "m_agy", "opencode2": "m_opencode"},
+        )
+
+        # 1. TC-CODEX-SMOKE carrying opencode2 spec
+        specs_mismatch_1 = dict(specs)
+        specs_mismatch_1[CaseId.TC_CODEX_SMOKE.value] = specs[CaseId.TC_OPENCODE_SMOKE.value]
+        p1 = build_human_gate_payload("R-T1", str(run_root), {}, {}, specs_mismatch_1)
+        self.assertEqual(p1.readiness, "NOT_READY")
+        self.assertIn(f"{CaseId.TC_CODEX_SMOKE.value}.tool_mismatch", p1.unresolved_parameters)
+
+        # 2. TC-AGY-MUTATION carrying codex spec
+        specs_mismatch_2 = dict(specs)
+        specs_mismatch_2[CaseId.TC_AGY_MUTATION.value] = specs[CaseId.TC_CODEX_MUTATION.value]
+        p2 = build_human_gate_payload("R-T2", str(run_root), {}, {}, specs_mismatch_2)
+        self.assertEqual(p2.readiness, "NOT_READY")
+        self.assertIn(f"{CaseId.TC_AGY_MUTATION.value}.tool_mismatch", p2.unresolved_parameters)
+
+        # 3. TC-OPENCODE-SMOKE carrying agy spec
+        specs_mismatch_3 = dict(specs)
+        specs_mismatch_3[CaseId.TC_OPENCODE_SMOKE.value] = specs[CaseId.TC_AGY_SMOKE.value]
+        p3 = build_human_gate_payload("R-T3", str(run_root), {}, {}, specs_mismatch_3)
+        self.assertEqual(p3.readiness, "NOT_READY")
+        self.assertIn(f"{CaseId.TC_OPENCODE_SMOKE.value}.tool_mismatch", p3.unresolved_parameters)
+
+    # -------------------------------------------------------------------------
+    # R007: OpenCode Policy Readiness Tests
+    # -------------------------------------------------------------------------
+
+    def test_r007_opencode_missing_required_env_key_blocks_ready(self) -> None:
+        """Verify missing any required OpenCode override key causes NOT_READY (CAL1B-PRE-R007)."""
+        run_root = self.test_root / "RUN-R007-ENV"
+        req_keys = [
+            "OPENCODE_CONFIG_CONTENT",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        ]
+
+        for target_case in [CaseId.TC_OPENCODE_SMOKE.value, CaseId.TC_OPENCODE_MUTATION.value]:
+            for key_to_remove in req_keys:
+                with self.subTest(case=target_case, missing_key=key_to_remove):
+                    specs = plan_calibration_invocations(
+                        run_root=run_root,
+                        executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+                        models={"codex": "m_c", "agy": "m_a", "opencode2": "m_o"},
+                    )
+                    orig_spec = specs[target_case]
+                    corrupted_env_keys = [k for k in orig_spec.env_override_keys if k != key_to_remove]
+                    specs[target_case] = InvocationSpec(
+                        tool=orig_spec.tool,
+                        executable=orig_spec.executable,
+                        argv=orig_spec.argv,
+                        cwd=orig_spec.cwd,
+                        model=orig_spec.model,
+                        timeout_seconds=orig_spec.timeout_seconds,
+                        env_override_keys=corrupted_env_keys,
+                        permission_summary=orig_spec.permission_summary,
+                        expected_raw_output_mode=orig_spec.expected_raw_output_mode,
+                    )
+                    payload = build_human_gate_payload("R-ENV", str(run_root), {}, {}, specs)
+                    self.assertEqual(payload.readiness, "NOT_READY")
+                    self.assertIn(f"{target_case}.env_missing_{key_to_remove}", payload.unresolved_parameters)
+
+    def test_r007_opencode_agent_selection_validation(self) -> None:
+        """Verify OpenCode spec requires explicit calibration-readonly agent in argv."""
+        run_root = self.test_root / "RUN-R007-AGENT"
+
+        # 1. Wrong agent: --agent build
+        specs_wrong_agent = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m_c", "agy": "m_a", "opencode2": "m_o"},
+        )
+        orig = specs_wrong_agent[CaseId.TC_OPENCODE_SMOKE.value]
+        wrong_argv = [tok if tok != "calibration-readonly" else "build" for tok in orig.argv]
+        specs_wrong_agent[CaseId.TC_OPENCODE_SMOKE.value] = InvocationSpec(
+            tool=orig.tool,
+            executable=orig.executable,
+            argv=wrong_argv,
+            cwd=orig.cwd,
+            model=orig.model,
+            timeout_seconds=orig.timeout_seconds,
+            env_override_keys=orig.env_override_keys,
+            permission_summary=orig.permission_summary,
+            expected_raw_output_mode=orig.expected_raw_output_mode,
+        )
+        p1 = build_human_gate_payload("R-WAGENT", str(run_root), {}, {}, specs_wrong_agent)
+        self.assertEqual(p1.readiness, "NOT_READY")
+        self.assertIn(f"{CaseId.TC_OPENCODE_SMOKE.value}.agent_mismatch", p1.unresolved_parameters)
+
+        # 2. Missing --agent
+        specs_no_agent = plan_calibration_invocations(
+            run_root=run_root,
+            executables={"codex": "/bin/codex", "agy": "/bin/agy", "opencode2": "/bin/opencode2"},
+            models={"codex": "m_c", "agy": "m_a", "opencode2": "m_o"},
+        )
+        orig2 = specs_no_agent[CaseId.TC_OPENCODE_MUTATION.value]
+        no_agent_argv = [tok for tok in orig2.argv if tok not in ("--agent", "calibration-readonly")]
+        specs_no_agent[CaseId.TC_OPENCODE_MUTATION.value] = InvocationSpec(
+            tool=orig2.tool,
+            executable=orig2.executable,
+            argv=no_agent_argv,
+            cwd=orig2.cwd,
+            model=orig2.model,
+            timeout_seconds=orig2.timeout_seconds,
+            env_override_keys=orig2.env_override_keys,
+            permission_summary=orig2.permission_summary,
+            expected_raw_output_mode=orig2.expected_raw_output_mode,
+        )
+        p2 = build_human_gate_payload("R-NAGENT", str(run_root), {}, {}, specs_no_agent)
+        self.assertEqual(p2.readiness, "NOT_READY")
+        self.assertIn(f"{CaseId.TC_OPENCODE_MUTATION.value}.agent_mismatch", p2.unresolved_parameters)
+
+    # -------------------------------------------------------------------------
+    # R008: False Case PASS & Hash / Mutation Consistency Tests
+    # -------------------------------------------------------------------------
+
+    def test_r008_workspace_mutated_with_pass_verdict_rejected(self) -> None:
+        """Verify pre_hash != post_hash, workspace_mutated=True, verdict=PASS is rejected (CAL1B-PRE-R008 Case A)."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-R008-1",
+            tool="codex",
+            executable_path="/bin/codex",
+            version="0.148.0",
+            working_dir="/tmp/ws",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        case_a = CalibrationCaseResult(
+            case_id=CaseId.TC_CODEX_SMOKE.value,
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash="a" * 64,
+            post_hash="b" * 64,
+            workspace_mutated=True,
+            verdict=CalibrationVerdict.PASS,
+            error_class=None,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_calibration_case_result(case_a)
+        self.assertIn("PASS verdict cannot have mutated workspace", str(ctx.exception))
+
+    def test_r008_hash_mismatch_with_workspace_mutated_false_rejected(self) -> None:
+        """Verify pre_hash != post_hash, workspace_mutated=False is rejected (CAL1B-PRE-R008 Case B)."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-R008-2",
+            tool="codex",
+            executable_path="/bin/codex",
+            version="0.148.0",
+            working_dir="/tmp/ws",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        case_b = CalibrationCaseResult(
+            case_id=CaseId.TC_CODEX_SMOKE.value,
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash="a" * 64,
+            post_hash="b" * 64,
+            workspace_mutated=False,
+            verdict=CalibrationVerdict.FAIL,
+            error_class=ErrorClass.IMPLEMENTATION_FAILURE,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_calibration_case_result(case_b)
+        self.assertIn("contradicts hash comparison", str(ctx.exception))
+
+    def test_r008_hash_match_with_workspace_mutated_true_rejected(self) -> None:
+        """Verify pre_hash == post_hash, workspace_mutated=True is rejected (CAL1B-PRE-R008 Case C)."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-R008-3",
+            tool="codex",
+            executable_path="/bin/codex",
+            version="0.148.0",
+            working_dir="/tmp/ws",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        case_c = CalibrationCaseResult(
+            case_id=CaseId.TC_CODEX_SMOKE.value,
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash="a" * 64,
+            post_hash="a" * 64,
+            workspace_mutated=True,
+            verdict=CalibrationVerdict.FAIL,
+            error_class=ErrorClass.GOVERNANCE_BLOCKER,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_calibration_case_result(case_c)
+        self.assertIn("contradicts hash comparison", str(ctx.exception))
+
+    def test_r008_valid_clean_workspace_pass_accepted(self) -> None:
+        """Verify pre_hash == post_hash, workspace_mutated=False, verdict=PASS is valid."""
+        inv_result = CalibrationResult(
+            calibration_id="CAL-R008-4",
+            tool="codex",
+            executable_path="/bin/codex",
+            version="0.148.0",
+            working_dir="/tmp/ws",
+            status=CalibrationStatus.PASS,
+            error_class=None,
+            timed_out=False,
+            duration_ms=100,
+            structured_output_valid=True,
+            exit_code=0,
+        )
+        case_valid = CalibrationCaseResult(
+            case_id=CaseId.TC_CODEX_SMOKE.value,
+            tool="codex",
+            invocation_result=inv_result,
+            pre_hash="a" * 64,
+            post_hash="a" * 64,
+            workspace_mutated=False,
+            verdict=CalibrationVerdict.PASS,
+            error_class=None,
+        )
+        validate_calibration_case_result(case_valid)
+
+    # -------------------------------------------------------------------------
     # Runtime Schema Copy Contract
     # -------------------------------------------------------------------------
 
@@ -1047,6 +1315,29 @@ class TestCalibrationHarness(unittest.TestCase):
         target2 = self.test_root / "runtime2" / "schema.json"
         with self.assertRaises(ValueError):
             copy_payload_schema_to_runtime(symlink_src, target2)
+
+    def test_copy_payload_schema_hash_mismatch_branch(self) -> None:
+        """Verify copy_payload_schema_to_runtime raises ValueError if SHA-256 integrity check fails."""
+        import shutil
+        src_schema = self.test_root / "src_mismatch_schema.json"
+        src_schema.write_text('{"CALIBRATION_KEY": "src"}', encoding="utf-8")
+        target_schema = self.test_root / "runtime_mismatch" / "schemas" / "calibration-payload.schema.json"
+
+        # Monkeypatch shutil.copy2 temporarily to write altered content to destination
+        original_copy2 = shutil.copy2
+        try:
+            def corrupting_copy2(src, dst):
+                target_path = Path(dst)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text('{"CALIBRATION_KEY": "corrupted"}', encoding="utf-8")
+                return dst
+
+            shutil.copy2 = corrupting_copy2
+            with self.assertRaises(ValueError) as ctx:
+                copy_payload_schema_to_runtime(src_schema, target_schema)
+            self.assertIn("SHA-256 mismatch", str(ctx.exception))
+        finally:
+            shutil.copy2 = original_copy2
 
 
 if __name__ == "__main__":
