@@ -554,6 +554,13 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
         raise ValueError("OpenCode output contains no non-empty lines")
 
     terminal_payload: dict[str, Any] | None = None
+    reviewer_payloads: list[dict[str, Any]] = []
+
+    def record_reviewer_payload(candidate: dict[str, Any]) -> None:
+        """Record complete normalized-review-shaped payloads for ambiguity checks."""
+        verdict = candidate.get("result", candidate.get("recommendation"))
+        if verdict in {"PASS", "FAIL", "ACCEPT", "REJECT"} and isinstance(candidate.get("findings"), list):
+            reviewer_payloads.append(candidate)
 
     for line in lines:
         try:
@@ -573,10 +580,26 @@ def parse_opencode_output(raw_json_events: str) -> dict[str, Any]:
             )
             if isinstance(candidate, dict):
                 terminal_payload = candidate
+                record_reviewer_payload(candidate)
         elif event_type in ("final_response", "result", "terminal"):
             candidate = event.get("data") if "data" in event else event.get("payload")
             if isinstance(candidate, dict):
                 terminal_payload = candidate
+                record_reviewer_payload(candidate)
+        elif event_type == "text":
+            part = event.get("part")
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str):
+                try:
+                    candidate = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    terminal_payload = candidate
+                    record_reviewer_payload(candidate)
+
+    if len(reviewer_payloads) > 1:
+        raise ValueError("Ambiguous normalized review results in OpenCode event stream")
 
     if terminal_payload is None:
         raise ValueError("No recognized terminal response payload found in OpenCode event stream")

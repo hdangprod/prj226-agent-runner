@@ -15,6 +15,7 @@ from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.runner import (
     RoleConfig,
     _fresh_reviewer_env,
+    _parse_reviewer_result,
     build_builder_invocation,
     build_reviewer_invocation,
     candidate_branch_name,
@@ -232,6 +233,70 @@ class TestHarn001Runner(unittest.TestCase):
     def test_sos_reject_prevents_acceptance_ready(self) -> None:
         result = self.execute_runner(FAKE_SOS="REJECT")
         self.assertEqual(result["result"], "STOPPED")
+
+    def test_opencode_text_event_normalizes_run_004_reviewer_result(self) -> None:
+        stdout = self.root / "opencode-stdout.log"
+        stdout.write_text(
+            "{\"type\":\"step_start\",\"part\":{\"type\":\"step-start\"}}\n"
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"checking evidence\"}}\n"
+            + json.dumps({
+                "type": "text",
+                "part": {"type": "text", "text": json.dumps({"result": "PASS", "findings": []})},
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(_parse_reviewer_result(stdout, "dv"), ("PASS", []))
+
+    def test_opencode_text_event_supports_sos_reviewer_contract(self) -> None:
+        stdout = self.root / "opencode-sos-stdout.log"
+        stdout.write_text(
+            "{\"type\":\"step_start\",\"part\":{\"type\":\"step-start\"}}\n"
+            + json.dumps({
+                "type": "text",
+                "part": {"type": "text", "text": json.dumps({"recommendation": "ACCEPT", "findings": []})},
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(_parse_reviewer_result(stdout, "sos"), ("ACCEPT", []))
+
+    def test_opencode_text_event_arbitrary_or_malformed_text_is_rejected(self) -> None:
+        for text in ("Looks good", "{not json"):
+            with self.subTest(text=text):
+                stdout = self.root / f"opencode-{len(text)}.log"
+                stdout.write_text(
+                    "{\"type\":\"step_start\"}\n" + json.dumps({"type": "text", "part": {"text": text}}) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ArtifactValidationError):
+                    _parse_reviewer_result(stdout, "dv")
+
+    def test_opencode_text_event_invalid_review_result_is_rejected(self) -> None:
+        stdout = self.root / "opencode-invalid-result.log"
+        stdout.write_text(
+            "{\"type\":\"step_start\"}\n" + json.dumps({
+                "type": "text",
+                "part": {"text": json.dumps({"result": "UNKNOWN", "findings": []})},
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ArtifactValidationError):
+            _parse_reviewer_result(stdout, "dv")
+
+    def test_opencode_text_event_conflicting_review_results_fail_closed(self) -> None:
+        stdout = self.root / "opencode-conflicting-results.log"
+        stdout.write_text(
+            "{\"type\":\"step_start\"}\n" + "\n".join(
+                json.dumps({"type": "text", "part": {"text": json.dumps({"result": result, "findings": []})}})
+                for result in ("PASS", "FAIL")
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ArtifactValidationError):
+            _parse_reviewer_result(stdout, "dv")
 
     def test_reviewer_worktree_mutation_detected(self) -> None:
         result = self.execute_runner(FAKE_REVIEW_MUTATE="1")
