@@ -77,7 +77,10 @@ HARN-002 Repair-4 binds the independent Security / Operability / Semantics /
 Architecture reviewer to Codex CLI / OpenAI / `gpt-5.6-luna`. Its lifecycle is
 deterministic local preflight → exactly one ordinary `codex exec` semantic
 review → deterministic local postflight. The invocation is ephemeral,
-read-only, isolated from user config and rules, and constrained by the closed
+read-only, isolated from user config and rules, explicitly disables built-in
+apps, and uses a fresh auth-only CODEX_HOME/HOME pair. Synthetic qualification
+and production review use the same canonical profile and sanitized
+`reviewer_profile_hash`, and are constrained by the closed
 [Codex reviewer result schema](schemas/codex-reviewer-result.schema.json).
 Provider failures stop without retry or fallback. Runner Git checks and a
 path-sorted filesystem fingerprint bind the verifier worktree before and after

@@ -12,7 +12,6 @@ import os
 import shutil
 import stat
 import subprocess
-import tempfile
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import ntpath
@@ -28,11 +27,19 @@ from prj226_runner.errors import (
     WorktreeIntegrityError,
 )
 from prj226_runner.paths import get_runner_root
+from prj226_runner.reviewer_profile import (
+    CODEX_REVIEWER_MODEL,
+    CODEX_REVIEWER_PROVIDER,
+    CODEX_REVIEWER_TOOL,
+    CodexReviewerProfile,
+    build_codex_reviewer_argv,
+    build_codex_reviewer_env as build_canonical_codex_reviewer_env,
+    build_codex_reviewer_profile,
+    normalize_codex_reviewer_profile,
+    resolve_reviewer_executable,
+)
 
 
-CODEX_REVIEWER_PROVIDER = "OpenAI"
-CODEX_REVIEWER_MODEL = "gpt-5.6-luna"
-CODEX_REVIEWER_TOOL = "codex"
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 
 REVIEW_KEYS = {
@@ -392,14 +399,7 @@ def _validate_schema_file(schema: Path) -> None:
 
 def _resolve_executable(executable: str) -> Path:
     """Resolve and validate an executable path using local filesystem inspection only."""
-    configured = Path(executable).expanduser()
-    resolved = configured if configured.is_file() else Path(shutil.which(executable) or "")
-    if not resolved.is_file():
-        raise RunnerEnvironmentError(f"Codex reviewer executable is not an existing file: {executable}")
-    resolved = resolved.resolve()
-    if not os.access(resolved, os.X_OK):
-        raise RunnerEnvironmentError(f"Codex reviewer executable is not executable: {resolved}")
-    return resolved
+    return resolve_reviewer_executable(executable)
 
 
 def check_codex_reviewer_binding(
@@ -407,16 +407,20 @@ def check_codex_reviewer_binding(
     *,
     model: str = CODEX_REVIEWER_MODEL,
     output_schema: Path | str | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Perform only deterministic local checks for the fixed reviewer binding."""
-    if model != CODEX_REVIEWER_MODEL:
-        raise ArtifactValidationError(f"Codex reviewer model must be exactly {CODEX_REVIEWER_MODEL}")
-    resolved_executable = _resolve_executable(executable)
+    profile = build_codex_reviewer_profile(executable, model=model)
     schema = Path(output_schema or _schema_path()).resolve()
     if not schema.is_file():
         raise RunnerEnvironmentError(f"Codex reviewer output schema is missing: {schema}")
     _validate_schema_file(schema)
-    return {"executable": str(resolved_executable), "model": CODEX_REVIEWER_MODEL, "output_schema": str(schema)}
+    return {
+        "executable": profile.resolved_executable,
+        "model": profile.model,
+        "output_schema": str(schema),
+        "reviewer_profile_hash": profile.reviewer_profile_hash,
+        "reviewer_profile": profile.authority_manifest(),
+    }
 
 
 def _object_id(value: Any, field: str) -> str:
@@ -519,104 +523,65 @@ def build_codex_reviewer_invocation(
     output_path: Path | str | None = None,
     *,
     model: str = CODEX_REVIEWER_MODEL,
+    profile: CodexReviewerProfile | None = None,
 ) -> list[str]:
     """Build the ordinary `codex exec` argv for the fixed reviewer binding."""
-    if model != CODEX_REVIEWER_MODEL:
-        raise ArtifactValidationError(f"Codex reviewer model must be exactly {CODEX_REVIEWER_MODEL}")
+    reviewer_profile = profile or build_codex_reviewer_profile(executable, model=model)
+    if reviewer_profile.model != model:
+        raise ArtifactValidationError("Codex reviewer profile/model mismatch")
+    if resolve_reviewer_executable(executable) != Path(reviewer_profile.resolved_executable):
+        raise ArtifactValidationError("Codex reviewer executable does not match canonical profile")
     schema = Path(output_schema or _schema_path()).resolve()
     result = Path(output_path).resolve() if output_path is not None else None
     if result is None:
         raise ArtifactValidationError("Codex reviewer requires an explicit final output path")
-    workspace_path = Path(workspace).resolve()
-    try:
-        result.relative_to(workspace_path)
-    except ValueError:
-        pass
-    else:
-        raise ArtifactValidationError("Codex reviewer output must be outside the verifier worktree")
     if not schema.is_file():
         raise RunnerEnvironmentError(f"Codex reviewer output schema is missing: {schema}")
     _validate_schema_file(schema)
-    argv = [
-        executable,
-        "--ask-for-approval",
-        "never",
-        "exec",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--ephemeral",
-        "-C",
-        str(workspace_path),
-        "--sandbox",
-        "read-only",
-        "--model",
-        CODEX_REVIEWER_MODEL,
-        "--output-schema",
-        str(schema),
-        "-o",
-        str(result),
-    ]
-    argv.append(prompt)
-    return argv
-
-
-_SAFE_INHERITED_ENV = {
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-    "CODEX_ACCESS_TOKEN",
-    "OPENAI_API_KEY",
-}
+    return build_codex_reviewer_argv(reviewer_profile, workspace, prompt, schema, result)
 
 
 def build_codex_reviewer_env(
-    evidence_dir: Path | str,
+    evidence_dir: Path | str | None = None,
     *,
     source_codex_home: Path | str | None = None,
 ) -> dict[str, str]:
     """Create a clean child environment and copy only the Codex auth file."""
-    # The auth-only home is ephemeral and deliberately outside durable review
-    # evidence, so credentials cannot be mistaken for a review artifact.
-    isolated_home = Path(tempfile.mkdtemp(prefix="prj226-review-codex-home-"))
-    try:
-        source = Path(source_codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-        source_auth = source / "auth.json"
-        destination_auth = isolated_home / "auth.json"
-        if source_auth.is_symlink() or source_auth.exists():
-            if source_auth.is_symlink() or not source_auth.is_file():
-                raise RunnerEnvironmentError("Codex authentication material is not a regular file")
-            try:
-                shutil.copyfile(source_auth, destination_auth)
-                destination_auth.chmod(0o600)
-            except OSError as exc:
-                raise RunnerEnvironmentError("Unable to copy isolated Codex authentication material") from exc
-        child_env = {key: os.environ[key] for key in _SAFE_INHERITED_ENV if key in os.environ}
-        child_env["CODEX_HOME"] = str(isolated_home)
-        # Keep the child from discovering user-level configuration through HOME;
-        # auth.json above is the only file copied into the isolated Codex home.
-        child_env["HOME"] = str(isolated_home)
-        return child_env
-    except RunnerEnvironmentError:
-        shutil.rmtree(isolated_home, ignore_errors=True)
-        raise
+    return build_canonical_codex_reviewer_env(source_codex_home=source_codex_home)
+
+
+def build_codex_reviewer_qualification_invocation(
+    executable: str,
+    workspace: Path | str,
+    prompt: str,
+    output_schema: Path | str,
+    output_path: Path | str,
+    *,
+    model: str = CODEX_REVIEWER_MODEL,
+) -> list[str]:
+    """Build the synthetic-qualification invocation from the same profile."""
+    return build_codex_reviewer_invocation(
+        executable,
+        workspace,
+        prompt,
+        output_schema,
+        output_path,
+        model=model,
+    )
+
+
+build_synthetic_codex_reviewer_invocation = build_codex_reviewer_qualification_invocation
+build_codex_reviewer_qualification_env = build_codex_reviewer_env
+build_synthetic_codex_reviewer_env = build_codex_reviewer_env
+
+
+def qualify_codex_reviewer_invocation(
+    argv: list[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Perform deterministic local profile qualification without Codex."""
+    return normalize_codex_reviewer_profile(argv, env=env)
 
 
 def _git(repo: Path, args: list[str]) -> str:
@@ -662,13 +627,34 @@ def _assert_candidate(
     return actual_fingerprint
 
 
-def _run_once(argv: list[str], workspace: Path, evidence_dir: Path, timeout_seconds: int, env: dict[str, str]) -> None:
+def _run_once(
+    argv: list[str],
+    workspace: Path,
+    evidence_dir: Path,
+    timeout_seconds: int,
+    env: dict[str, str],
+    profile: CodexReviewerProfile,
+) -> None:
     evidence_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = evidence_dir / "stdout.log"
     stderr_path = evidence_dir / "stderr.log"
     exit_code: int | None = None
     timed_out = False
     duration_ms: int | None = None
+    invocation_base = {
+        "argv": argv,
+        "tool": CODEX_REVIEWER_TOOL,
+        "provider": CODEX_REVIEWER_PROVIDER,
+        "model": profile.model,
+        "sandbox": profile.sandbox,
+        "approval": profile.approval,
+        "ephemeral": profile.ephemeral,
+        "ignore_user_config": True,
+        "ignore_rules": True,
+        "apps_disabled": True,
+        "reviewer_profile_hash": profile.reviewer_profile_hash,
+        "reviewer_profile": profile.authority_manifest(),
+    }
     try:
         exit_code, timed_out, duration_ms = run_calibration_subprocess(
             argv,
@@ -682,18 +668,11 @@ def _run_once(argv: list[str], workspace: Path, evidence_dir: Path, timeout_seco
         # Persist a non-secret invocation record even for spawn failure.  This
         # makes the one-attempt boundary auditable without recording env data.
         invocation = {
-            "argv": argv,
+            **invocation_base,
             "exit_code": None,
             "timed_out": False,
             "duration_ms": None,
             "spawn_error": type(exc).__name__,
-            "tool": CODEX_REVIEWER_TOOL,
-            "provider": CODEX_REVIEWER_PROVIDER,
-            "model": CODEX_REVIEWER_MODEL,
-            "sandbox": "read-only",
-            "ephemeral": True,
-            "ignore_user_config": True,
-            "ignore_rules": True,
         }
         try:
             (evidence_dir / "invocation.json").write_text(
@@ -703,17 +682,10 @@ def _run_once(argv: list[str], workspace: Path, evidence_dir: Path, timeout_seco
             raise RunnerEnvironmentError(f"Unable to persist Codex reviewer invocation evidence: {persist_exc}") from persist_exc
         raise AgentExecutionError(f"Codex reviewer process could not start: {exc}") from exc
     invocation = {
-        "argv": argv,
+        **invocation_base,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
-        "tool": CODEX_REVIEWER_TOOL,
-        "provider": CODEX_REVIEWER_PROVIDER,
-        "model": CODEX_REVIEWER_MODEL,
-        "sandbox": "read-only",
-        "ephemeral": True,
-        "ignore_user_config": True,
-        "ignore_rules": True,
     }
     try:
         (evidence_dir / "invocation.json").write_text(json.dumps(invocation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -749,7 +721,8 @@ def run_codex_review(
         pass
     else:
         raise GovernanceBlockerError("Review artifacts must be outside the verifier worktree")
-    binding = check_codex_reviewer_binding(executable, model=CODEX_REVIEWER_MODEL, output_schema=output_schema)
+    profile = build_codex_reviewer_profile(executable, model=CODEX_REVIEWER_MODEL)
+    binding = check_codex_reviewer_binding(executable, model=profile.model, output_schema=output_schema)
     pre_fingerprint = _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
     evidence.mkdir(parents=True, exist_ok=True)
     with EvidenceRoot(evidence, label="Codex review evidence root"):
@@ -769,10 +742,31 @@ def run_codex_review(
         prompt,
         output_schema,
         output_path,
+        profile=profile,
     )
     env = build_codex_reviewer_env(evidence, source_codex_home=source_codex_home)
     try:
-        _run_once(argv, candidate_workspace, evidence, timeout_seconds, env)
+        normalized_profile = normalize_codex_reviewer_profile(argv, profile=profile, env=env)
+        (evidence / "reviewer-profile.json").write_text(
+            json.dumps(
+                {
+                    "authority": normalized_profile["authority"],
+                    "environment": normalized_profile["environment"],
+                    "reviewer_profile_hash": normalized_profile["reviewer_profile_hash"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        shutil.rmtree(env["CODEX_HOME"], ignore_errors=True)
+        if isinstance(exc, (ArtifactValidationError, RunnerEnvironmentError)):
+            raise
+        raise RunnerEnvironmentError(f"Unable to persist Codex reviewer profile evidence: {exc}") from exc
+    try:
+        _run_once(argv, candidate_workspace, evidence, timeout_seconds, env, profile)
     finally:
         shutil.rmtree(env["CODEX_HOME"], ignore_errors=True)
     # Capture and persist the post-review filesystem identity before the Git
@@ -803,6 +797,8 @@ def run_codex_review(
         "artifact_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
         "raw_artifact": str(output_path),
         "invocation": str(evidence / "invocation.json"),
+        "reviewer_profile": str(evidence / "reviewer-profile.json"),
+        "reviewer_profile_hash": profile.reviewer_profile_hash,
         "fingerprint": pre_fingerprint,
         "fingerprint_pre_artifact": str(evidence / "fingerprint-pre.json"),
         "fingerprint_post_artifact": str(evidence / "fingerprint-post.json"),
