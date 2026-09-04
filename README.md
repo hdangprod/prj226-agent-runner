@@ -72,3 +72,19 @@ Provider executables and models are configured only in `runner.toml`; they are
 never accepted from a packet. Runtime evidence is immutable under the configured
 external `runtime_root`. The runner never retries, repairs, merges, rebases,
 cherry-picks, canonicalizes, or pushes a product repository.
+
+## HARN-002 single-project controller
+
+HARN-002 adds a manifest-driven, read-only project inspection and next-work
+discovery layer above Runner V1. It drafts a closed Design Contract, waits for
+exact Human Gate A binding, derives the existing HARN-001 Task Packet, ingests
+exact candidate/reviewer evidence, and stops at Human Gate B before canonical
+integration. See [AI Agent Harness Vision and Operating Model V2](AI_AGENT_HARNESS_VISION_AND_OPERATING_MODEL_V2.md)
+and the contracts in `schemas/project-manifest.schema.json`,
+`schemas/design-contract.schema.json`, `schemas/controller-state.schema.json`,
+and `schemas/controller-result.schema.json`.
+
+The smallest CLI probes are `inspect-project`, `discover-work`,
+`draft-contract`, `derive-task-packet`, `ingest-result`, `prepare-gate-b`, and
+`resume`. Controller state stores only orchestration facts; it never copies
+project source, logs, or Git history.

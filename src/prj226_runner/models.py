@@ -42,6 +42,32 @@ class ErrorClass(str, Enum):
     GOVERNANCE_BLOCKER = "GOVERNANCE_BLOCKER"
 
 
+class WorkShape(str, Enum):
+    """The only work classifications accepted by HARN-002."""
+
+    SPIKE = "SPIKE"
+    BOUNDED = "BOUNDED"
+    ARCHITECTURAL = "ARCHITECTURAL"
+
+
+class ControllerPhase(str, Enum):
+    """Explicit HARN-002 controller cursor phases."""
+
+    PROJECT_DISCOVERY = "PROJECT_DISCOVERY"
+    TASK_DISCOVERY = "TASK_DISCOVERY"
+    WORK_CLASSIFICATION = "WORK_CLASSIFICATION"
+    CONTRACT_DRAFT = "CONTRACT_DRAFT"
+    WAITING_HUMAN_GATE_A = "WAITING_HUMAN_GATE_A"
+    EXECUTION_PREP = "EXECUTION_PREP"
+    RUNNER_ACTIVE = "RUNNER_ACTIVE"
+    RESULT_INGESTION = "RESULT_INGESTION"
+    ACCEPTANCE_READY = "ACCEPTANCE_READY"
+    WAITING_HUMAN_GATE_B = "WAITING_HUMAN_GATE_B"
+    CANONICAL_INTEGRATION = "CANONICAL_INTEGRATION"
+    POST_INTEGRATION_VERIFY = "POST_INTEGRATION_VERIFY"
+    STOPPED = "STOPPED"
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     """Configuration binding for a single role agent."""
