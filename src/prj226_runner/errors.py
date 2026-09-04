@@ -22,10 +22,6 @@ class RunnerEnvironmentError(RunnerError):
     error_class = ErrorClass.ENVIRONMENT_ERROR
 
 
-class ReviewerProviderUnavailableError(RunnerEnvironmentError):
-    """Raised when the explicitly bound Codex provider cannot start or respond."""
-
-
 class AgentExecutionError(RunnerError):
     """Raised when an external agent invocation crashes or times out."""
 

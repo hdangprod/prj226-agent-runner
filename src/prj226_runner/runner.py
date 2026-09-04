@@ -24,10 +24,9 @@ from prj226_runner.calibration import (
     validate_run_id,
 )
 from prj226_runner.codex_reviewer import (
-    CODEX_REVIEWER_MODEL,
     build_codex_reviewer_invocation,
+    check_codex_reviewer_binding,
     run_codex_review,
-    run_codex_startup_probe,
 )
 from prj226_runner.errors import (
     AgentExecutionError,
@@ -223,6 +222,11 @@ def _paths_for(config: RunnerConfig, packet: TaskPacket) -> dict[str, Path]:
 
 def _inspect(packet: TaskPacket, config: RunnerConfig) -> dict[str, Any]:
     repo = _canonical_baseline(packet)
+    reviewer = config.agents["sos_reviewer"]
+    if reviewer.tool == "codex":
+        # This is local binding/schema/executable inspection only.  It must
+        # never be replaced by a provider startup or availability call.
+        check_codex_reviewer_binding(reviewer.executable, model=reviewer.model)
     paths = _paths_for(config, packet)
     if paths["root"].exists():
         raise GovernanceBlockerError(f"Run ID collision: immutable runtime evidence already exists at {paths['root']}")
@@ -545,13 +549,6 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
         evidence.transition(RunState.SOS_RUNNING, "sos_started")
         sos_role = config.agents["sos_reviewer"]
         if sos_role.tool == "codex":
-            if sos_role.model != CODEX_REVIEWER_MODEL:
-                raise ArtifactValidationError(f"Codex independent reviewer model must be exactly {CODEX_REVIEWER_MODEL}")
-            run_codex_startup_probe(
-                sos_role.executable,
-                paths["sos"] / "startup",
-                timeout_seconds=sos_role.timeout_seconds,
-            )
             review_workspace = _create_candidate_verifier_worktree(repo, candidate, paths["review_worktree"])
             codex_review = run_codex_review(
                 sos_role.executable,
@@ -573,7 +570,6 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
                 "review_disposition": review_value["disposition"],
                 "review_artifact": codex_review["artifact"],
                 "review_raw_artifact": codex_review["raw_artifact"],
-                "review_startup": str(paths["sos"] / "startup" / "startup-result.json"),
             })
         else:
             context = _review_context(packet, candidate, tree, changes, tests)

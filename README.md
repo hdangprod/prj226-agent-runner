@@ -73,13 +73,15 @@ never accepted from a packet. Runtime evidence is immutable under the configured
 external `runtime_root`. The runner never retries, repairs, merges, rebases,
 cherry-picks, canonicalizes, or pushes a product repository.
 
-HARN-002 Repair-2 binds the independent Security / Operability / Semantics /
-Architecture reviewer to Codex CLI / OpenAI / `gpt-5.6-luna`. Its ordinary
-`codex exec` invocation is ephemeral, read-only, isolated from user config and
-rules, and constrained by the closed
+HARN-002 Repair-3 binds the independent Security / Operability / Semantics /
+Architecture reviewer to Codex CLI / OpenAI / `gpt-5.6-luna`. Its lifecycle is
+deterministic local preflight → exactly one ordinary `codex exec` semantic
+review → deterministic local postflight. The invocation is ephemeral,
+read-only, isolated from user config and rules, and constrained by the closed
 [Codex reviewer result schema](schemas/codex-reviewer-result.schema.json).
-Runner Git checks bind the verifier worktree before and after review; reviewer
-claims never authorize a candidate transition.
+Provider failures stop without retry or fallback. Runner Git checks bind the
+verifier worktree before and after review; reviewer claims never authorize a
+candidate transition.
 
 ## HARN-002 single-project controller
 
@@ -92,7 +94,7 @@ and the contracts in `schemas/project-manifest.schema.json`,
 `schemas/design-contract.schema.json`, `schemas/controller-state.schema.json`,
 and `schemas/controller-result.schema.json`.
 
-The smallest CLI probes are `inspect-project`, `discover-work`,
+The smallest CLI commands are `inspect-project`, `discover-work`,
 `draft-contract`, `derive-task-packet`, `ingest-result`, `prepare-gate-b`, and
 `resume`. Controller state stores only orchestration facts; it never copies
 project source, logs, or Git history.

@@ -10,7 +10,9 @@
 ## Constraints
 - **Independent & Unanchored**: Must evaluate candidate code independently without anchoring on prior verifier conclusions.
 - **Read-Only**: Strictly read-only; cannot modify code or repair defects.
-- **Provider Binding**: This HARN-002 Repair-2 role is bound only to Codex CLI / OpenAI / `gpt-5.6-luna`.
+- **Provider Binding**: This HARN-002 Repair-3 role is bound only to Codex CLI / OpenAI / `gpt-5.6-luna`.
+- **Lifecycle**: Deterministic local preflight, exactly one semantic review invocation, and deterministic local postflight.
+- **Failure Handling**: Provider failure, timeout, or cancellation stops the run; there is no probe, retry, fallback, or model change.
 - **Contract Output**: Must produce valid structured output conforming to `schemas/codex-reviewer-result.schema.json`.
 - **Candidate Binding**: `reviewed_head` and `reviewed_tree` must be the exact Git identities inspected.
 - **Disposition**: Return `PASS` only when all axes pass without blocking findings; otherwise return `NEEDS_FIX`.

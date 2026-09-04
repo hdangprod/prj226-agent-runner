@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CodexIndependentReviewerResult",
-  "description": "Closed HARN-002 Repair-2 result from the explicitly bound Codex independent reviewer.",
+  "description": "Closed HARN-002 Repair-3 result from the explicitly bound Codex independent reviewer.",
   "type": "object",
   "additionalProperties": false,
   "required": [

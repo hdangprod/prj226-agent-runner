@@ -6,7 +6,6 @@ from prj226_runner.errors import (
     GovernanceBlockerError,
     ImplementationFailureError,
     ReviewStaleError,
-    ReviewerProviderUnavailableError,
     RunnerEnvironmentError,
     RunnerError,
 )
@@ -51,7 +50,6 @@ __all__ = [
     "ImplementationFailureError",
     "GovernanceBlockerError",
     "ReviewStaleError",
-    "ReviewerProviderUnavailableError",
     "DEFAULT_TARGET_REPO",
     "DEFAULT_CANONICAL_BRANCH",
     "DEFAULT_EXPECTED_HEAD",
