@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import jsonschema
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from prj226_runner.controller import (
     discover_next_work,
     draft_design_contract,
     ingest_runner_result,
+    load_controller_result,
     inspect_project,
     integrate_after_gate_b,
     load_controller_state,
@@ -376,6 +378,9 @@ class TestHarn002Controller(unittest.TestCase):
         result = Controller(self.manifest).dispatch(contract, self._gate_a(contract), packet_path, config)
         self.assertEqual(result["result"], "ACCEPTANCE_READY", result)
         ingested = ingest_runner_result(contract, result)
+        persisted = load_controller_result(Path(result["runtime_root"]) / "controller-result.json")
+        jsonschema.Draft7Validator(json.loads((Path(__file__).parents[1] / "schemas/controller-result.schema.json").read_text(encoding="utf-8"))).validate(persisted)
+        self.assertEqual(persisted, ingested)
         gate_b = prepare_gate_b(contract, ingested, json.loads(Path(result["review_artifact"]).read_text(encoding="utf-8")))
         self.assertEqual(gate_b["decision"], "PENDING")
         self.assertEqual(self._git("rev-parse", "HEAD"), self.baseline_head)

@@ -111,3 +111,13 @@ fresh six-field Human Gate-B authorization bound to that package; the
 authorization is consumed by an exclusive attempt claim and is never a push
 authorization. Use-time validation repeats the evidence, baseline, candidate,
 and protected-worktree checks under the integration lock.
+
+Repair-6 binds Runner evidence to one trusted run-root directory descriptor.
+Internal evidence locators in the closed controller result are root-relative;
+every component is opened with no-follow semantics and every accepted file is
+read, hashed, parsed, and semantically checked from the same descriptor
+snapshot. Runner evidence files must have one hard link, matching the
+single-owner immutable evidence lifecycle. The controller result is
+schema-validated before persistence, and
+Gate-B reloads and revalidates that result and its evidence before it can be
+prepared or consumed.

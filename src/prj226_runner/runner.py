@@ -27,6 +27,7 @@ from prj226_runner.codex_reviewer import (
     build_codex_reviewer_invocation,
     fingerprint_worktree,
     check_codex_reviewer_binding,
+    read_artifact_snapshot,
     run_codex_review,
 )
 from prj226_runner.errors import (
@@ -421,7 +422,10 @@ def _fresh_reviewer_env(directory: Path) -> dict[str, str]:
 
 
 def _parse_reviewer_result(path: Path, kind: str) -> tuple[str, list[Any]]:
-    raw = path.read_text(encoding="utf-8")
+    try:
+        raw = read_artifact_snapshot(path).raw_bytes.decode("utf-8")
+    except (ArtifactValidationError, UnicodeDecodeError) as exc:
+        raise ArtifactValidationError(f"{kind} reviewer output is not a safe UTF-8 artifact") from exc
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:

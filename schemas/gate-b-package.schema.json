@@ -9,7 +9,7 @@
     "expected_canonical_head", "expected_canonical_tree", "contract_id", "contract_hash", "run_id",
     "baseline_head", "baseline_tree", "candidate_head", "candidate_tree", "candidate_ref",
     "expected_changed_paths", "design_contract_id", "design_contract_hash", "task_packet_id", "task_packet_hash",
-    "runner_acceptance_evidence_sha256", "review_artifact", "review_artifact_sha256", "review_disposition",
+    "runner_acceptance_evidence_sha256", "evidence_root", "review_artifact", "review_artifact_sha256", "review_disposition",
     "review_section_pass_states", "blocking_findings", "required_integrity_evidence", "evidence_references",
     "runner_acceptance_evidence", "gate_b_package_hash"
   ],
@@ -36,6 +36,7 @@
     "task_packet_id": {"type": "string", "minLength": 1},
     "task_packet_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "runner_acceptance_evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_root": {"type": "string", "minLength": 1},
     "review_artifact": {"type": "string", "minLength": 1},
     "review_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "review_disposition": {"const": "PASS"},

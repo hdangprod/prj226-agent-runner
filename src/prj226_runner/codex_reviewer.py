@@ -14,8 +14,10 @@ import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
+import ntpath
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from prj226_runner.calibration import run_calibration_subprocess
 from prj226_runner.errors import (
@@ -31,6 +33,7 @@ from prj226_runner.paths import get_runner_root
 CODEX_REVIEWER_PROVIDER = "OpenAI"
 CODEX_REVIEWER_MODEL = "gpt-5.6-luna"
 CODEX_REVIEWER_TOOL = "codex"
+MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 
 REVIEW_KEYS = {
     "disposition",
@@ -45,7 +48,6 @@ REVIEW_KEYS = {
 }
 REVIEW_AXIS_KEYS = {"status", "findings"}
 REVIEW_STATUSES = {"PASS", "NEEDS_FIX"}
-MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -62,103 +64,206 @@ class ArtifactSnapshot:
         return self.raw_bytes
 
 
-def _read_open_file_snapshot(
-    path: Path,
-    *,
-    label: str,
-    failure_type: type[Exception],
-    max_bytes: int | None = None,
-    expected_path_identity: os.stat_result | None = None,
-) -> bytes:
-    """Read one regular file descriptor and reject observable read races."""
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    # Prevent a replacement FIFO/device from blocking before fstat can fail it.
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    try:
-        descriptor = os.open(os.fspath(path), flags)
-    except OSError as exc:
-        raise failure_type(f"{label} cannot be opened as a regular file: {path}") from exc
-    try:
-        try:
-            before = os.fstat(descriptor)
-        except OSError as exc:
-            raise failure_type(f"{label} metadata cannot be captured: {path}") from exc
-        if not stat.S_ISREG(before.st_mode):
-            raise failure_type(f"{label} must reference a regular file: {path}")
-        if expected_path_identity is not None and (
-            before.st_dev != expected_path_identity.st_dev
-            or before.st_ino != expected_path_identity.st_ino
-            or stat.S_IFMT(before.st_mode) != stat.S_IFMT(expected_path_identity.st_mode)
-        ):
-            raise failure_type(f"{label} pathname identity changed before snapshot: {path}")
-        if max_bytes is not None and before.st_size > max_bytes:
-            raise failure_type(f"{label} exceeds the bounded snapshot size: {path}")
+def _safe_evidence_relative_path(value: str, field: str = "evidence path") -> str:
+    """Validate a portable, root-relative evidence locator before opening it."""
+    if not isinstance(value, str) or not value or value != value.strip() or "\x00" in value:
+        raise ArtifactValidationError(f"{field} must be a non-empty safe relative path")
+    # Evidence locators use POSIX separators even when the runner is inspected
+    # on another platform.  Reject Windows drive/UNC syntax explicitly rather
+    # than relying on the host platform's Path implementation.
+    drive, _ = ntpath.splitdrive(value)
+    if drive or value.startswith(("/", "\\")) or "\\" in value:
+        raise ArtifactValidationError(f"{field} must be root-relative")
+    components = value.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ArtifactValidationError(f"{field} contains an unsafe path component")
+    return "/".join(components)
 
-        data = bytearray()
-        while True:
-            try:
-                chunk = os.read(descriptor, 1024 * 1024)
-            except OSError as exc:
-                raise failure_type(f"{label} cannot be read: {path}") from exc
-            if not chunk:
-                break
-            data.extend(chunk)
-            if max_bytes is not None and len(data) > max_bytes:
-                raise failure_type(f"{label} exceeds the bounded snapshot size: {path}")
 
+class EvidenceRoot:
+    """One trusted directory descriptor used for all reads in an operation.
+
+    The root is opened once with no-follow semantics.  Every later component
+    is opened relative to the already-open parent descriptor, so a symlink in
+    any intermediate directory cannot escape the authorized evidence root.
+    """
+
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        label: str = "Evidence root",
+        failure_type: type[Exception] = ArtifactValidationError,
+    ) -> None:
+        self.path = Path(os.path.abspath(os.fspath(root)))
+        self.label = label
+        self.failure_type = failure_type
+        self._descriptor: int | None = None
+
+    def _fail(self, message: str) -> None:
+        raise self.failure_type(message)
+
+    def __enter__(self) -> "EvidenceRoot":
+        if not self.path.is_absolute():
+            self._fail(f"{self.label} must be an absolute directory")
+        required = ("O_NOFOLLOW", "O_DIRECTORY")
+        if any(not hasattr(os, name) for name in required) or os.open not in getattr(os, "supports_dir_fd", set()):
+            self._fail(f"{self.label} requires descriptor-relative no-follow filesystem primitives")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
         try:
-            after = os.fstat(descriptor)
+            descriptor = os.open(os.fspath(self.path), flags)
+            info = os.fstat(descriptor)
         except OSError as exc:
-            raise failure_type(f"{label} metadata cannot be captured after read: {path}") from exc
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            stat.S_IFMT(before.st_mode),
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-            stat.S_IMODE(before.st_mode),
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            stat.S_IFMT(after.st_mode),
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-            stat.S_IMODE(after.st_mode),
-        )
-        if before_identity != after_identity or len(data) != before.st_size:
-            raise failure_type(f"{label} changed during snapshot acquisition: {path}")
-        return bytes(data)
-    finally:
-        try:
+            self._fail(f"{self.label} cannot be opened as a trusted directory: {self.path}")
+            raise AssertionError("unreachable") from exc
+        if not stat.S_ISDIR(info.st_mode):
             os.close(descriptor)
-        except OSError:
-            pass
+            self._fail(f"{self.label} is not a directory: {self.path}")
+        self._descriptor = descriptor
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._descriptor is not None:
+            try:
+                os.close(self._descriptor)
+            except OSError:
+                pass
+            self._descriptor = None
+
+    def _root_fd(self) -> int:
+        if self._descriptor is None:
+            self._fail(f"{self.label} is not open")
+        return self._descriptor  # type: ignore[return-value]
+
+    def relative(self, value: str, field: str = "evidence path") -> str:
+        return _safe_evidence_relative_path(value, field)
+
+    def absolute_path(self, relative: str) -> Path:
+        """Return a lexical path for APIs that require a worktree pathname."""
+        return self.path / self.relative(relative)
+
+    def _open_relative(self, relative: str, *, final_directory: bool) -> int:
+        components = self.relative(relative)
+        parent = os.dup(self._root_fd())
+        try:
+            for component in components.split("/")[:-1]:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
+                try:
+                    child = os.open(component, flags, dir_fd=parent)
+                except OSError as exc:
+                    self._fail(f"{self.label} path component cannot be opened safely: {relative}")
+                    raise AssertionError("unreachable") from exc
+                os.close(parent)
+                parent = child
+            final_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            if final_directory:
+                final_flags |= os.O_DIRECTORY
+            try:
+                descriptor = os.open(components.split("/")[-1], final_flags, dir_fd=parent)
+            except OSError as exc:
+                self._fail(f"{self.label} path cannot be opened safely: {relative}")
+                raise AssertionError("unreachable") from exc
+            return descriptor
+        finally:
+            try:
+                os.close(parent)
+            except OSError:
+                pass
+
+    @contextmanager
+    def directory(self, relative: str, field: str = "evidence directory") -> Iterator[int]:
+        descriptor = self._open_relative(relative, final_directory=True)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                self._fail(f"{field} must be a directory: {relative}")
+            yield descriptor
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def validate_directory(self, relative: str, field: str = "evidence directory") -> None:
+        with self.directory(relative, field):
+            return
+
+    def snapshot(
+        self,
+        relative: str,
+        *,
+        label: str = "Evidence",
+        max_bytes: int | None = MAX_ARTIFACT_BYTES,
+        require_single_link: bool = True,
+    ) -> ArtifactSnapshot:
+        descriptor = self._open_relative(relative, final_directory=False)
+        try:
+            try:
+                before = os.fstat(descriptor)
+            except OSError as exc:
+                self._fail(f"{label} metadata cannot be captured: {relative}")
+                raise AssertionError("unreachable") from exc
+            if not stat.S_ISREG(before.st_mode):
+                self._fail(f"{label} must reference a regular file: {relative}")
+            if require_single_link and before.st_nlink != 1:
+                self._fail(f"{label} must have exactly one hard link: {relative}")
+            if max_bytes is not None and before.st_size > max_bytes:
+                self._fail(f"{label} exceeds the bounded snapshot size: {relative}")
+
+            data = bytearray()
+            while True:
+                try:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                except OSError as exc:
+                    self._fail(f"{label} cannot be read: {relative}")
+                    raise AssertionError("unreachable") from exc
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if max_bytes is not None and len(data) > max_bytes:
+                    self._fail(f"{label} exceeds the bounded snapshot size: {relative}")
+
+            try:
+                after = os.fstat(descriptor)
+            except OSError as exc:
+                self._fail(f"{label} metadata cannot be captured after read: {relative}")
+                raise AssertionError("unreachable") from exc
+            before_identity = (
+                before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode), before.st_nlink,
+                before.st_size, before.st_mtime_ns, stat.S_IMODE(before.st_mode),
+                before.st_uid, before.st_gid,
+            )
+            after_identity = (
+                after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode), after.st_nlink,
+                after.st_size, after.st_mtime_ns, stat.S_IMODE(after.st_mode),
+                after.st_uid, after.st_gid,
+            )
+            if before_identity != after_identity or len(data) != before.st_size:
+                self._fail(f"{label} changed during snapshot acquisition: {relative}")
+            raw_bytes = bytes(data)
+            return ArtifactSnapshot(raw_bytes, hashlib.sha256(raw_bytes).hexdigest())
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def list_directory(self, relative: str, field: str = "evidence directory") -> list[str]:
+        with self.directory(relative, field) as descriptor:
+            try:
+                names = os.listdir(descriptor)
+            except OSError as exc:
+                self._fail(f"{field} cannot be listed safely: {relative}")
+                raise AssertionError("unreachable") from exc
+        return sorted(names)
 
 
 def read_artifact_snapshot(path: Path | str) -> ArtifactSnapshot:
     """Capture exact bytes and SHA-256 from one no-follow regular-file open."""
     target = Path(path)
-    try:
-        info = os.lstat(target)
-    except OSError as exc:
-        raise ArtifactValidationError(f"Artifact is missing: {target}") from exc
-    if stat.S_ISLNK(info.st_mode):
-        raise ArtifactValidationError(f"Artifact path must not be a symbolic link: {target}")
-    if not stat.S_ISREG(info.st_mode):
-        raise ArtifactValidationError(f"Artifact must reference a regular file: {target}")
-    raw_bytes = _read_open_file_snapshot(
-        target,
-        label="Artifact",
-        failure_type=ArtifactValidationError,
-        max_bytes=MAX_ARTIFACT_BYTES,
-        expected_path_identity=info,
-    )
-    return ArtifactSnapshot(raw_bytes, hashlib.sha256(raw_bytes).hexdigest())
+    root_path = Path(os.path.abspath(os.fspath(target.parent)))
+    with EvidenceRoot(root_path, label="Artifact parent root") as root:
+        return root.snapshot(target.name, label="Artifact")
 
 
 def _git_admin_paths(workspace: Path) -> set[str]:
@@ -201,6 +306,7 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
         raise RunnerEnvironmentError(f"Reviewer worktree is not a directory: {root}")
     admin = _git_admin_paths(root)
     manifest: list[dict[str, Any]] = []
+    bound_root = EvidenceRoot(root, label="Reviewer worktree root", failure_type=WorktreeIntegrityError)
 
     def visit(directory: Path, relative_directory: str = "") -> None:
         try:
@@ -218,15 +324,12 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
                 raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree path: {relative}") from exc
             mode = stat.S_IMODE(info.st_mode)
             if stat.S_ISREG(info.st_mode):
-                try:
-                    raw_bytes = _read_open_file_snapshot(
-                        path,
-                        label=f"Unable to fingerprint reviewer worktree file {relative}",
-                        failure_type=WorktreeIntegrityError,
-                        expected_path_identity=info,
-                    )
-                except WorktreeIntegrityError:
-                    raise
+                raw_bytes = bound_root.snapshot(
+                    relative,
+                    label=f"Unable to fingerprint reviewer worktree file {relative}",
+                    max_bytes=None,
+                    require_single_link=False,
+                ).raw_bytes
                 manifest.append({"path": relative, "type": "file", "mode": mode, "sha256": hashlib.sha256(raw_bytes).hexdigest()})
             elif stat.S_ISLNK(info.st_mode):
                 try:
@@ -242,7 +345,8 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
                     f"WORKTREE_UNSUPPORTED_NODE: unsupported filesystem node at {relative}"
                 )
 
-    visit(root)
+    with bound_root:
+        visit(root)
     return sorted(manifest, key=lambda item: (str(item["path"]), str(item["type"])))
 
 
@@ -638,7 +742,7 @@ def run_codex_review(
     expected_head = _object_id(candidate_head, "candidate_head")
     expected_tree = _object_id(candidate_tree, "candidate_tree")
     candidate_workspace = Path(workspace).resolve()
-    evidence = Path(evidence_dir).resolve()
+    evidence = Path(os.path.abspath(os.fspath(evidence_dir)))
     try:
         evidence.relative_to(candidate_workspace)
     except ValueError:
@@ -648,6 +752,8 @@ def run_codex_review(
     binding = check_codex_reviewer_binding(executable, model=CODEX_REVIEWER_MODEL, output_schema=output_schema)
     pre_fingerprint = _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
     evidence.mkdir(parents=True, exist_ok=True)
+    with EvidenceRoot(evidence, label="Codex review evidence root"):
+        pass
     fingerprint_manifest = build_worktree_fingerprint_manifest(candidate_workspace)
     try:
         (evidence / "fingerprint-pre.json").write_text(
