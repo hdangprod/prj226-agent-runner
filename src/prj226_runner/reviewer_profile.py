@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -436,6 +438,109 @@ def assert_codex_reviewer_profile_parity(
     }
 
 
+def _sanitize_proxy_value(value: str) -> str | None:
+    """Remove proxy URL userinfo before allowing an ambient value through."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        # Accessing these properties validates malformed bracketed hosts and
+        # keeps malformed values from crossing the reviewer boundary.
+        has_userinfo = parsed.username is not None or parsed.password is not None
+    except ValueError:
+        return None
+
+    if has_userinfo:
+        # urlsplit exposes the authority separately, so preserve the proxy
+        # endpoint and remove only the ambient username/password component.
+        return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, parsed.query, parsed.fragment))
+    if "@" in parsed.netloc:
+        return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, parsed.query, parsed.fragment))
+    if "@" in value and "://" not in value:
+        # Some clients accept a scheme-less host:port form.  Apply the same
+        # userinfo rule to that form without broadening the accepted syntax.
+        return value.rsplit("@", 1)[-1]
+    return value
+
+
+def _read_auth_snapshot(source_auth: Path) -> bytes | None:
+    """Read auth.json from one no-follow descriptor, never by pathname twice."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(os.fspath(source_auth), flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RunnerEnvironmentError("Codex authentication material cannot be opened safely") from exc
+
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError as exc:
+            raise RunnerEnvironmentError("Codex authentication material metadata cannot be captured") from exc
+        if not stat.S_ISREG(before.st_mode):
+            raise RunnerEnvironmentError("Codex authentication material is not a regular file")
+
+        data = bytearray()
+        while True:
+            try:
+                chunk = os.read(descriptor, 1024 * 1024)
+            except OSError as exc:
+                raise RunnerEnvironmentError("Codex authentication material cannot be read") from exc
+            if not chunk:
+                break
+            data.extend(chunk)
+
+        try:
+            after = os.fstat(descriptor)
+        except OSError as exc:
+            raise RunnerEnvironmentError("Codex authentication material metadata cannot be captured after read") from exc
+        before_identity = (
+            before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode), before.st_nlink,
+            before.st_size, before.st_mtime_ns, stat.S_IMODE(before.st_mode), before.st_uid, before.st_gid,
+        )
+        after_identity = (
+            after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode), after.st_nlink,
+            after.st_size, after.st_mtime_ns, stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid,
+        )
+        if before_identity != after_identity or len(data) != before.st_size:
+            raise RunnerEnvironmentError("Codex authentication material changed during snapshot acquisition")
+        return bytes(data)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _write_private_auth(destination: Path, data: bytes) -> None:
+    """Create the isolated auth file without following a destination symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(os.fspath(destination), flags, 0o600)
+    except OSError as exc:
+        raise RunnerEnvironmentError("Unable to create isolated Codex authentication material") from exc
+    try:
+        offset = 0
+        while offset < len(data):
+            try:
+                written = os.write(descriptor, data[offset:])
+            except OSError as exc:
+                raise RunnerEnvironmentError("Unable to write isolated Codex authentication material") from exc
+            if written <= 0:
+                raise RunnerEnvironmentError("Unable to write isolated Codex authentication material")
+            offset += written
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError as exc:
+            raise RunnerEnvironmentError("Unable to secure isolated Codex authentication material") from exc
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def build_codex_reviewer_env(
     *,
     source_codex_home: Path | str | None = None,
@@ -446,24 +551,23 @@ def build_codex_reviewer_env(
         source = Path(source_codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
         source_auth = source / "auth.json"
         destination_auth = isolated_home / "auth.json"
-        if source_auth.is_symlink() or source_auth.exists():
-            if source_auth.is_symlink() or not source_auth.is_file():
-                raise RunnerEnvironmentError("Codex authentication material is not a regular file")
-            try:
-                shutil.copyfile(source_auth, destination_auth)
-                destination_auth.chmod(0o600)
-            except OSError as exc:
-                raise RunnerEnvironmentError("Unable to copy isolated Codex authentication material") from exc
+        auth_snapshot = _read_auth_snapshot(source_auth)
+        if auth_snapshot is not None:
+            _write_private_auth(destination_auth, auth_snapshot)
 
         # Keep reviewer runtime propagation explicitly bounded.  Authentication
         # comes only from the copied auth.json in the fresh CODEX_HOME; ambient
         # provider credentials must never become child-process authority.
         safe_keys = {
             "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
-            "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "NO_PROXY", "no_proxy",
         }
         child_env = {key: os.environ[key] for key in safe_keys if key in os.environ}
+        for proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            if proxy_key in os.environ:
+                sanitized = _sanitize_proxy_value(os.environ[proxy_key])
+                if sanitized is not None:
+                    child_env[proxy_key] = sanitized
         child_env["CODEX_HOME"] = str(isolated_home)
         child_env["HOME"] = str(isolated_home)
         return child_env

@@ -1760,17 +1760,17 @@ def _record_gate_b_attempt(package: Mapping[str, Any], authorization: Mapping[st
 
 
 def _fast_forward_exact_baseline(repo: Path, expected_head: str, candidate_head: str, branch: str) -> None:
-    """Fast-forward the canonical worktree with Git's compare-and-swap ref check."""
+    """Fast-forward the canonical worktree as one Git-owned transition."""
     branch_ref = _git(repo, ["symbolic-ref", "-q", "HEAD"])
     if branch_ref != "refs/heads/" + branch:
         raise GovernanceBlockerError("Canonical integration branch reference drift")
-    # The old object ID is a compare-and-swap guard. A concurrent ref change
-    # therefore fails the operation instead of being accepted as another base.
+    if _git(repo, ["rev-parse", "HEAD"]).lower() != expected_head:
+        raise GovernanceBlockerError("Canonical integration baseline drift")
     _git(repo, ["merge-base", "--is-ancestor", expected_head, candidate_head])
-    _git(repo, ["update-ref", branch_ref, candidate_head, expected_head])
-    # Update the already-verified clean index/worktree to the exact new tree;
-    # this is not reset/clean/stash/rebase and has no rollback path.
-    _git(repo, ["read-tree", "-u", "-m", expected_head, candidate_head])
+    # Git's fast-forward merge owns the ref, index, and worktree transition as
+    # one operation. Keeping update-ref and read-tree as separate runner steps
+    # could leave canonical state partially advanced if the second step failed.
+    _git(repo, ["merge", "--ff-only", "--no-edit", candidate_head])
 
 
 def integrate_after_gate_b(
