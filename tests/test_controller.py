@@ -251,10 +251,11 @@ class TestHarn002Controller(unittest.TestCase):
             validate_task_packet_derivation(contract, packet)
 
     def test_stale_review_is_rejected(self) -> None:
+        review = self._codex_review(self._contract())
         with self.assertRaisesRegex(GovernanceBlockerError, "REVIEW_STALE"):
-            validate_review_binding({"candidate_head": "a" * 40, "candidate_tree": "b" * 40}, "c" * 40, "d" * 40)
+            validate_review_binding({**review, "reviewed_head": "a" * 40, "reviewed_tree": "b" * 40}, "c" * 40, "d" * 40)
         with self.assertRaisesRegex(GovernanceBlockerError, "REVIEW_STALE"):
-            validate_review_binding({"candidate_head": "a" * 40, "candidate_tree": "b" * 40}, "a" * 40, "b" * 40, actual_candidate_head="c" * 40, actual_candidate_tree="d" * 40)
+            validate_review_binding({**review, "reviewed_head": "a" * 40, "reviewed_tree": "b" * 40}, "a" * 40, "b" * 40, actual_candidate_head="c" * 40, actual_candidate_tree="d" * 40)
 
     def _codex_review(self, contract: dict, disposition: str = "PASS") -> dict:
         axis_status = "PASS" if disposition == "PASS" else "NEEDS_FIX"
@@ -271,16 +272,18 @@ class TestHarn002Controller(unittest.TestCase):
             "non_blocking_findings": [],
         }
 
-    def test_codex_pass_review_is_accepted_and_needs_fix_is_blocked(self) -> None:
+    def test_identity_only_runner_and_review_evidence_are_rejected(self) -> None:
         contract = self._contract()
-        ingested = ingest_runner_result(contract, {
-            "run_id": contract["run_id"], "result": "ACCEPTANCE_READY", "candidate_head": "a" * 40,
-            "candidate_tree": "b" * 40, "dv_result": "PASS", "sos_result": "ACCEPT",
-        })
-        gate_b = prepare_gate_b(contract, ingested, self._codex_review(contract))
-        self.assertEqual(gate_b["decision"], "PENDING")
-        with self.assertRaisesRegex(GovernanceBlockerError, "NEEDS_FIX"):
-            prepare_gate_b(contract, ingested, self._codex_review(contract, "NEEDS_FIX"))
+        with self.assertRaises(ArtifactValidationError):
+            ingest_runner_result(contract, {
+                "run_id": contract["run_id"], "result": "ACCEPTANCE_READY", "candidate_head": "a" * 40,
+                "candidate_tree": "b" * 40, "dv_result": "PASS", "sos_result": "ACCEPT",
+            })
+        with self.assertRaises(ArtifactValidationError):
+            prepare_gate_b(contract, {
+                "result": "RESULT_INGESTED", "controller_phase": "ACCEPTANCE_READY",
+                "run_id": contract["run_id"], "candidate_head": "a" * 40, "candidate_tree": "b" * 40,
+            }, self._codex_review(contract))
 
     def test_gate_b_bypass_leaves_canonical_branch_unchanged(self) -> None:
         contract = self._contract()
@@ -295,17 +298,15 @@ class TestHarn002Controller(unittest.TestCase):
             integrate_after_gate_b(contract, gate_b, perform=True)
         self.assertEqual(self._git("rev-parse", "HEAD"), before)
 
-    def test_result_ingestion_and_gate_b_preparation_bind_exact_candidate(self) -> None:
+    def test_incomplete_result_cannot_prepare_gate_b(self) -> None:
         contract = self._contract()
         candidate_head, candidate_tree = "a" * 40, "b" * 40
-        result = ingest_runner_result(contract, {
-            "run_id": contract["run_id"], "result": "ACCEPTANCE_READY", "candidate_head": candidate_head,
-            "candidate_tree": candidate_tree, "dv_result": "PASS", "sos_result": "ACCEPT",
-            "evidence_paths": {"worktree": "/tmp/candidate", "report": "/tmp/report.json"},
-        })
-        gate_b = prepare_gate_b(contract, result, {"candidate_head": candidate_head, "candidate_tree": candidate_tree})
-        self.assertEqual(gate_b["decision"], "PENDING")
-        self.assertEqual(gate_b["candidate_head"], candidate_head)
+        with self.assertRaises(ArtifactValidationError):
+            ingest_runner_result(contract, {
+                "run_id": contract["run_id"], "result": "ACCEPTANCE_READY", "candidate_head": candidate_head,
+                "candidate_tree": candidate_tree, "dv_result": "PASS", "sos_result": "ACCEPT",
+                "evidence_paths": {"worktree": "/tmp/candidate", "report": "/tmp/report.json"},
+            })
 
     def test_state_git_drift_fails_closed(self) -> None:
         contract = self._contract()
@@ -332,19 +333,23 @@ class TestHarn002Controller(unittest.TestCase):
         derive_task_packet(contract, self._gate_a(contract), output_path=packet_path)
         fake_result = {"result": "ACCEPTANCE_READY", "run_id": contract["run_id"], "candidate_head": "a" * 40, "candidate_tree": "b" * 40}
         with patch("prj226_runner.controller.run_packet", return_value=fake_result) as runner:
-            result = Controller(self.manifest).dispatch(contract, self._gate_a(contract), packet_path)
-        self.assertEqual(result, fake_result)
+            with self.assertRaises(ArtifactValidationError):
+                Controller(self.manifest).dispatch(contract, self._gate_a(contract), packet_path)
         runner.assert_called_once_with(packet_path, None, authorize=True)
 
     def test_synthetic_end_to_end_reaches_acceptance_ready_through_harn001(self) -> None:
         provider = self.root / "provider.py"
         provider.write_text(
             "#!" + sys.executable + "\n"
-            "import json, pathlib\n"
-            "prompt = pathlib.Path('/dev/stdin') if False else ''\n"
-            "value = __import__('sys').argv[-1]\n"
-            "if 'Review SECURITY' in value:\n"
-            "  print(json.dumps({'recommendation': 'ACCEPT', 'findings': []}))\n"
+            "import json, pathlib, subprocess, sys\n"
+            "value = sys.argv[-1]\n"
+            "if 'provided closed schema' in value:\n"
+            "  output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+            "  head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+            "  tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()\n"
+            "  axis = {'status': 'PASS', 'findings': []}\n"
+            "  output.parent.mkdir(parents=True, exist_ok=True)\n"
+            "  output.write_text(json.dumps({'disposition': 'PASS', 'reviewed_head': head, 'reviewed_tree': tree, 'security': axis, 'operability': axis, 'semantics': axis, 'architecture': axis, 'blocking_findings': [], 'non_blocking_findings': []}), encoding='utf-8')\n"
             "elif 'Review this candidate' in value:\n"
             "  print(json.dumps({'result': 'PASS', 'findings': []}))\n"
             "else:\n"
@@ -361,7 +366,7 @@ class TestHarn002Controller(unittest.TestCase):
             "[runner]\n" + f"runtime_root = {json.dumps(str(runtime))}\n\n"
             "[agents.builder]\n" + f"tool = 'codex'\nexecutable = {executable}\nmodel = 'builder'\n" +
             "timeout_seconds = 20\n\n[agents.dv]\n" + f"tool = 'opencode2'\nexecutable = {executable}\nmodel = 'dv'\n" +
-            "timeout_seconds = 20\n\n[agents.sos_reviewer]\n" + f"tool = 'opencode2'\nexecutable = {executable}\nmodel = 'sos'\n" +
+            "timeout_seconds = 20\n\n[agents.sos_reviewer]\n" + f"tool = 'codex'\nexecutable = {executable}\nmodel = 'gpt-5.6-luna'\n" +
             "timeout_seconds = 20\n",
             encoding="utf-8",
         )
@@ -371,9 +376,7 @@ class TestHarn002Controller(unittest.TestCase):
         result = Controller(self.manifest).dispatch(contract, self._gate_a(contract), packet_path, config)
         self.assertEqual(result["result"], "ACCEPTANCE_READY", result)
         ingested = ingest_runner_result(contract, result)
-        gate_b = prepare_gate_b(contract, ingested, {
-            "candidate_head": result["candidate_head"], "candidate_tree": result["candidate_tree"],
-        })
+        gate_b = prepare_gate_b(contract, ingested, json.loads(Path(result["review_artifact"]).read_text(encoding="utf-8")))
         self.assertEqual(gate_b["decision"], "PENDING")
         self.assertEqual(self._git("rev-parse", "HEAD"), self.baseline_head)
 
@@ -418,10 +421,15 @@ class TestHarn002Controller(unittest.TestCase):
         provider = self.root / "provider-positive.py"
         provider.write_text(
             "#!" + sys.executable + "\n"
-            "import json, pathlib, sys\n"
+            "import json, pathlib, subprocess, sys\n"
             "value = sys.argv[-1]\n"
-            "if 'Review SECURITY' in value:\n"
-            "  print(json.dumps({'recommendation': 'ACCEPT', 'findings': []}))\n"
+            "if 'provided closed schema' in value:\n"
+            "  output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+            "  head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+            "  tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()\n"
+            "  axis = {'status': 'PASS', 'findings': []}\n"
+            "  output.parent.mkdir(parents=True, exist_ok=True)\n"
+            "  output.write_text(json.dumps({'disposition': 'PASS', 'reviewed_head': head, 'reviewed_tree': tree, 'security': axis, 'operability': axis, 'semantics': axis, 'architecture': axis, 'blocking_findings': [], 'non_blocking_findings': []}), encoding='utf-8')\n"
             "elif 'Review this candidate' in value:\n"
             "  print(json.dumps({'result': 'PASS', 'findings': []}))\n"
             "else:\n"
@@ -438,7 +446,7 @@ class TestHarn002Controller(unittest.TestCase):
             "[runner]\n" + f"runtime_root = {json.dumps(str(runtime))}\n\n"
             "[agents.builder]\n" + f"tool = 'codex'\nexecutable = {executable}\nmodel = 'builder'\n"
             "timeout_seconds = 20\n\n[agents.dv]\n" + f"tool = 'opencode2'\nexecutable = {executable}\nmodel = 'dv'\n"
-            "timeout_seconds = 20\n\n[agents.sos_reviewer]\n" + f"tool = 'opencode2'\nexecutable = {executable}\nmodel = 'sos'\n"
+            "timeout_seconds = 20\n\n[agents.sos_reviewer]\n" + f"tool = 'codex'\nexecutable = {executable}\nmodel = 'gpt-5.6-luna'\n"
             "timeout_seconds = 20\n",
             encoding="utf-8",
         )
@@ -455,7 +463,7 @@ class TestHarn002Controller(unittest.TestCase):
         gate_b = prepare_gate_b(
             contract,
             ingested,
-            {"candidate_head": result["candidate_head"], "candidate_tree": result["candidate_tree"]},
+            json.loads(Path(result["review_artifact"]).read_text(encoding="utf-8")),
         )
         self.assertEqual(gate_b["decision"], "PENDING")
         self.assertEqual(gate_b["candidate_head"], result["candidate_head"])

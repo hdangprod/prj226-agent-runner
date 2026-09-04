@@ -73,15 +73,16 @@ never accepted from a packet. Runtime evidence is immutable under the configured
 external `runtime_root`. The runner never retries, repairs, merges, rebases,
 cherry-picks, canonicalizes, or pushes a product repository.
 
-HARN-002 Repair-3 binds the independent Security / Operability / Semantics /
+HARN-002 Repair-4 binds the independent Security / Operability / Semantics /
 Architecture reviewer to Codex CLI / OpenAI / `gpt-5.6-luna`. Its lifecycle is
 deterministic local preflight → exactly one ordinary `codex exec` semantic
 review → deterministic local postflight. The invocation is ephemeral,
 read-only, isolated from user config and rules, and constrained by the closed
 [Codex reviewer result schema](schemas/codex-reviewer-result.schema.json).
-Provider failures stop without retry or fallback. Runner Git checks bind the
-verifier worktree before and after review; reviewer claims never authorize a
-candidate transition.
+Provider failures stop without retry or fallback. Runner Git checks and a
+path-sorted filesystem fingerprint bind the verifier worktree before and after
+review, including ignored files, empty directories, symlinks, and modes.
+Reviewer claims never authorize a candidate transition.
 
 ## HARN-002 single-project controller
 
@@ -89,7 +90,10 @@ HARN-002 adds a manifest-driven, read-only project inspection and next-work
 discovery layer above Runner V1. It drafts a closed Design Contract, waits for
 exact Human Gate A binding, derives the existing HARN-001 Task Packet, ingests
 exact candidate/reviewer evidence, and stops at Human Gate B before canonical
-integration. See [AI Agent Harness Vision and Operating Model V2](AI_AGENT_HARNESS_VISION_AND_OPERATING_MODEL_V2.md)
+integration. `ACCEPTANCE_READY` is accepted only with complete deterministic
+Runner evidence, an exact candidate, a complete validated closed review
+artifact, and matching pre/post worktree fingerprints. See [AI Agent Harness
+Vision and Operating Model V2](AI_AGENT_HARNESS_VISION_AND_OPERATING_MODEL_V2.md)
 and the contracts in `schemas/project-manifest.schema.json`,
 `schemas/design-contract.schema.json`, `schemas/controller-state.schema.json`,
 and `schemas/controller-result.schema.json`.

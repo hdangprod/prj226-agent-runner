@@ -1,4 +1,4 @@
-"""The explicit Codex CLI independent reviewer adapter for HARN-002 Repair-3.
+"""The explicit Codex CLI independent reviewer adapter for HARN-002 Repair-4.
 
 This module owns one provider binding only.  It deliberately has no fallback,
 retry, repair, merge, push, or provider-selection behavior.
@@ -7,8 +7,10 @@ retry, repair, merge, push, or provider-selection behavior.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -41,6 +43,103 @@ REVIEW_KEYS = {
 }
 REVIEW_AXIS_KEYS = {"status", "findings"}
 REVIEW_STATUSES = {"PASS", "NEEDS_FIX"}
+
+
+def _git_admin_paths(workspace: Path) -> set[str]:
+    """Return only the worktree-local Git admin entry that must be ignored.
+
+    A linked worktree has a ``.git`` *file*, while a primary worktree normally
+    has a ``.git`` directory.  The common Git directory is outside the
+    worktree and therefore cannot appear in this fingerprint.  We deliberately
+    do not ignore arbitrary dot files, ignored paths, or directories.
+    """
+    admin: set[str] = set()
+    git_entry = workspace / ".git"
+    if git_entry.is_symlink() or git_entry.exists():
+        admin.add(".git")
+    return admin
+
+
+def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, Any]]:
+    """Build a deterministic, non-following filesystem manifest.
+
+    The manifest intentionally describes directory entries as well as files.
+    That makes empty-directory creation/deletion observable.  ``lstat`` and
+    ``readlink`` ensure that symlink targets are recorded without traversing
+    them.  Git's local administrative entry is the sole excluded path.
+    """
+    root = Path(worktree).resolve()
+    if not root.is_dir():
+        raise RunnerEnvironmentError(f"Reviewer worktree is not a directory: {root}")
+    admin = _git_admin_paths(root)
+    manifest: list[dict[str, Any]] = []
+
+    def visit(directory: Path, relative_directory: str = "") -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as exc:
+            raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree: {directory}") from exc
+        for entry in entries:
+            relative = f"{relative_directory}/{entry.name}" if relative_directory else entry.name
+            if relative in admin or relative.startswith(".git/"):
+                continue
+            path = directory / entry.name
+            try:
+                info = os.lstat(path)
+            except OSError as exc:
+                raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree path: {relative}") from exc
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISREG(info.st_mode):
+                digest = hashlib.sha256()
+                try:
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                except OSError as exc:
+                    raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree file: {relative}") from exc
+                manifest.append({"path": relative, "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+            elif stat.S_ISLNK(info.st_mode):
+                try:
+                    target = os.readlink(path)
+                except OSError as exc:
+                    raise RunnerEnvironmentError(f"Unable to read reviewer worktree symlink: {relative}") from exc
+                manifest.append({"path": relative, "type": "symlink", "mode": mode, "target": target})
+            elif stat.S_ISDIR(info.st_mode):
+                manifest.append({"path": relative, "type": "directory", "mode": mode})
+                visit(path, relative)
+            else:
+                # Special nodes are semantic filesystem state too.  No content
+                # is read from them, but type and mode remain fingerprinted.
+                node_type = "fifo" if stat.S_ISFIFO(info.st_mode) else (
+                    "socket" if stat.S_ISSOCK(info.st_mode) else (
+                        "block" if stat.S_ISBLK(info.st_mode) else (
+                            "char" if stat.S_ISCHR(info.st_mode) else "special"
+                        )
+                    )
+                )
+                manifest.append({"path": relative, "type": node_type, "mode": mode})
+
+    visit(root)
+    return sorted(manifest, key=lambda item: (str(item["path"]), str(item["type"])))
+
+
+def fingerprint_worktree(worktree: Path | str) -> str:
+    """Return the SHA-256 identity of the normalized worktree manifest."""
+    manifest = build_worktree_fingerprint_manifest(worktree)
+    return fingerprint_manifest(manifest)
+
+
+def fingerprint_manifest(manifest: list[dict[str, Any]]) -> str:
+    """Hash a normalized manifest using the same definition as the live oracle."""
+    ordered = sorted(manifest, key=lambda item: (str(item.get("path", "")), str(item.get("type", ""))))
+    normalized = json.dumps(ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+# Descriptive aliases make the oracle convenient for callers and tests while
+# retaining one implementation and one digest definition.
+worktree_fingerprint = fingerprint_worktree
+compute_worktree_fingerprint = fingerprint_worktree
 
 
 def _schema_path() -> Path:
@@ -181,6 +280,13 @@ def build_codex_reviewer_invocation(
     result = Path(output_path).resolve() if output_path is not None else None
     if result is None:
         raise ArtifactValidationError("Codex reviewer requires an explicit final output path")
+    workspace_path = Path(workspace).resolve()
+    try:
+        result.relative_to(workspace_path)
+    except ValueError:
+        pass
+    else:
+        raise ArtifactValidationError("Codex reviewer output must be outside the verifier worktree")
     if not schema.is_file():
         raise RunnerEnvironmentError(f"Codex reviewer output schema is missing: {schema}")
     _validate_schema_file(schema)
@@ -193,7 +299,7 @@ def build_codex_reviewer_invocation(
         "--ignore-rules",
         "--ephemeral",
         "-C",
-        str(Path(workspace).resolve()),
+        str(workspace_path),
         "--sandbox",
         "read-only",
         "--model",
@@ -283,7 +389,14 @@ def _git(repo: Path, args: list[str]) -> str:
     return result.stdout.strip()
 
 
-def _assert_candidate(repo: Path, expected_head: str, expected_tree: str, candidate_ref: str | None = None) -> None:
+def _assert_candidate(
+    repo: Path,
+    expected_head: str,
+    expected_tree: str,
+    candidate_ref: str | None = None,
+    *,
+    expected_fingerprint: str | None = None,
+) -> str:
     actual_head = _git(repo, ["rev-parse", "HEAD"]).lower()
     actual_tree = _git(repo, ["rev-parse", "HEAD^{tree}"]).lower()
     if actual_head != expected_head:
@@ -292,10 +405,14 @@ def _assert_candidate(repo: Path, expected_head: str, expected_tree: str, candid
         raise ReviewStaleError("REVIEW_STALE: candidate TREE changed during reviewer execution")
     if _git(repo, ["status", "--porcelain"]):
         raise ReviewStaleError("REVIEW_STALE: reviewer worktree is not clean")
+    actual_fingerprint = fingerprint_worktree(repo)
+    if expected_fingerprint is not None and actual_fingerprint != expected_fingerprint:
+        raise ReviewStaleError("REVIEW_STALE: reviewer worktree filesystem fingerprint changed during reviewer execution")
     if candidate_ref is not None:
         ref_head = _git(repo, ["rev-parse", candidate_ref]).lower()
         if ref_head != expected_head:
             raise ReviewStaleError("REVIEW_STALE: candidate reference changed during reviewer execution")
+    return actual_fingerprint
 
 
 def _run_once(argv: list[str], workspace: Path, evidence_dir: Path, timeout_seconds: int, env: dict[str, str]) -> None:
@@ -379,8 +496,23 @@ def run_codex_review(
     expected_tree = _object_id(candidate_tree, "candidate_tree")
     candidate_workspace = Path(workspace).resolve()
     evidence = Path(evidence_dir).resolve()
+    try:
+        evidence.relative_to(candidate_workspace)
+    except ValueError:
+        pass
+    else:
+        raise GovernanceBlockerError("Review artifacts must be outside the verifier worktree")
     binding = check_codex_reviewer_binding(executable, model=CODEX_REVIEWER_MODEL, output_schema=output_schema)
-    _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
+    pre_fingerprint = _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
+    evidence.mkdir(parents=True, exist_ok=True)
+    fingerprint_manifest = build_worktree_fingerprint_manifest(candidate_workspace)
+    try:
+        (evidence / "fingerprint-pre.json").write_text(
+            json.dumps({"fingerprint": pre_fingerprint, "manifest": fingerprint_manifest}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Unable to persist pre-review worktree fingerprint: {exc}") from exc
     output_path = evidence / "raw-result.json"
     argv = build_codex_reviewer_invocation(
         binding["executable"],
@@ -394,6 +526,20 @@ def run_codex_review(
         _run_once(argv, candidate_workspace, evidence, timeout_seconds, env)
     finally:
         shutil.rmtree(env["CODEX_HOME"], ignore_errors=True)
+    # Capture and persist the post-review filesystem identity before the Git
+    # cleanliness assertion can short-circuit on an ignored-only mutation.
+    post_manifest = build_worktree_fingerprint_manifest(candidate_workspace)
+    normalized_post_manifest = json.dumps(post_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    post_fingerprint = hashlib.sha256(normalized_post_manifest.encode("utf-8")).hexdigest()
+    try:
+        (evidence / "fingerprint-post.json").write_text(
+            json.dumps({"fingerprint": post_fingerprint, "manifest": post_manifest}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Unable to persist post-review worktree fingerprint: {exc}") from exc
+    if post_fingerprint != pre_fingerprint:
+        raise ReviewStaleError("REVIEW_STALE: reviewer worktree filesystem fingerprint changed during reviewer execution")
     _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
     result = parse_codex_reviewer_result(output_path, expected_head=expected_head, expected_tree=expected_tree)
     normalized_path = evidence / "review.json"
@@ -406,6 +552,9 @@ def run_codex_review(
         "artifact": str(normalized_path),
         "raw_artifact": str(output_path),
         "invocation": str(evidence / "invocation.json"),
+        "fingerprint": pre_fingerprint,
+        "fingerprint_pre_artifact": str(evidence / "fingerprint-pre.json"),
+        "fingerprint_post_artifact": str(evidence / "fingerprint-post.json"),
     }
 
 

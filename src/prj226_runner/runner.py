@@ -7,6 +7,7 @@ Git/state-machine logic.  It contains no retry, repair, merge, or push path.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -25,6 +26,7 @@ from prj226_runner.calibration import (
 )
 from prj226_runner.codex_reviewer import (
     build_codex_reviewer_invocation,
+    fingerprint_worktree,
     check_codex_reviewer_binding,
     run_codex_review,
 )
@@ -355,6 +357,7 @@ def _verify_candidate_identity(
     tree: str,
     expected_paths: Iterable[str],
     candidate_ref: str | None = None,
+    expected_fingerprint: str | None = None,
 ) -> None:
     if _git(repo, ["rev-parse", "HEAD"]).lower() != candidate:
         raise GovernanceBlockerError("Candidate HEAD changed after freeze")
@@ -364,6 +367,8 @@ def _verify_candidate_identity(
         raise GovernanceBlockerError("Candidate reference changed after freeze")
     if _git(repo, ["status", "--porcelain"]):
         raise GovernanceBlockerError("Candidate worktree is not clean")
+    if expected_fingerprint is not None and fingerprint_worktree(repo) != expected_fingerprint:
+        raise GovernanceBlockerError("Candidate worktree filesystem fingerprint changed")
     parents = _git(repo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split()
     if len(parents) != 2 or parents[1].lower() != baseline:
         raise GovernanceBlockerError("Candidate topology no longer has the baseline as its sole parent")
@@ -435,19 +440,27 @@ def _parse_reviewer_result(path: Path, kind: str) -> tuple[str, list[Any]]:
     return verdict, findings
 
 
-def _run_tests(repo: Path, packet: TaskPacket, evidence: _RunEvidence, candidate: str, tree: str, changes: list[str]) -> list[dict[str, Any]]:
+def _run_tests(
+    repo: Path,
+    packet: TaskPacket,
+    evidence: _RunEvidence,
+    candidate: str,
+    tree: str,
+    changes: list[str],
+    expected_fingerprint: str,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, argv in enumerate(packet.test_commands, start=1):
         result = _run_process(argv, repo, evidence.paths["deterministic"] / f"test-{index}", 300)
         results.append(result)
         if result["exit_code"] != 0:
             raise ImplementationFailureError(f"Deterministic test {index} failed")
-        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes)
+        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
     check = subprocess.run(["git", "-C", str(repo), "diff", "--check", f"{packet.baseline_head}..{candidate}"],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, shell=False, check=False)
     if check.returncode != 0:
         raise ImplementationFailureError("Frozen candidate fails git diff --check")
-    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes)
+    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
     return results
 
 
@@ -532,16 +545,26 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
         if unauthorized:
             raise GovernanceBlockerError(f"Builder changed unauthorized paths: {unauthorized}")
         candidate, tree = _freeze_candidate(paths["worktree"], packet, changes)
-        summary.update({"candidate_head": candidate, "candidate_tree": tree, "changed_paths": changes})
+        candidate_fingerprint = fingerprint_worktree(paths["worktree"])
+        summary.update({
+            "candidate_head": candidate,
+            "candidate_tree": tree,
+            "candidate_ref": branch,
+            "candidate_worktree_fingerprint": candidate_fingerprint,
+            "changed_paths": changes,
+        })
         evidence.transition(RunState.CANDIDATE_FROZEN, "candidate_frozen", {"head": candidate, "tree": tree, "changed_paths": changes})
         evidence.transition(RunState.DETERMINISTIC_GATES, "deterministic_gates_started")
-        tests = _run_tests(paths["worktree"], packet, evidence, candidate, tree, changes)
+        tests = _run_tests(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint)
         context = _review_context(packet, candidate, tree, changes, tests)
         evidence.transition(RunState.DV_RUNNING, "dv_started")
         dv_prompt = "Review this candidate read-only. Return only JSON: {\"result\":\"PASS|FAIL\",\"findings\":[]}.\n" + context
         _run_process(build_reviewer_invocation(config.agents["dv"], dv_prompt), paths["worktree"], paths["dv"],
                      config.agents["dv"].timeout_seconds, _fresh_reviewer_env(paths["dv"]))
-        _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes)
+        _verify_candidate_identity(
+            paths["worktree"], packet.baseline_head, candidate, tree, changes,
+            expected_fingerprint=candidate_fingerprint,
+        )
         dv_result, dv_findings = _parse_reviewer_result(paths["dv"] / "stdout.log", "dv")
         _write_json(paths["dv"] / "result.json", {"result": dv_result, "findings": dv_findings})
         if dv_result != "PASS":
@@ -562,7 +585,10 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
             )
             review_value = codex_review["result"]
             _write_json(paths["sos"] / "result.json", review_value)
-            _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes, branch)
+            _verify_candidate_identity(
+                paths["worktree"], packet.baseline_head, candidate, tree, changes, branch,
+                expected_fingerprint=candidate_fingerprint,
+            )
             _verify_candidate_identity(review_workspace, packet.baseline_head, candidate, tree, changes, branch)
             sos_result = "ACCEPT" if review_value["disposition"] == "PASS" else "REJECT"
             sos_findings = review_value["blocking_findings"] + review_value["non_blocking_findings"]
@@ -570,22 +596,57 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
                 "review_disposition": review_value["disposition"],
                 "review_artifact": codex_review["artifact"],
                 "review_raw_artifact": codex_review["raw_artifact"],
+                "review_worktree_fingerprint": codex_review["fingerprint"],
+                "review_fingerprint_pre_artifact": codex_review["fingerprint_pre_artifact"],
+                "review_fingerprint_post_artifact": codex_review["fingerprint_post_artifact"],
             })
         else:
             context = _review_context(packet, candidate, tree, changes, tests)
             sos_prompt = "Review SECURITY, OPERABILITY, and SEMANTICS read-only. Return only JSON: {\"recommendation\":\"ACCEPT|REJECT\",\"findings\":[]}.\n" + context
             _run_process(build_reviewer_invocation(sos_role, sos_prompt), paths["worktree"], paths["sos"],
                          sos_role.timeout_seconds, _fresh_reviewer_env(paths["sos"]))
-            _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes)
+            _verify_candidate_identity(
+                paths["worktree"], packet.baseline_head, candidate, tree, changes,
+                expected_fingerprint=candidate_fingerprint,
+            )
             sos_result, sos_findings = _parse_reviewer_result(paths["sos"] / "stdout.log", "sos")
             _write_json(paths["sos"] / "result.json", {"recommendation": sos_result, "findings": sos_findings})
         if sos_result != "ACCEPT":
             raise ImplementationFailureError("S/O/S reviewer returned REJECT")
         _canonical_baseline(packet)
         evidence.transition(RunState.ACCEPTANCE_READY, "acceptance_ready")
-        summary.update({"result": "ACCEPTANCE_READY", "candidate_head": candidate, "candidate_tree": tree,
-                        "changed_paths": changes, "tests": tests, "dv_result": dv_result, "sos_result": sos_result,
-                        "evidence_paths": {key: str(value) for key, value in paths.items() if key != "root"}})
+        evidence_paths = {key: str(value) for key, value in paths.items() if key != "root"}
+        summary.update({
+            "result": "ACCEPTANCE_READY",
+            "deterministic_result": "ACCEPTANCE_READY",
+            "verification_disposition": "PASS",
+            "candidate_head": candidate,
+            "candidate_tree": tree,
+            "candidate_ref": branch,
+            "candidate_worktree_fingerprint": candidate_fingerprint,
+            "changed_paths": changes,
+            "tests": tests,
+            "dv_result": dv_result,
+            "sos_result": sos_result,
+            "reviewer_disposition": {
+                "dv_result": dv_result,
+                "sos_result": sos_result,
+                **({"review_disposition": summary["review_disposition"]} if "review_disposition" in summary else {}),
+            },
+            "evidence_paths": evidence_paths,
+        })
+        required_references = set(evidence_paths.values())
+        for key in ("review_artifact", "review_raw_artifact", "review_fingerprint_pre_artifact", "review_fingerprint_post_artifact"):
+            if key in summary:
+                required_references.add(str(summary[key]))
+        summary["required_evidence_references"] = sorted(required_references)
+        if "review_artifact" in summary:
+            try:
+                summary["review_artifact_sha256"] = hashlib.sha256(
+                    Path(summary["review_artifact"]).read_bytes()
+                ).hexdigest()
+            except OSError as exc:
+                raise RunnerEnvironmentError(f"Unable to hash Codex review evidence: {exc}") from exc
         _write_json(paths["root"] / "report.json", summary)
         return summary
     except RunnerError as exc:

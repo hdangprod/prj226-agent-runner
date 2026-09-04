@@ -1,4 +1,4 @@
-"""Deterministic HARN-002 Repair-3 one-shot Codex reviewer controls."""
+"""Deterministic HARN-002 Repair-4 one-shot Codex reviewer controls."""
 
 from __future__ import annotations
 
@@ -36,8 +36,11 @@ class TestCodexReviewerAdapter(unittest.TestCase):
         self._git(self.repo, "config", "user.email", "runner@example.test")
         self._git(self.repo, "config", "user.name", "Runner Test")
         (self.repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
-        self._git(self.repo, "add", "candidate.txt")
+        (self.repo / ".gitignore").write_text("*.ignored\nignored-existing.txt\nignored-empty-dir/\nreview-link\n", encoding="utf-8")
+        self._git(self.repo, "add", "candidate.txt", ".gitignore")
         self._git(self.repo, "commit", "-m", "candidate")
+        (self.repo / "ignored-existing.txt").write_text("ignored baseline\n", encoding="utf-8")
+        (self.repo / "review-link").symlink_to("target-a")
         self.head = self._git(self.repo, "rev-parse", "HEAD")
         self.tree = self._git(self.repo, "rev-parse", "HEAD^{tree}")
         self.branch = self._git(self.repo, "branch", "--show-current")
@@ -54,6 +57,14 @@ class TestCodexReviewerAdapter(unittest.TestCase):
             "if 'TIMEOUT' in prompt: time.sleep(5)\n"
             "if 'PROCESS_FAILURE' in prompt and 'WITH_OUTPUT' not in prompt: raise SystemExit(9)\n"
             "if 'MUTATE_WORKTREE' in prompt: pathlib.Path('reviewer-mutated.txt').write_text('bad')\n"
+            "if 'MUTATE_TRACKED' in prompt: pathlib.Path('candidate.txt').write_text('tracked mutation\\n')\n"
+            "if 'CREATE_UNTRACKED' in prompt: pathlib.Path('untracked.txt').write_text('untracked mutation\\n')\n"
+            "if 'CREATE_IGNORED' in prompt: pathlib.Path('new.ignored').write_text('ignored mutation\\n')\n"
+            "if 'MODIFY_IGNORED' in prompt: pathlib.Path('ignored-existing.txt').write_text('ignored changed\\n')\n"
+            "if 'DELETE_IGNORED' in prompt: pathlib.Path('ignored-existing.txt').unlink()\n"
+            "if 'CREATE_IGNORED_EMPTY_DIR' in prompt: pathlib.Path('ignored-empty-dir').mkdir()\n"
+            "if 'CHANGE_SYMLINK' in prompt: pathlib.Path('review-link').unlink(); pathlib.Path('review-link').symlink_to('target-b')\n"
+            "if 'CHANGE_MODE' in prompt: pathlib.Path('candidate.txt').chmod(0o600)\n"
             "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
             "tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()\n"
             "if 'MISMATCH_HEAD' in prompt: head = '1' * 40\n"
@@ -164,6 +175,49 @@ class TestCodexReviewerAdapter(unittest.TestCase):
         with self.assertRaisesRegex(ReviewStaleError, "REVIEW_STALE"):
             self._review("MUTATE_WORKTREE")
         self.assertEqual(self._call_count(), 1)
+
+    def test_SEC_A_tracked_file_changed_during_review_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("MUTATE_TRACKED")
+
+    def test_SEC_B_ordinary_untracked_file_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("CREATE_UNTRACKED")
+
+    def test_SEC_C_new_ignored_file_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("CREATE_IGNORED")
+
+    def test_SEC_D_existing_ignored_file_modified_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("MODIFY_IGNORED")
+
+    def test_SEC_E_ignored_file_deleted_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("DELETE_IGNORED")
+
+    def test_SEC_F_ignored_empty_directory_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("CREATE_IGNORED_EMPTY_DIR")
+
+    def test_SEC_G_symlink_target_changed_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("CHANGE_SYMLINK")
+
+    def test_SEC_H_file_mode_changed_invalidates(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("CHANGE_MODE")
+
+    def test_SEC_I_no_filesystem_mutation_has_equal_fingerprint(self) -> None:
+        result = self._review("SEC_I_CLEAN")
+        pre = json.loads((self.root / "evidence" / "SEC_I_CLEAN" / "fingerprint-pre.json").read_text(encoding="utf-8"))
+        post = json.loads((self.root / "evidence" / "SEC_I_CLEAN" / "fingerprint-post.json").read_text(encoding="utf-8"))
+        self.assertEqual(pre, post)
+        self.assertEqual(result["fingerprint"], pre["fingerprint"])
+
+    def test_SEC_J_pass_review_with_mutation_is_not_pass(self) -> None:
+        with self.assertRaises(ReviewStaleError):
+            self._review("MUTATE_WORKTREE")
 
     def test_local_binding_checks_do_not_invoke_configured_executable(self) -> None:
         binding = check_codex_reviewer_binding(str(self.fake), output_schema=self.schema)
