@@ -1219,12 +1219,15 @@ def _validate_controller_result(data: Mapping[str, Any]) -> dict[str, Any]:
     for field, relative in RUNNER_ARTIFACT_RELATIVE_PATHS.items():
         if value[field] != relative:
             raise ArtifactValidationError(f"Accepted controller result {field} is not root-relative")
+    for field, relative in (("worktree", RUNNER_EVIDENCE_RELATIVE_PATHS["worktree"]), ("review_worktree", RUNNER_EVIDENCE_RELATIVE_PATHS["review_worktree"])):
+        if paths[field] != relative:
+            _lexical_absolute_path(paths[field], f"evidence_paths.{field}")
     for field in ("candidate_worktree_fingerprint", "review_worktree_fingerprint", "review_artifact_sha256"):
         if not isinstance(value[field], str) or not SHA256_RE.fullmatch(value[field]):
             raise ArtifactValidationError(f"Accepted controller result {field} is invalid")
     refs = value.get("required_evidence_references")
     evidence_refs = value.get("evidence_references")
-    if not isinstance(refs, list) or not isinstance(evidence_refs, list) or refs != evidence_refs or refs != sorted(refs) or len(refs) != len(set(refs)):
+    if not isinstance(refs, list) or not refs or not isinstance(evidence_refs, list) or not evidence_refs or refs != evidence_refs or refs != sorted(refs) or len(refs) != len(set(refs)):
         raise ArtifactValidationError("Accepted controller result evidence references are not deterministic")
     if not all(isinstance(item, str) and item.strip() for item in refs):
         raise ArtifactValidationError("Accepted controller result evidence references are invalid")
