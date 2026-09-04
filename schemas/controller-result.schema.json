@@ -12,7 +12,7 @@
     "candidate_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
     "candidate_tree": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
     "deterministic_result": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
-    "reviewer_disposition": {"type": "object", "additionalProperties": false, "properties": {"dv_result": {"type": "string"}, "sos_result": {"type": "string"}}},
+    "reviewer_disposition": {"type": "object", "additionalProperties": false, "properties": {"dv_result": {"type": "string"}, "sos_result": {"type": "string"}, "review_disposition": {"type": "string", "enum": ["PASS", "NEEDS_FIX"]}}},
     "evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "error_class": {"type": ["string", "null"], "enum": ["ENVIRONMENT_ERROR", "AGENT_EXECUTION_ERROR", "ARTIFACT_VALIDATION_ERROR", "IMPLEMENTATION_FAILURE", "GOVERNANCE_BLOCKER", null]}
   }

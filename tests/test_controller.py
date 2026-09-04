@@ -256,6 +256,32 @@ class TestHarn002Controller(unittest.TestCase):
         with self.assertRaisesRegex(GovernanceBlockerError, "REVIEW_STALE"):
             validate_review_binding({"candidate_head": "a" * 40, "candidate_tree": "b" * 40}, "a" * 40, "b" * 40, actual_candidate_head="c" * 40, actual_candidate_tree="d" * 40)
 
+    def _codex_review(self, contract: dict, disposition: str = "PASS") -> dict:
+        axis_status = "PASS" if disposition == "PASS" else "NEEDS_FIX"
+        findings = [] if disposition == "PASS" else ["blocking finding"]
+        return {
+            "disposition": disposition,
+            "reviewed_head": "a" * 40,
+            "reviewed_tree": "b" * 40,
+            "security": {"status": axis_status, "findings": findings},
+            "operability": {"status": axis_status, "findings": findings},
+            "semantics": {"status": axis_status, "findings": findings},
+            "architecture": {"status": axis_status, "findings": findings},
+            "blocking_findings": findings,
+            "non_blocking_findings": [],
+        }
+
+    def test_codex_pass_review_is_accepted_and_needs_fix_is_blocked(self) -> None:
+        contract = self._contract()
+        ingested = ingest_runner_result(contract, {
+            "run_id": contract["run_id"], "result": "ACCEPTANCE_READY", "candidate_head": "a" * 40,
+            "candidate_tree": "b" * 40, "dv_result": "PASS", "sos_result": "ACCEPT",
+        })
+        gate_b = prepare_gate_b(contract, ingested, self._codex_review(contract))
+        self.assertEqual(gate_b["decision"], "PENDING")
+        with self.assertRaisesRegex(GovernanceBlockerError, "NEEDS_FIX"):
+            prepare_gate_b(contract, ingested, self._codex_review(contract, "NEEDS_FIX"))
+
     def test_gate_b_bypass_leaves_canonical_branch_unchanged(self) -> None:
         contract = self._contract()
         gate_b = {

@@ -22,6 +22,7 @@ from prj226_runner.errors import (
     GovernanceBlockerError,
     RunnerEnvironmentError,
 )
+from prj226_runner.codex_reviewer import validate_codex_review
 from prj226_runner.models import ControllerPhase, ErrorClass, WorkShape
 from prj226_runner.runner import TaskPacket, candidate_branch_name, parse_task_packet, run_packet
 
@@ -759,7 +760,7 @@ def ingest_runner_result(contract: Mapping[str, Any] | Path | str, result: Mappi
         "candidate_head": candidate_head,
         "candidate_tree": candidate_tree,
         "deterministic_result": outcome,
-        "reviewer_disposition": {key: data[key] for key in ("dv_result", "sos_result") if key in data},
+        "reviewer_disposition": {key: data[key] for key in ("dv_result", "sos_result", "review_disposition") if key in data},
         "evidence_references": sorted(str(item) for item in data.get("evidence_paths", {}).values()) if isinstance(data.get("evidence_paths", {}), dict) else [],
         "error_class": error_class,
     }
@@ -775,8 +776,8 @@ def validate_review_binding(
 ) -> None:
     if not isinstance(review, dict):
         raise ArtifactValidationError("Review evidence must be a JSON object")
-    review_head = review.get("candidate_head", review.get("candidate_sha"))
-    review_tree = review.get("candidate_tree")
+    review_head = review.get("candidate_head", review.get("candidate_sha", review.get("reviewed_head")))
+    review_tree = review.get("candidate_tree", review.get("reviewed_tree"))
     expected_head = _validate_object_id(candidate_head, "candidate_head")
     expected_tree = _validate_object_id(candidate_tree, "candidate_tree")
     if not isinstance(review_head, str) or not isinstance(review_tree, str) or review_head.lower() != expected_head or review_tree.lower() != expected_tree:
@@ -798,6 +799,10 @@ def prepare_gate_b(
     candidate_head = _validate_object_id(ingested_result.get("candidate_head"), "candidate_head")
     candidate_tree = _validate_object_id(ingested_result.get("candidate_tree"), "candidate_tree")
     validate_review_binding(review, candidate_head, candidate_tree)
+    if "disposition" in review:
+        normalized_review = validate_codex_review(review, expected_head=candidate_head, expected_tree=candidate_tree)
+        if normalized_review["disposition"] != "PASS":
+            raise GovernanceBlockerError("Gate B cannot be prepared from a NEEDS_FIX independent review")
     disposition = ingested_result.get("reviewer_disposition", {})
     if disposition.get("dv_result") != "PASS" or disposition.get("sos_result") != "ACCEPT":
         raise GovernanceBlockerError("Gate B cannot be prepared from a rejected reviewer disposition")

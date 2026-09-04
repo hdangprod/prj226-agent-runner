@@ -22,6 +22,10 @@ class RunnerEnvironmentError(RunnerError):
     error_class = ErrorClass.ENVIRONMENT_ERROR
 
 
+class ReviewerProviderUnavailableError(RunnerEnvironmentError):
+    """Raised when the explicitly bound Codex provider cannot start or respond."""
+
+
 class AgentExecutionError(RunnerError):
     """Raised when an external agent invocation crashes or times out."""
 
@@ -44,3 +48,7 @@ class GovernanceBlockerError(RunnerError):
     """Raised when a governance invariant, human gate, or permission boundary is breached."""
 
     error_class = ErrorClass.GOVERNANCE_BLOCKER
+
+
+class ReviewStaleError(GovernanceBlockerError):
+    """Raised when review evidence or candidate Git truth is no longer exact."""
