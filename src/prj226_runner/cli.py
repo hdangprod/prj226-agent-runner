@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             result = prepare_gate_b(
                 contract,
                 ingest_runner_result(contract, args.result_artifact),
-                _json_artifact(args.review),
+                args.review,
             )
         else:
             result = resume_controller(args.manifest, args.state)

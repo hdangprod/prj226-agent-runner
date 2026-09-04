@@ -7,7 +7,6 @@ Git/state-machine logic.  It contains no retry, repair, merge, or push path.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import re
 import subprocess
@@ -595,6 +594,7 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
             summary.update({
                 "review_disposition": review_value["disposition"],
                 "review_artifact": codex_review["artifact"],
+                "review_artifact_sha256": codex_review["artifact_sha256"],
                 "review_raw_artifact": codex_review["raw_artifact"],
                 "review_worktree_fingerprint": codex_review["fingerprint"],
                 "review_fingerprint_pre_artifact": codex_review["fingerprint_pre_artifact"],
@@ -641,12 +641,8 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
                 required_references.add(str(summary[key]))
         summary["required_evidence_references"] = sorted(required_references)
         if "review_artifact" in summary:
-            try:
-                summary["review_artifact_sha256"] = hashlib.sha256(
-                    Path(summary["review_artifact"]).read_bytes()
-                ).hexdigest()
-            except OSError as exc:
-                raise RunnerEnvironmentError(f"Unable to hash Codex review evidence: {exc}") from exc
+            if not isinstance(summary.get("review_artifact_sha256"), str):
+                raise ArtifactValidationError("Codex review evidence is missing its same-snapshot SHA-256")
         _write_json(paths["root"] / "report.json", summary)
         return summary
     except RunnerError as exc:

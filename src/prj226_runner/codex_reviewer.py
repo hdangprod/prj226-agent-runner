@@ -1,4 +1,4 @@
-"""The explicit Codex CLI independent reviewer adapter for HARN-002 Repair-4.
+"""The explicit Codex CLI independent reviewer adapter for HARN-002 Repair-4/5.
 
 This module owns one provider binding only.  It deliberately has no fallback,
 retry, repair, merge, push, or provider-selection behavior.
@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,6 +23,7 @@ from prj226_runner.errors import (
     ArtifactValidationError,
     ReviewStaleError,
     RunnerEnvironmentError,
+    WorktreeIntegrityError,
 )
 from prj226_runner.paths import get_runner_root
 
@@ -43,6 +45,120 @@ REVIEW_KEYS = {
 }
 REVIEW_AXIS_KEYS = {"status", "findings"}
 REVIEW_STATUSES = {"PASS", "NEEDS_FIX"}
+MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    """The bytes, digest, and semantic value from one opened artifact."""
+
+    raw_bytes: bytes
+    sha256: str
+    value: Any = None
+
+    @property
+    def bytes(self) -> bytes:
+        """Compatibility spelling for callers that need the exact byte snapshot."""
+        return self.raw_bytes
+
+
+def _read_open_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    failure_type: type[Exception],
+    max_bytes: int | None = None,
+    expected_path_identity: os.stat_result | None = None,
+) -> bytes:
+    """Read one regular file descriptor and reject observable read races."""
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    # Prevent a replacement FIFO/device from blocking before fstat can fail it.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(os.fspath(path), flags)
+    except OSError as exc:
+        raise failure_type(f"{label} cannot be opened as a regular file: {path}") from exc
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError as exc:
+            raise failure_type(f"{label} metadata cannot be captured: {path}") from exc
+        if not stat.S_ISREG(before.st_mode):
+            raise failure_type(f"{label} must reference a regular file: {path}")
+        if expected_path_identity is not None and (
+            before.st_dev != expected_path_identity.st_dev
+            or before.st_ino != expected_path_identity.st_ino
+            or stat.S_IFMT(before.st_mode) != stat.S_IFMT(expected_path_identity.st_mode)
+        ):
+            raise failure_type(f"{label} pathname identity changed before snapshot: {path}")
+        if max_bytes is not None and before.st_size > max_bytes:
+            raise failure_type(f"{label} exceeds the bounded snapshot size: {path}")
+
+        data = bytearray()
+        while True:
+            try:
+                chunk = os.read(descriptor, 1024 * 1024)
+            except OSError as exc:
+                raise failure_type(f"{label} cannot be read: {path}") from exc
+            if not chunk:
+                break
+            data.extend(chunk)
+            if max_bytes is not None and len(data) > max_bytes:
+                raise failure_type(f"{label} exceeds the bounded snapshot size: {path}")
+
+        try:
+            after = os.fstat(descriptor)
+        except OSError as exc:
+            raise failure_type(f"{label} metadata cannot be captured after read: {path}") from exc
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            stat.S_IFMT(before.st_mode),
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            stat.S_IMODE(before.st_mode),
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            stat.S_IFMT(after.st_mode),
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            stat.S_IMODE(after.st_mode),
+        )
+        if before_identity != after_identity or len(data) != before.st_size:
+            raise failure_type(f"{label} changed during snapshot acquisition: {path}")
+        return bytes(data)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def read_artifact_snapshot(path: Path | str) -> ArtifactSnapshot:
+    """Capture exact bytes and SHA-256 from one no-follow regular-file open."""
+    target = Path(path)
+    try:
+        info = os.lstat(target)
+    except OSError as exc:
+        raise ArtifactValidationError(f"Artifact is missing: {target}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise ArtifactValidationError(f"Artifact path must not be a symbolic link: {target}")
+    if not stat.S_ISREG(info.st_mode):
+        raise ArtifactValidationError(f"Artifact must reference a regular file: {target}")
+    raw_bytes = _read_open_file_snapshot(
+        target,
+        label="Artifact",
+        failure_type=ArtifactValidationError,
+        max_bytes=MAX_ARTIFACT_BYTES,
+        expected_path_identity=info,
+    )
+    return ArtifactSnapshot(raw_bytes, hashlib.sha256(raw_bytes).hexdigest())
 
 
 def _git_admin_paths(workspace: Path) -> set[str]:
@@ -55,8 +171,16 @@ def _git_admin_paths(workspace: Path) -> set[str]:
     """
     admin: set[str] = set()
     git_entry = workspace / ".git"
-    if git_entry.is_symlink() or git_entry.exists():
+    try:
+        info = os.lstat(git_entry)
+    except FileNotFoundError:
+        return admin
+    except OSError as exc:
+        raise WorktreeIntegrityError(f"Unable to inspect reviewer worktree Git admin entry: {git_entry}") from exc
+    if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
         admin.add(".git")
+    else:
+        raise WorktreeIntegrityError("WORKTREE_UNSUPPORTED_NODE: unsupported filesystem node at .git")
     return admin
 
 
@@ -68,8 +192,12 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
     ``readlink`` ensure that symlink targets are recorded without traversing
     them.  Git's local administrative entry is the sole excluded path.
     """
-    root = Path(worktree).resolve()
-    if not root.is_dir():
+    root = Path(worktree).absolute()
+    try:
+        root_info = os.lstat(root)
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Reviewer worktree is not accessible: {root}") from exc
+    if not stat.S_ISDIR(root_info.st_mode):
         raise RunnerEnvironmentError(f"Reviewer worktree is not a directory: {root}")
     admin = _git_admin_paths(root)
     manifest: list[dict[str, Any]] = []
@@ -90,14 +218,16 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
                 raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree path: {relative}") from exc
             mode = stat.S_IMODE(info.st_mode)
             if stat.S_ISREG(info.st_mode):
-                digest = hashlib.sha256()
                 try:
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                except OSError as exc:
-                    raise RunnerEnvironmentError(f"Unable to fingerprint reviewer worktree file: {relative}") from exc
-                manifest.append({"path": relative, "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+                    raw_bytes = _read_open_file_snapshot(
+                        path,
+                        label=f"Unable to fingerprint reviewer worktree file {relative}",
+                        failure_type=WorktreeIntegrityError,
+                        expected_path_identity=info,
+                    )
+                except WorktreeIntegrityError:
+                    raise
+                manifest.append({"path": relative, "type": "file", "mode": mode, "sha256": hashlib.sha256(raw_bytes).hexdigest()})
             elif stat.S_ISLNK(info.st_mode):
                 try:
                     target = os.readlink(path)
@@ -108,16 +238,9 @@ def build_worktree_fingerprint_manifest(worktree: Path | str) -> list[dict[str, 
                 manifest.append({"path": relative, "type": "directory", "mode": mode})
                 visit(path, relative)
             else:
-                # Special nodes are semantic filesystem state too.  No content
-                # is read from them, but type and mode remain fingerprinted.
-                node_type = "fifo" if stat.S_ISFIFO(info.st_mode) else (
-                    "socket" if stat.S_ISSOCK(info.st_mode) else (
-                        "block" if stat.S_ISBLK(info.st_mode) else (
-                            "char" if stat.S_ISCHR(info.st_mode) else "special"
-                        )
-                    )
+                raise WorktreeIntegrityError(
+                    f"WORKTREE_UNSUPPORTED_NODE: unsupported filesystem node at {relative}"
                 )
-                manifest.append({"path": relative, "type": node_type, "mode": mode})
 
     visit(root)
     return sorted(manifest, key=lambda item: (str(item["path"]), str(item["type"])))
@@ -131,6 +254,11 @@ def fingerprint_worktree(worktree: Path | str) -> str:
 
 def fingerprint_manifest(manifest: list[dict[str, Any]]) -> str:
     """Hash a normalized manifest using the same definition as the live oracle."""
+    if not isinstance(manifest, list):
+        raise WorktreeIntegrityError("WORKTREE_UNSUPPORTED_NODE: fingerprint manifest is not an array")
+    for entry in manifest:
+        if not isinstance(entry, dict) or entry.get("type") not in {"file", "directory", "symlink"}:
+            raise WorktreeIntegrityError("WORKTREE_UNSUPPORTED_NODE: fingerprint manifest contains an unsupported node type")
     ordered = sorted(manifest, key=lambda item: (str(item.get("path", "")), str(item.get("type", ""))))
     normalized = json.dumps(ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -252,16 +380,31 @@ def validate_codex_review(
     }
 
 
+def read_validated_artifact_snapshot(
+    path: Path | str,
+    *,
+    expected_head: str | None = None,
+    expected_tree: str | None = None,
+) -> ArtifactSnapshot:
+    """Read, hash, parse, and validate a review artifact from one byte snapshot."""
+    snapshot = read_artifact_snapshot(path)
+    try:
+        parsed = json.loads(snapshot.raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ArtifactValidationError("Codex reviewer artifact is not valid UTF-8") from exc
+    except json.JSONDecodeError as exc:
+        raise ArtifactValidationError(f"Codex reviewer artifact is not valid JSON: {exc.msg}") from exc
+    validated = validate_codex_review(parsed, expected_head=expected_head, expected_tree=expected_tree)
+    return replace(snapshot, value=validated)
+
+
 def parse_codex_reviewer_result(path: Path | str, *, expected_head: str | None = None, expected_tree: str | None = None) -> dict[str, Any]:
     """Read only the Codex final output file and validate its closed schema."""
-    target = Path(path)
-    try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ArtifactValidationError(f"Codex reviewer final output is missing: {target}") from exc
-    except json.JSONDecodeError as exc:
-        raise ArtifactValidationError(f"Codex reviewer final output is not valid JSON: {exc.msg}") from exc
-    return validate_codex_review(raw, expected_head=expected_head, expected_tree=expected_tree)
+    return read_validated_artifact_snapshot(
+        path,
+        expected_head=expected_head,
+        expected_tree=expected_tree,
+    ).value
 
 
 def build_codex_reviewer_invocation(
@@ -543,13 +686,15 @@ def run_codex_review(
     _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
     result = parse_codex_reviewer_result(output_path, expected_head=expected_head, expected_tree=expected_tree)
     normalized_path = evidence / "review.json"
+    normalized_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        normalized_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        normalized_path.write_bytes(normalized_bytes)
     except OSError as exc:
         raise RunnerEnvironmentError(f"Unable to persist normalized Codex review artifact: {exc}") from exc
     return {
         "result": result,
         "artifact": str(normalized_path),
+        "artifact_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
         "raw_artifact": str(output_path),
         "invocation": str(evidence / "invocation.json"),
         "fingerprint": pre_fingerprint,

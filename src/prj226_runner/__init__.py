@@ -8,6 +8,7 @@ from prj226_runner.errors import (
     ReviewStaleError,
     RunnerEnvironmentError,
     RunnerError,
+    WorktreeIntegrityError,
 )
 from prj226_runner.models import (
     AgentConfig,
@@ -50,6 +51,7 @@ __all__ = [
     "ImplementationFailureError",
     "GovernanceBlockerError",
     "ReviewStaleError",
+    "WorktreeIntegrityError",
     "DEFAULT_TARGET_REPO",
     "DEFAULT_CANONICAL_BRANCH",
     "DEFAULT_EXPECTED_HEAD",

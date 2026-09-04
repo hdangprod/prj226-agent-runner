@@ -22,6 +22,10 @@ class RunnerEnvironmentError(RunnerError):
     error_class = ErrorClass.ENVIRONMENT_ERROR
 
 
+class WorktreeIntegrityError(RunnerEnvironmentError):
+    """Raised when a worktree contains state outside the supported integrity model."""
+
+
 class AgentExecutionError(RunnerError):
     """Raised when an external agent invocation crashes or times out."""
 

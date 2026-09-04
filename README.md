@@ -102,3 +102,12 @@ The smallest CLI commands are `inspect-project`, `discover-work`,
 `draft-contract`, `derive-task-packet`, `ingest-result`, `prepare-gate-b`, and
 `resume`. Controller state stores only orchestration facts; it never copies
 project source, logs, or Git history.
+
+Repair-5 closes the final pre-qualification trust boundary. Worktree
+fingerprints fail closed on unsupported filesystem nodes, review artifacts are
+hashed and validated from one no-follow byte snapshot, and `prepare-gate-b`
+emits a deterministic evidence package. Canonical integration requires a
+fresh six-field Human Gate-B authorization bound to that package; the
+authorization is consumed by an exclusive attempt claim and is never a push
+authorization. Use-time validation repeats the evidence, baseline, candidate,
+and protected-worktree checks under the integration lock.
