@@ -455,10 +455,13 @@ def build_codex_reviewer_env(
             except OSError as exc:
                 raise RunnerEnvironmentError("Unable to copy isolated Codex authentication material") from exc
 
+        # Keep reviewer runtime propagation explicitly bounded.  Authentication
+        # comes only from the copied auth.json in the fresh CODEX_HOME; ambient
+        # provider credentials must never become child-process authority.
         safe_keys = {
             "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
             "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-            "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
         }
         child_env = {key: os.environ[key] for key in safe_keys if key in os.environ}
         child_env["CODEX_HOME"] = str(isolated_home)
