@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from prj226_runner.models import ErrorClass
+from prj226_runner.reviewer_profile import (
+    CODEX_REVIEWER_MODEL,
+    CodexReviewerProfile,
+    build_codex_reviewer_argv,
+    build_codex_reviewer_env,
+    build_codex_reviewer_profile,
+)
 
 
 class CalibrationStatus(str, Enum):
@@ -940,6 +947,7 @@ def build_codex_invocation(
     model: str | None = None,
     timeout_seconds: float = 300.0,
     overrides: Mapping[str, str] | None = None,
+    reviewer_profile: CodexReviewerProfile | None = None,
 ) -> InvocationSpec:
     """
     Pure command builder for Codex CLI matching installed 0.148.0 contract.
@@ -947,6 +955,28 @@ def build_codex_invocation(
     Produces argv as a list without executing subprocess.
     """
     override_keys = validate_environment_override_keys(overrides)
+
+    if reviewer_profile is not None:
+        if model != reviewer_profile.model:
+            raise ValueError("Canonical reviewer profile/model mismatch")
+        argv = build_codex_reviewer_argv(
+            reviewer_profile,
+            workspace,
+            prompt,
+            payload_schema_path,
+            output_path,
+        )
+        return InvocationSpec(
+            tool="codex",
+            executable=reviewer_profile.resolved_executable,
+            argv=argv,
+            cwd=str(Path(workspace).resolve()),
+            model=reviewer_profile.model,
+            timeout_seconds=timeout_seconds,
+            env_override_keys=["CODEX_HOME", "HOME"],
+            permission_summary="sandbox=read-only, ask-for-approval=never, ignore-user-config=true, ignore-rules=true, apps=disabled, ephemeral=true",
+            expected_raw_output_mode="output_last_message_json",
+        )
 
     argv = [
         executable,
@@ -979,6 +1009,39 @@ def build_codex_invocation(
         permission_summary="sandbox=read-only, ask-for-approval=never, ephemeral=true",
         expected_raw_output_mode="output_last_message_json",
     )
+
+
+def build_synthetic_codex_reviewer_invocation(
+    executable: str,
+    workspace: str,
+    prompt: str,
+    payload_schema_path: str,
+    output_path: str,
+    timeout_seconds: float = 300.0,
+) -> InvocationSpec:
+    """Build synthetic qualification from the canonical HARN-002 profile."""
+    # Static qualification planning must not require or execute the provider;
+    # strict executable checks remain in the actual qualification gate.
+    profile = build_codex_reviewer_profile(
+        executable,
+        model=CODEX_REVIEWER_MODEL,
+        strict_executable=False,
+    )
+    return build_codex_invocation(
+        executable,
+        workspace,
+        prompt,
+        payload_schema_path,
+        output_path,
+        model=profile.model,
+        timeout_seconds=timeout_seconds,
+        reviewer_profile=profile,
+    )
+
+
+build_codex_reviewer_qualification_invocation = build_synthetic_codex_reviewer_invocation
+build_synthetic_codex_reviewer_env = build_codex_reviewer_env
+build_codex_reviewer_qualification_env = build_codex_reviewer_env
 
 
 def build_agy_invocation(
@@ -1388,27 +1451,47 @@ def plan_calibration_invocations(
 
     # 1. TC-CODEX-SMOKE
     codex_smoke_paths = plan_case_paths(root, CaseId.TC_CODEX_SMOKE.value)
-    specs[CaseId.TC_CODEX_SMOKE.value] = build_codex_invocation(
-        executable=executables.get("codex", "codex"),
-        workspace=str(codex_smoke_paths.workspace),
-        prompt=get_smoke_prompt(),
-        payload_schema_path=schema_path,
-        output_path=str(codex_smoke_paths.raw / "final-output.json"),
-        model=models.get("codex"),
-        timeout_seconds=timeout_map.get("codex", default_timeout),
-    )
+    if models.get("codex") == CODEX_REVIEWER_MODEL:
+        specs[CaseId.TC_CODEX_SMOKE.value] = build_synthetic_codex_reviewer_invocation(
+            executable=executables.get("codex", "codex"),
+            workspace=str(codex_smoke_paths.workspace),
+            prompt=get_smoke_prompt(),
+            payload_schema_path=schema_path,
+            output_path=str(codex_smoke_paths.raw / "final-output.json"),
+            timeout_seconds=timeout_map.get("codex", default_timeout),
+        )
+    else:
+        specs[CaseId.TC_CODEX_SMOKE.value] = build_codex_invocation(
+            executable=executables.get("codex", "codex"),
+            workspace=str(codex_smoke_paths.workspace),
+            prompt=get_smoke_prompt(),
+            payload_schema_path=schema_path,
+            output_path=str(codex_smoke_paths.raw / "final-output.json"),
+            model=models.get("codex"),
+            timeout_seconds=timeout_map.get("codex", default_timeout),
+        )
 
     # 2. TC-CODEX-MUTATION
     codex_mutation_paths = plan_case_paths(root, CaseId.TC_CODEX_MUTATION.value)
-    specs[CaseId.TC_CODEX_MUTATION.value] = build_codex_invocation(
-        executable=executables.get("codex", "codex"),
-        workspace=str(codex_mutation_paths.workspace),
-        prompt=get_mutation_prompt(),
-        payload_schema_path=schema_path,
-        output_path=str(codex_mutation_paths.raw / "final-output.json"),
-        model=models.get("codex"),
-        timeout_seconds=timeout_map.get("codex", default_timeout),
-    )
+    if models.get("codex") == CODEX_REVIEWER_MODEL:
+        specs[CaseId.TC_CODEX_MUTATION.value] = build_synthetic_codex_reviewer_invocation(
+            executable=executables.get("codex", "codex"),
+            workspace=str(codex_mutation_paths.workspace),
+            prompt=get_mutation_prompt(),
+            payload_schema_path=schema_path,
+            output_path=str(codex_mutation_paths.raw / "final-output.json"),
+            timeout_seconds=timeout_map.get("codex", default_timeout),
+        )
+    else:
+        specs[CaseId.TC_CODEX_MUTATION.value] = build_codex_invocation(
+            executable=executables.get("codex", "codex"),
+            workspace=str(codex_mutation_paths.workspace),
+            prompt=get_mutation_prompt(),
+            payload_schema_path=schema_path,
+            output_path=str(codex_mutation_paths.raw / "final-output.json"),
+            model=models.get("codex"),
+            timeout_seconds=timeout_map.get("codex", default_timeout),
+        )
 
     # 3. TC-AGY-SMOKE
     agy_smoke_paths = plan_case_paths(root, CaseId.TC_AGY_SMOKE.value)

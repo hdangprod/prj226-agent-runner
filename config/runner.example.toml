@@ -18,7 +18,7 @@ model = "Muse"
 timeout_seconds = 300
 
 [agents.sos_reviewer]
-tool = "opencode2"
-executable = "opencode"
-model = "MiMo"
+tool = "codex"
+executable = "/Users/dangnguyen/.nvm/versions/node/v20.5.0/bin/codex"
+model = "gpt-5.6-luna"
 timeout_seconds = 300

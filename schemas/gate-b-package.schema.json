@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Harn002GateBPackage",
+  "description": "Deterministic evidence package shown to a Human; it is not executable authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "gate", "decision", "package_version", "project_id", "repository_path", "canonical_branch",
+    "expected_canonical_head", "expected_canonical_tree", "contract_id", "contract_hash", "run_id",
+    "baseline_head", "baseline_tree", "candidate_head", "candidate_tree", "candidate_ref",
+    "expected_changed_paths", "design_contract_id", "design_contract_hash", "task_packet_id", "task_packet_hash",
+    "runner_acceptance_evidence_sha256", "evidence_root", "review_artifact", "review_artifact_sha256", "review_disposition",
+    "review_section_pass_states", "blocking_findings", "required_integrity_evidence", "evidence_references",
+    "runner_acceptance_evidence", "gate_b_package_hash"
+  ],
+  "properties": {
+    "gate": {"const": "HUMAN_GATE_B"},
+    "decision": {"const": "PENDING"},
+    "package_version": {"const": "HARN-002.GATE_B.v1"},
+    "project_id": {"type": "string", "minLength": 1},
+    "repository_path": {"type": "string", "minLength": 1},
+    "canonical_branch": {"type": "string", "minLength": 1},
+    "expected_canonical_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "expected_canonical_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "contract_id": {"type": "string", "minLength": 1},
+    "contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "run_id": {"type": "string", "minLength": 1},
+    "baseline_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "baseline_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_ref": {"type": "string", "minLength": 1},
+    "expected_changed_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "design_contract_id": {"type": "string", "minLength": 1},
+    "design_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_packet_id": {"type": "string", "minLength": 1},
+    "task_packet_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "runner_acceptance_evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_root": {"type": "string", "minLength": 1},
+    "review_artifact": {"type": "string", "minLength": 1},
+    "review_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "review_disposition": {"const": "PASS"},
+    "review_section_pass_states": {
+      "type": "object", "additionalProperties": false,
+      "required": ["security", "operability", "semantics", "architecture"],
+      "properties": {"security": {"const": "PASS"}, "operability": {"const": "PASS"}, "semantics": {"const": "PASS"}, "architecture": {"const": "PASS"}}
+    },
+    "blocking_findings": {"type": "array", "maxItems": 0},
+    "required_integrity_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_worktree_fingerprint", "review_worktree_fingerprint", "review_fingerprint_pre_artifact", "review_fingerprint_post_artifact", "review_fingerprint_pre_artifact_sha256", "review_fingerprint_post_artifact_sha256"],
+      "properties": {
+        "candidate_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_fingerprint_pre_artifact": {"type": "string", "minLength": 1},
+        "review_fingerprint_post_artifact": {"type": "string", "minLength": 1},
+        "review_fingerprint_pre_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_fingerprint_post_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "runner_acceptance_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["run_id", "result", "candidate_head", "candidate_tree", "candidate_ref", "deterministic_result", "verification_disposition", "reviewer_disposition", "evidence_paths", "required_evidence_references", "review_artifact", "review_raw_artifact", "review_fingerprint_pre_artifact", "review_fingerprint_post_artifact", "review_worktree_fingerprint", "candidate_worktree_fingerprint", "review_artifact_sha256", "evidence_file_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "result": {"const": "ACCEPTANCE_READY"},
+        "candidate_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "candidate_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "candidate_ref": {"type": "string", "minLength": 1},
+        "deterministic_result": {"const": "ACCEPTANCE_READY"},
+        "verification_disposition": {"const": "PASS"},
+        "reviewer_disposition": {"type": "object", "additionalProperties": false, "required": ["dv_result", "sos_result", "review_disposition"], "properties": {"dv_result": {"const": "PASS"}, "sos_result": {"const": "ACCEPT"}, "review_disposition": {"const": "PASS"}}},
+        "evidence_paths": {
+          "type": "object", "additionalProperties": false,
+          "required": ["manifest", "state", "events", "builder", "deterministic", "dv", "sos", "worktree", "review_worktree"],
+          "properties": {
+            "manifest": {"type": "string", "minLength": 1}, "state": {"type": "string", "minLength": 1}, "events": {"type": "string", "minLength": 1},
+            "builder": {"type": "string", "minLength": 1}, "deterministic": {"type": "string", "minLength": 1}, "dv": {"type": "string", "minLength": 1},
+            "sos": {"type": "string", "minLength": 1}, "worktree": {"type": "string", "minLength": 1}, "review_worktree": {"type": "string", "minLength": 1}
+          }
+        },
+        "required_evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "review_artifact": {"type": "string", "minLength": 1},
+        "review_raw_artifact": {"type": "string", "minLength": 1},
+        "review_fingerprint_pre_artifact": {"type": "string", "minLength": 1},
+        "review_fingerprint_post_artifact": {"type": "string", "minLength": 1},
+        "review_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "candidate_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evidence_file_sha256": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "minProperties": 1}
+      }
+    },
+    "gate_b_package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

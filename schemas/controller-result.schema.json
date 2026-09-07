@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Harn002ControllerResult",
+  "description": "Closed exact result-ingestion record for one HARN-001 run. Evidence files are relative to the trusted evidence_root; candidate/verifier roots may retain their exact external worktree locator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result", "controller_phase", "run_id", "candidate_head", "candidate_tree", "deterministic_result", "reviewer_disposition", "evidence_references", "error_class"],
+  "properties": {
+    "result": {"type": "string", "enum": ["RESULT_INGESTED"]},
+    "controller_phase": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "candidate_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_tree": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_ref": {"type": ["string", "null"], "minLength": 1},
+    "deterministic_result": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "verification_disposition": {"type": "string", "enum": ["PASS", "NEEDS_FIX", "STOPPED"]},
+    "reviewer_disposition": {"type": "object", "additionalProperties": false, "properties": {"dv_result": {"type": "string"}, "sos_result": {"type": "string"}, "review_disposition": {"type": "string", "enum": ["PASS", "NEEDS_FIX"]}}},
+    "evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "required_evidence_references": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_root": {"type": "string", "minLength": 1, "pattern": "^/"},
+    "evidence_paths": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest", "state", "events", "builder", "deterministic", "dv", "sos", "worktree", "review_worktree"],
+      "properties": {
+        "manifest": {"type": "string", "const": "manifest.json"},
+        "state": {"type": "string", "const": "state.json"},
+        "events": {"type": "string", "const": "events.ndjson"},
+        "builder": {"type": "string", "const": "builder"},
+        "deterministic": {"type": "string", "const": "deterministic"},
+        "dv": {"type": "string", "const": "dv"},
+        "sos": {"type": "string", "const": "sos"},
+        "worktree": {"type": "string", "minLength": 1},
+        "review_worktree": {"type": "string", "minLength": 1}
+      }
+    },
+    "candidate_worktree_fingerprint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "review_worktree_fingerprint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "review_artifact": {"type": ["string", "null"], "minLength": 1},
+    "review_raw_artifact": {"type": ["string", "null"], "minLength": 1},
+    "review_fingerprint_pre_artifact": {"type": ["string", "null"], "minLength": 1},
+    "review_fingerprint_post_artifact": {"type": ["string", "null"], "minLength": 1},
+    "review_artifact_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "error_class": {"type": ["string", "null"], "enum": ["ENVIRONMENT_ERROR", "AGENT_EXECUTION_ERROR", "ARTIFACT_VALIDATION_ERROR", "IMPLEMENTATION_FAILURE", "GOVERNANCE_BLOCKER", null]}
+  },
+  "oneOf": [
+    {
+      "required": ["candidate_ref", "verification_disposition", "evidence_root", "evidence_paths", "required_evidence_references", "candidate_worktree_fingerprint", "review_worktree_fingerprint", "review_artifact", "review_raw_artifact", "review_fingerprint_pre_artifact", "review_fingerprint_post_artifact", "review_artifact_sha256"],
+      "properties": {
+        "candidate_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "candidate_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "candidate_ref": {"type": "string", "minLength": 1},
+        "controller_phase": {"const": "ACCEPTANCE_READY"},
+        "deterministic_result": {"const": "ACCEPTANCE_READY"},
+        "verification_disposition": {"const": "PASS"},
+        "evidence_references": {"minItems": 1},
+        "required_evidence_references": {"minItems": 1},
+        "evidence_paths": {
+          "properties": {
+            "worktree": {"anyOf": [{"const": "builder/worktree"}, {"type": "string", "pattern": "^/"}]},
+            "review_worktree": {"anyOf": [{"const": "sos/verifier-worktree"}, {"type": "string", "pattern": "^/"}]}
+          }
+        },
+        "candidate_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_worktree_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "review_artifact": {"const": "sos/review.json"},
+        "review_raw_artifact": {"const": "sos/raw-result.json"},
+        "review_fingerprint_pre_artifact": {"const": "sos/fingerprint-pre.json"},
+        "review_fingerprint_post_artifact": {"const": "sos/fingerprint-post.json"},
+        "review_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "reviewer_disposition": {
+          "type": "object", "additionalProperties": false,
+          "required": ["dv_result", "sos_result", "review_disposition"],
+          "properties": {"dv_result": {"const": "PASS"}, "sos_result": {"const": "ACCEPT"}, "review_disposition": {"const": "PASS"}}
+        }
+      }
+    },
+    {
+      "properties": {
+        "controller_phase": {"const": "STOPPED"},
+        "deterministic_result": {"const": "STOPPED"},
+        "reviewer_disposition": {"const": {}},
+        "evidence_references": {"const": []}
+      },
+      "not": {
+        "anyOf": [
+          {"required": ["candidate_ref"]},
+          {"required": ["verification_disposition"]},
+          {"required": ["evidence_root"]},
+          {"required": ["required_evidence_references"]},
+          {"required": ["evidence_paths"]},
+          {"required": ["candidate_worktree_fingerprint"]},
+          {"required": ["review_worktree_fingerprint"]},
+          {"required": ["review_artifact"]},
+          {"required": ["review_raw_artifact"]},
+          {"required": ["review_fingerprint_pre_artifact"]},
+          {"required": ["review_fingerprint_post_artifact"]},
+          {"required": ["review_artifact_sha256"]}
+        ]
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "candidate_head": {"const": null},
+            "candidate_tree": {"const": null}
+          }
+        },
+        {
+          "properties": {
+            "candidate_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+            "candidate_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}
+          }
+        }
+      ]
+    }
+  ]
+}

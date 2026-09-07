@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Harn002ControllerState",
+  "description": "Closed orchestration cursor; Git and canonical documents remain authoritative.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "project_id", "repository", "canonical_branch", "baseline_head", "baseline_tree", "protected_dirty_paths",
+    "work_item_id", "work_shape", "contract_id", "task_packet_ref", "run_id", "candidate_head", "candidate_tree", "candidate_ref",
+    "phase", "pending_gate"
+  ],
+  "properties": {
+    "project_id": {"type": ["string", "null"]},
+    "repository": {"type": ["string", "null"]},
+    "canonical_branch": {"type": ["string", "null"]},
+    "baseline_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "baseline_tree": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "protected_dirty_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "work_item_id": {"type": ["string", "null"]},
+    "work_shape": {"type": ["string", "null"], "enum": ["SPIKE", "BOUNDED", "ARCHITECTURAL", null]},
+    "contract_id": {"type": ["string", "null"]},
+    "task_packet_ref": {"type": ["string", "null"]},
+    "run_id": {"type": ["string", "null"]},
+    "candidate_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_tree": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+    "candidate_ref": {"type": ["string", "null"]},
+    "phase": {
+      "type": "string",
+      "enum": [
+        "PROJECT_DISCOVERY", "TASK_DISCOVERY", "WORK_CLASSIFICATION", "CONTRACT_DRAFT", "WAITING_HUMAN_GATE_A",
+        "EXECUTION_PREP", "RUNNER_ACTIVE", "RESULT_INGESTION", "ACCEPTANCE_READY", "WAITING_HUMAN_GATE_B",
+        "CANONICAL_INTEGRATION", "POST_INTEGRATION_VERIFY", "STOPPED"
+      ]
+    },
+    "pending_gate": {"type": ["string", "null"], "enum": ["HUMAN_GATE_A", "HUMAN_GATE_B", null]}
+  }
+}

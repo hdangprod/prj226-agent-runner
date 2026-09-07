@@ -23,6 +23,13 @@ from prj226_runner.calibration import (
     run_calibration_subprocess,
     validate_run_id,
 )
+from prj226_runner.codex_reviewer import (
+    build_codex_reviewer_invocation,
+    fingerprint_worktree,
+    check_codex_reviewer_binding,
+    read_artifact_snapshot,
+    run_codex_review,
+)
 from prj226_runner.errors import (
     AgentExecutionError,
     ArtifactValidationError,
@@ -211,11 +218,17 @@ def _paths_for(config: RunnerConfig, packet: TaskPacket) -> dict[str, Path]:
         "root": root, "manifest": root / "manifest.json", "state": root / "state.json",
         "events": root / "events.ndjson", "builder": root / "builder", "deterministic": root / "deterministic",
         "dv": root / "dv", "sos": root / "sos", "worktree": root / "builder" / "worktree",
+        "review_worktree": root / "sos" / "verifier-worktree",
     }
 
 
 def _inspect(packet: TaskPacket, config: RunnerConfig) -> dict[str, Any]:
     repo = _canonical_baseline(packet)
+    reviewer = config.agents["sos_reviewer"]
+    if reviewer.tool == "codex":
+        # This is local binding/schema/executable inspection only.  It must
+        # never be replaced by a provider startup or availability call.
+        check_codex_reviewer_binding(reviewer.executable, model=reviewer.model)
     paths = _paths_for(config, packet)
     if paths["root"].exists():
         raise GovernanceBlockerError(f"Run ID collision: immutable runtime evidence already exists at {paths['root']}")
@@ -300,6 +313,14 @@ def build_builder_invocation(role: RoleConfig, workspace: Path, packet: TaskPack
 
 def build_reviewer_invocation(role: RoleConfig, prompt: str) -> list[str]:
     """Build a provider invocation kept separate from lifecycle semantics."""
+    if role.tool == "codex":
+        return build_codex_reviewer_invocation(
+            role.executable,
+            Path.cwd(),
+            prompt,
+            output_path=Path.cwd() / "reviewer-result.json",
+            model=role.model,
+        )
     if role.tool == "opencode2":
         return [role.executable, "run", "--standalone", "--format", "json", "--agent", "harn-readonly",
                 "--model", role.model, prompt]
@@ -329,13 +350,25 @@ def _changed_paths(repo: Path, baseline: str) -> list[str]:
     return sorted(set(path for path in [*tracked, *untracked] if path))
 
 
-def _verify_candidate_identity(repo: Path, baseline: str, candidate: str, tree: str, expected_paths: Iterable[str]) -> None:
+def _verify_candidate_identity(
+    repo: Path,
+    baseline: str,
+    candidate: str,
+    tree: str,
+    expected_paths: Iterable[str],
+    candidate_ref: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> None:
     if _git(repo, ["rev-parse", "HEAD"]).lower() != candidate:
         raise GovernanceBlockerError("Candidate HEAD changed after freeze")
     if _git(repo, ["rev-parse", "HEAD^{tree}"]).lower() != tree:
         raise GovernanceBlockerError("Candidate TREE changed after freeze")
+    if candidate_ref is not None and _git(repo, ["rev-parse", candidate_ref]).lower() != candidate:
+        raise GovernanceBlockerError("Candidate reference changed after freeze")
     if _git(repo, ["status", "--porcelain"]):
         raise GovernanceBlockerError("Candidate worktree is not clean")
+    if expected_fingerprint is not None and fingerprint_worktree(repo) != expected_fingerprint:
+        raise GovernanceBlockerError("Candidate worktree filesystem fingerprint changed")
     parents = _git(repo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split()
     if len(parents) != 2 or parents[1].lower() != baseline:
         raise GovernanceBlockerError("Candidate topology no longer has the baseline as its sole parent")
@@ -389,7 +422,10 @@ def _fresh_reviewer_env(directory: Path) -> dict[str, str]:
 
 
 def _parse_reviewer_result(path: Path, kind: str) -> tuple[str, list[Any]]:
-    raw = path.read_text(encoding="utf-8")
+    try:
+        raw = read_artifact_snapshot(path).raw_bytes.decode("utf-8")
+    except (ArtifactValidationError, UnicodeDecodeError) as exc:
+        raise ArtifactValidationError(f"{kind} reviewer output is not a safe UTF-8 artifact") from exc
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
@@ -407,19 +443,27 @@ def _parse_reviewer_result(path: Path, kind: str) -> tuple[str, list[Any]]:
     return verdict, findings
 
 
-def _run_tests(repo: Path, packet: TaskPacket, evidence: _RunEvidence, candidate: str, tree: str, changes: list[str]) -> list[dict[str, Any]]:
+def _run_tests(
+    repo: Path,
+    packet: TaskPacket,
+    evidence: _RunEvidence,
+    candidate: str,
+    tree: str,
+    changes: list[str],
+    expected_fingerprint: str,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, argv in enumerate(packet.test_commands, start=1):
         result = _run_process(argv, repo, evidence.paths["deterministic"] / f"test-{index}", 300)
         results.append(result)
         if result["exit_code"] != 0:
             raise ImplementationFailureError(f"Deterministic test {index} failed")
-        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes)
+        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
     check = subprocess.run(["git", "-C", str(repo), "diff", "--check", f"{packet.baseline_head}..{candidate}"],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, shell=False, check=False)
     if check.returncode != 0:
         raise ImplementationFailureError("Frozen candidate fails git diff --check")
-    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes)
+    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
     return results
 
 
@@ -432,6 +476,51 @@ def _create_builder_worktree(repo: Path, packet: TaskPacket, worktree: Path) -> 
     if result.returncode != 0:
         raise GovernanceBlockerError(f"Cannot create isolated Builder worktree: {result.stderr.strip() or result.stdout.strip()}")
     return branch
+
+
+def _create_candidate_verifier_worktree(repo: Path, candidate: str, worktree: Path) -> Path:
+    """Create a detached, clean verifier worktree pinned to the frozen candidate."""
+    if worktree.exists():
+        raise GovernanceBlockerError("Planned candidate verifier worktree already exists")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), candidate],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Cannot create candidate verifier worktree: {exc}") from exc
+    if result.returncode != 0:
+        raise GovernanceBlockerError(
+            f"Cannot create candidate verifier worktree: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return worktree
+
+
+def _codex_review_prompt(packet: TaskPacket, candidate: str, tree: str, changes: list[str], tests: list[dict[str, Any]]) -> str:
+    """Build the exact Repair-2 review brief, including the semantic frontier distinction."""
+    context = _review_context(packet, candidate, tree, changes, tests)
+    return (
+        "You are the independent Security / Operability / Semantics / Architecture reviewer for HARN-002 Repair-2. "
+        "Review the current immutable candidate in the current working directory read-only. Do not edit, create, "
+        "delete, commit, reset, checkout, merge, push, or repair anything. Return only JSON conforming to the "
+        "provided closed schema. Set reviewed_head and reviewed_tree to the exact Git HEAD and HEAD^{tree} you inspected. "
+        "Review SECURITY: Gate A exact authority, human dirty baseline protection, write envelope enforcement, and "
+        "mutation bypass. Review OPERABILITY: repository truth precedence, baseline drift, exact candidate/result "
+        "binding, resume semantics, and actionable failure taxonomy. Review SEMANTICS critically: frontier discovery "
+        "is not execution readiness; CURRENT plus ENGINEERING_PLAN can identify a canonical frontier; a missing Task "
+        "Packet does not make discovery undiscoverable but does prevent execution; the controller may classify and "
+        "draft a Design Contract and must stop at WAITING_HUMAN_GATE_A; exact Gate A remains mandatory; a derived "
+        "Task Packet cannot widen the approved contract; contradictory Task Packet evidence fails closed; and Gate B "
+        "cannot be bypassed. Review ARCHITECTURE: HARN-001 reuse, no retry/repair/provider router/fallback/multi-project "
+        "subsystem, Git authority, orchestration-only controller state, and no automatic merge/push. Confirm PRJ226 "
+        "dry-run remains read-only and ENG-012 is not implemented. Use PASS only when all four axes pass and there "
+        "are no blocking findings; otherwise use NEEDS_FIX. Findings must be non-empty strings.\n\n"
+        + context
+    )
 
 
 def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *, authorize: bool = False) -> dict[str, Any]:
@@ -459,33 +548,105 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
         if unauthorized:
             raise GovernanceBlockerError(f"Builder changed unauthorized paths: {unauthorized}")
         candidate, tree = _freeze_candidate(paths["worktree"], packet, changes)
+        candidate_fingerprint = fingerprint_worktree(paths["worktree"])
+        summary.update({
+            "candidate_head": candidate,
+            "candidate_tree": tree,
+            "candidate_ref": branch,
+            "candidate_worktree_fingerprint": candidate_fingerprint,
+            "changed_paths": changes,
+        })
         evidence.transition(RunState.CANDIDATE_FROZEN, "candidate_frozen", {"head": candidate, "tree": tree, "changed_paths": changes})
         evidence.transition(RunState.DETERMINISTIC_GATES, "deterministic_gates_started")
-        tests = _run_tests(paths["worktree"], packet, evidence, candidate, tree, changes)
+        tests = _run_tests(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint)
         context = _review_context(packet, candidate, tree, changes, tests)
         evidence.transition(RunState.DV_RUNNING, "dv_started")
         dv_prompt = "Review this candidate read-only. Return only JSON: {\"result\":\"PASS|FAIL\",\"findings\":[]}.\n" + context
         _run_process(build_reviewer_invocation(config.agents["dv"], dv_prompt), paths["worktree"], paths["dv"],
                      config.agents["dv"].timeout_seconds, _fresh_reviewer_env(paths["dv"]))
-        _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes)
+        _verify_candidate_identity(
+            paths["worktree"], packet.baseline_head, candidate, tree, changes,
+            expected_fingerprint=candidate_fingerprint,
+        )
         dv_result, dv_findings = _parse_reviewer_result(paths["dv"] / "stdout.log", "dv")
         _write_json(paths["dv"] / "result.json", {"result": dv_result, "findings": dv_findings})
         if dv_result != "PASS":
             raise ImplementationFailureError("DV reviewer returned FAIL")
         evidence.transition(RunState.SOS_RUNNING, "sos_started")
-        sos_prompt = "Review SECURITY, OPERABILITY, and SEMANTICS read-only. Return only JSON: {\"recommendation\":\"ACCEPT|REJECT\",\"findings\":[]}.\n" + context
-        _run_process(build_reviewer_invocation(config.agents["sos_reviewer"], sos_prompt), paths["worktree"], paths["sos"],
-                     config.agents["sos_reviewer"].timeout_seconds, _fresh_reviewer_env(paths["sos"]))
-        _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes)
-        sos_result, sos_findings = _parse_reviewer_result(paths["sos"] / "stdout.log", "sos")
-        _write_json(paths["sos"] / "result.json", {"recommendation": sos_result, "findings": sos_findings})
+        sos_role = config.agents["sos_reviewer"]
+        if sos_role.tool == "codex":
+            review_workspace = _create_candidate_verifier_worktree(repo, candidate, paths["review_worktree"])
+            codex_review = run_codex_review(
+                sos_role.executable,
+                review_workspace,
+                paths["sos"],
+                candidate_head=candidate,
+                candidate_tree=tree,
+                candidate_ref=branch,
+                prompt=_codex_review_prompt(packet, candidate, tree, changes, tests),
+                timeout_seconds=sos_role.timeout_seconds,
+            )
+            review_value = codex_review["result"]
+            _write_json(paths["sos"] / "result.json", review_value)
+            _verify_candidate_identity(
+                paths["worktree"], packet.baseline_head, candidate, tree, changes, branch,
+                expected_fingerprint=candidate_fingerprint,
+            )
+            _verify_candidate_identity(review_workspace, packet.baseline_head, candidate, tree, changes, branch)
+            sos_result = "ACCEPT" if review_value["disposition"] == "PASS" else "REJECT"
+            sos_findings = review_value["blocking_findings"] + review_value["non_blocking_findings"]
+            summary.update({
+                "review_disposition": review_value["disposition"],
+                "review_artifact": codex_review["artifact"],
+                "review_artifact_sha256": codex_review["artifact_sha256"],
+                "review_raw_artifact": codex_review["raw_artifact"],
+                "review_worktree_fingerprint": codex_review["fingerprint"],
+                "review_fingerprint_pre_artifact": codex_review["fingerprint_pre_artifact"],
+                "review_fingerprint_post_artifact": codex_review["fingerprint_post_artifact"],
+            })
+        else:
+            context = _review_context(packet, candidate, tree, changes, tests)
+            sos_prompt = "Review SECURITY, OPERABILITY, and SEMANTICS read-only. Return only JSON: {\"recommendation\":\"ACCEPT|REJECT\",\"findings\":[]}.\n" + context
+            _run_process(build_reviewer_invocation(sos_role, sos_prompt), paths["worktree"], paths["sos"],
+                         sos_role.timeout_seconds, _fresh_reviewer_env(paths["sos"]))
+            _verify_candidate_identity(
+                paths["worktree"], packet.baseline_head, candidate, tree, changes,
+                expected_fingerprint=candidate_fingerprint,
+            )
+            sos_result, sos_findings = _parse_reviewer_result(paths["sos"] / "stdout.log", "sos")
+            _write_json(paths["sos"] / "result.json", {"recommendation": sos_result, "findings": sos_findings})
         if sos_result != "ACCEPT":
             raise ImplementationFailureError("S/O/S reviewer returned REJECT")
         _canonical_baseline(packet)
         evidence.transition(RunState.ACCEPTANCE_READY, "acceptance_ready")
-        summary.update({"result": "ACCEPTANCE_READY", "candidate_head": candidate, "candidate_tree": tree,
-                        "changed_paths": changes, "tests": tests, "dv_result": dv_result, "sos_result": sos_result,
-                        "evidence_paths": {key: str(value) for key, value in paths.items() if key != "root"}})
+        evidence_paths = {key: str(value) for key, value in paths.items() if key != "root"}
+        summary.update({
+            "result": "ACCEPTANCE_READY",
+            "deterministic_result": "ACCEPTANCE_READY",
+            "verification_disposition": "PASS",
+            "candidate_head": candidate,
+            "candidate_tree": tree,
+            "candidate_ref": branch,
+            "candidate_worktree_fingerprint": candidate_fingerprint,
+            "changed_paths": changes,
+            "tests": tests,
+            "dv_result": dv_result,
+            "sos_result": sos_result,
+            "reviewer_disposition": {
+                "dv_result": dv_result,
+                "sos_result": sos_result,
+                **({"review_disposition": summary["review_disposition"]} if "review_disposition" in summary else {}),
+            },
+            "evidence_paths": evidence_paths,
+        })
+        required_references = set(evidence_paths.values())
+        for key in ("review_artifact", "review_raw_artifact", "review_fingerprint_pre_artifact", "review_fingerprint_post_artifact"):
+            if key in summary:
+                required_references.add(str(summary[key]))
+        summary["required_evidence_references"] = sorted(required_references)
+        if "review_artifact" in summary:
+            if not isinstance(summary.get("review_artifact_sha256"), str):
+                raise ArtifactValidationError("Codex review evidence is missing its same-snapshot SHA-256")
         _write_json(paths["root"] / "report.json", summary)
         return summary
     except RunnerError as exc:

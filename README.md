@@ -72,3 +72,55 @@ Provider executables and models are configured only in `runner.toml`; they are
 never accepted from a packet. Runtime evidence is immutable under the configured
 external `runtime_root`. The runner never retries, repairs, merges, rebases,
 cherry-picks, canonicalizes, or pushes a product repository.
+
+HARN-002 Repair-4 binds the independent Security / Operability / Semantics /
+Architecture reviewer to Codex CLI / OpenAI / `gpt-5.6-luna`. Its lifecycle is
+deterministic local preflight → exactly one ordinary `codex exec` semantic
+review → deterministic local postflight. The invocation is ephemeral,
+read-only, isolated from user config and rules, explicitly disables built-in
+apps, and uses a fresh auth-only CODEX_HOME/HOME pair. Synthetic qualification
+and production review use the same canonical profile and sanitized
+`reviewer_profile_hash`, and are constrained by the closed
+[Codex reviewer result schema](schemas/codex-reviewer-result.schema.json).
+Provider failures stop without retry or fallback. Runner Git checks and a
+path-sorted filesystem fingerprint bind the verifier worktree before and after
+review, including ignored files, empty directories, symlinks, and modes.
+Reviewer claims never authorize a candidate transition.
+
+## HARN-002 single-project controller
+
+HARN-002 adds a manifest-driven, read-only project inspection and next-work
+discovery layer above Runner V1. It drafts a closed Design Contract, waits for
+exact Human Gate A binding, derives the existing HARN-001 Task Packet, ingests
+exact candidate/reviewer evidence, and stops at Human Gate B before canonical
+integration. `ACCEPTANCE_READY` is accepted only with complete deterministic
+Runner evidence, an exact candidate, a complete validated closed review
+artifact, and matching pre/post worktree fingerprints. See [AI Agent Harness
+Vision and Operating Model V2](AI_AGENT_HARNESS_VISION_AND_OPERATING_MODEL_V2.md)
+and the contracts in `schemas/project-manifest.schema.json`,
+`schemas/design-contract.schema.json`, `schemas/controller-state.schema.json`,
+and `schemas/controller-result.schema.json`.
+
+The smallest CLI commands are `inspect-project`, `discover-work`,
+`draft-contract`, `derive-task-packet`, `ingest-result`, `prepare-gate-b`, and
+`resume`. Controller state stores only orchestration facts; it never copies
+project source, logs, or Git history.
+
+Repair-5 closes the final pre-qualification trust boundary. Worktree
+fingerprints fail closed on unsupported filesystem nodes, review artifacts are
+hashed and validated from one no-follow byte snapshot, and `prepare-gate-b`
+emits a deterministic evidence package. Canonical integration requires a
+fresh six-field Human Gate-B authorization bound to that package; the
+authorization is consumed by an exclusive attempt claim and is never a push
+authorization. Use-time validation repeats the evidence, baseline, candidate,
+and protected-worktree checks under the integration lock.
+
+Repair-6 binds Runner evidence to one trusted run-root directory descriptor.
+Internal evidence locators in the closed controller result are root-relative;
+every component is opened with no-follow semantics and every accepted file is
+read, hashed, parsed, and semantically checked from the same descriptor
+snapshot. Runner evidence files must have one hard link, matching the
+single-owner immutable evidence lifecycle. The controller result is
+schema-validated before persistence, and
+Gate-B reloads and revalidates that result and its evidence before it can be
+prepared or consumed.
