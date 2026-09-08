@@ -148,3 +148,26 @@ V2 plumbing only: `inspect-v2`, `run-v2 --contract --gate-a --authorize`,
 `draft-contract-v2`, `derive-task-packet-v2`, `ingest-result-v2`, and
 `prepare-gate-b-v2`. Direct V2 execution requires the exact Design Contract
 plus Gate A context; `--authorize` alone is insufficient.
+
+## M2 workflow (internal golden path)
+
+M2 removes internal ceremony from normal use. The operator never handles
+Design Contract JSON, Task Packet JSON, hashes, or lifecycle artifact paths
+directly. M2 calls the frozen M1 v2 lifecycle without changing its semantics.
+
+```text
+prj226-runner init --manifest PATH --config PATH
+prj226-runner task "DESCRIPTION" [--scope NAME] [--preview-only]
+prj226-runner status [TASK_ID] [--json]
+prj226-runner resume TASK_ID [--handoff]
+prj226-runner accept TASK_ID
+```
+
+Gate A shows REQUEST / BEHAVIOR / FILES / CHECKS / EXECUTION / REVIEW /
+UNCERTAINTY and requires the literal input `approve`. `--preview-only`
+performs no Gate A mutation, invokes no builder/reviewer, and creates no
+candidate. `status` is read-only. `resume` reconstructs only verified facts
+and never reruns execution. `accept` requires fresh literal `approve`,
+revalidates branch/head/tree/candidate/evidence via frozen M1, and performs
+local-only integration (no push). Exits: 0 ok, 2 usage/input, 10
+stopped/not-ready, 20 fail-closed blocker.
