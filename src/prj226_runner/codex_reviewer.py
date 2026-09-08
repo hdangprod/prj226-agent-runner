@@ -806,3 +806,285 @@ def run_codex_review(
 
 
 run_codex_reviewer = run_codex_review
+
+
+TARGETED_REVIEW_VERSION = "HARN-002.TARGETED_REVIEW.v1"
+TARGETED_REVIEW_KEYS = {
+    "review_version",
+    "disposition",
+    "reviewed_head",
+    "reviewed_tree",
+    "reviewed_ref",
+    "blocking_findings",
+    "non_blocking_findings",
+}
+TARGETED_DISPOSITIONS = {"PASS", "NEEDS_FIX"}
+
+
+def _targeted_object_id(value: Any, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 40:
+        raise ArtifactValidationError(f"{field} must be a 40-character Git object ID")
+    normalized = value.lower()
+    if any(character not in "0123456789abcdef" for character in normalized):
+        raise ArtifactValidationError(f"{field} must be a hexadecimal Git object ID")
+    return normalized
+
+
+def _targeted_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ArtifactValidationError(f"{field} must be a 64-character SHA-256 digest")
+    normalized = value.lower()
+    if any(character not in "0123456789abcdef" for character in normalized):
+        raise ArtifactValidationError(f"{field} must be lowercase hexadecimal SHA-256")
+    return normalized
+
+
+def validate_targeted_review(
+    value: Mapping[str, Any],
+    *,
+    expected_head: str | None = None,
+    expected_tree: str | None = None,
+    expected_ref: str | None = None,
+) -> dict[str, Any]:
+    """Validate the closed targeted-review contract. No prose/stdout fallback.
+
+    Candidate binding is exact via HEAD/TREE/ref. Reviewer/profile/executable
+    binding is enforced live against frozen Gate A authority by the caller, not
+    via result-file echo (which would require passing secrets through the
+    isolated reviewer environment).
+    """
+    if not isinstance(value, Mapping):
+        raise ArtifactValidationError("Targeted review result must be a JSON object")
+    data = dict(value)
+    if set(data) != TARGETED_REVIEW_KEYS:
+        raise ArtifactValidationError("Targeted review result must contain exactly the closed targeted fields")
+    if data.get("review_version") != TARGETED_REVIEW_VERSION:
+        raise ArtifactValidationError("Targeted review version is unsupported")
+    disposition = data.get("disposition")
+    if disposition not in TARGETED_DISPOSITIONS:
+        raise ArtifactValidationError("Targeted review disposition must be PASS or NEEDS_FIX")
+    reviewed_head = _targeted_object_id(data.get("reviewed_head"), "reviewed_head")
+    reviewed_tree = _targeted_object_id(data.get("reviewed_tree"), "reviewed_tree")
+    reviewed_ref = data.get("reviewed_ref")
+    if not isinstance(reviewed_ref, str) or not reviewed_ref.strip():
+        raise ArtifactValidationError("Targeted review reviewed_ref must be a non-empty string")
+    if expected_head is not None and reviewed_head != _targeted_object_id(expected_head, "candidate_head"):
+        raise ReviewStaleError("REVIEW_STALE: targeted reviewer output HEAD does not match the immutable candidate")
+    if expected_tree is not None and reviewed_tree != _targeted_object_id(expected_tree, "candidate_tree"):
+        raise ReviewStaleError("REVIEW_STALE: targeted reviewer output TREE does not match the immutable candidate")
+    if expected_ref is not None and reviewed_ref != expected_ref:
+        raise ReviewStaleError("REVIEW_STALE: targeted reviewer output ref does not match the immutable candidate")
+    blocking = data.get("blocking_findings")
+    non_blocking = data.get("non_blocking_findings")
+    if not isinstance(blocking, list) or not all(isinstance(item, str) and item.strip() for item in blocking):
+        raise ArtifactValidationError("Targeted blocking_findings must be an array of non-empty strings")
+    if not isinstance(non_blocking, list) or not all(isinstance(item, str) and item.strip() for item in non_blocking):
+        raise ArtifactValidationError("Targeted non_blocking_findings must be an array of non-empty strings")
+    expected_disposition = "NEEDS_FIX" if blocking else "PASS"
+    if disposition != expected_disposition:
+        raise ArtifactValidationError("Targeted reviewer disposition contradicts blocking findings")
+    return {
+        "review_version": TARGETED_REVIEW_VERSION,
+        "disposition": disposition,
+        "reviewed_head": reviewed_head,
+        "reviewed_tree": reviewed_tree,
+        "reviewed_ref": reviewed_ref,
+        "blocking_findings": list(blocking),
+        "non_blocking_findings": list(non_blocking),
+    }
+
+
+def read_targeted_artifact_snapshot(
+    path: Path | str,
+    *,
+    expected_head: str | None = None,
+    expected_tree: str | None = None,
+    expected_ref: str | None = None,
+) -> ArtifactSnapshot:
+    snapshot = read_artifact_snapshot(path)
+    try:
+        parsed = json.loads(snapshot.raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ArtifactValidationError("Targeted reviewer artifact is not valid UTF-8") from exc
+    except json.JSONDecodeError as exc:
+        raise ArtifactValidationError(f"Targeted reviewer artifact is not valid JSON: {exc.msg}") from exc
+    validated = validate_targeted_review(
+        parsed,
+        expected_head=expected_head,
+        expected_tree=expected_tree,
+        expected_ref=expected_ref,
+    )
+    return replace(snapshot, value=validated)
+
+
+def parse_targeted_reviewer_result(
+    path: Path | str,
+    *,
+    expected_head: str | None = None,
+    expected_tree: str | None = None,
+    expected_ref: str | None = None,
+) -> dict[str, Any]:
+    return read_targeted_artifact_snapshot(
+        path,
+        expected_head=expected_head,
+        expected_tree=expected_tree,
+        expected_ref=expected_ref,
+    ).value
+
+
+def build_targeted_reviewer_invocation(
+    executable: str,
+    workspace: Path | str,
+    prompt: str,
+    output_schema: Path | str | None,
+    output_path: Path | str | None,
+    *,
+    model: str = CODEX_REVIEWER_MODEL,
+    profile: CodexReviewerProfile | None = None,
+) -> list[str]:
+    """Build the single targeted-review argv from the canonical profile.
+
+    The argv shape intentionally reuses the canonical codex exec construction so
+    fake local executables with observable counters remain compatible. No
+    version/help/availability probe is performed here.
+    """
+    return build_codex_reviewer_invocation(
+        executable,
+        workspace,
+        prompt,
+        output_schema,
+        output_path,
+        model=model,
+        profile=profile,
+    )
+
+
+def run_targeted_review(
+    executable: str,
+    workspace: Path | str,
+    evidence_dir: Path | str,
+    *,
+    candidate_head: str,
+    candidate_tree: str,
+    candidate_ref: str | None,
+    prompt: str,
+    timeout_seconds: int,
+    output_schema: Path | str | None = None,
+    source_codex_home: Path | str | None = None,
+) -> dict[str, Any]:
+    """Run exactly one targeted semantic review with strict file-only parsing.
+
+    Process failure (spawn/timeout/nonzero) raises AgentExecutionError even when
+    a PASS file exists. Malformed/missing output raises ArtifactValidationError.
+    Candidate drift raises ReviewStaleError (a GovernanceBlockerError).
+    Reviewer/profile/executable binding against frozen Gate A authority is
+    enforced by the caller before invocation; this function records the live
+    binding for evidence without requiring result-file echo.
+    """
+    expected_head = _targeted_object_id(candidate_head, "candidate_head")
+    expected_tree = _targeted_object_id(candidate_tree, "candidate_tree")
+    if not isinstance(candidate_ref, str) or not candidate_ref.strip():
+        raise ArtifactValidationError("Targeted review requires an exact candidate ref")
+    candidate_workspace = Path(workspace).resolve()
+    evidence = Path(os.path.abspath(os.fspath(evidence_dir)))
+    try:
+        evidence.relative_to(candidate_workspace)
+    except ValueError:
+        pass
+    else:
+        raise GovernanceBlockerError("Targeted review artifacts must be outside the verifier worktree")
+    profile = build_codex_reviewer_profile(executable, model=CODEX_REVIEWER_MODEL)
+    binding = check_codex_reviewer_binding(executable, model=profile.model, output_schema=output_schema)
+    try:
+        _digest = hashlib.sha256()
+        with Path(binding["executable"]).open("rb") as _handle:
+            while _chunk := _handle.read(1024 * 1024):
+                _digest.update(_chunk)
+        live_exe_sha = _digest.hexdigest()
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Targeted reviewer executable cannot be fingerprinted: {exc}") from exc
+    pre_fingerprint = _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
+    evidence.mkdir(parents=True, exist_ok=True)
+    with EvidenceRoot(evidence, label="Targeted review evidence root"):
+        pass
+    fingerprint_manifest_data = build_worktree_fingerprint_manifest(candidate_workspace)
+    try:
+        (evidence / "fingerprint-pre.json").write_text(
+            json.dumps({"fingerprint": pre_fingerprint, "manifest": fingerprint_manifest_data}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Unable to persist targeted pre-review fingerprint: {exc}") from exc
+    output_path = evidence / "raw-result.json"
+    argv = build_targeted_reviewer_invocation(
+        binding["executable"],
+        candidate_workspace,
+        prompt,
+        output_schema,
+        output_path,
+        profile=profile,
+    )
+    env = build_codex_reviewer_env(evidence, source_codex_home=source_codex_home)
+    try:
+        normalized_profile = normalize_codex_reviewer_profile(argv, profile=profile, env=env)
+        (evidence / "reviewer-profile.json").write_text(
+            json.dumps(
+                {
+                    "authority": normalized_profile["authority"],
+                    "environment": normalized_profile["environment"],
+                    "reviewer_profile_hash": normalized_profile["reviewer_profile_hash"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        shutil.rmtree(env["CODEX_HOME"], ignore_errors=True)
+        if isinstance(exc, (ArtifactValidationError, RunnerEnvironmentError)):
+            raise
+        raise RunnerEnvironmentError(f"Unable to persist targeted reviewer profile evidence: {exc}") from exc
+    try:
+        _run_once(argv, candidate_workspace, evidence, timeout_seconds, env, profile)
+    finally:
+        shutil.rmtree(env["CODEX_HOME"], ignore_errors=True)
+    post_manifest = build_worktree_fingerprint_manifest(candidate_workspace)
+    normalized_post = json.dumps(post_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    post_fingerprint = hashlib.sha256(normalized_post.encode("utf-8")).hexdigest()
+    try:
+        (evidence / "fingerprint-post.json").write_text(
+            json.dumps({"fingerprint": post_fingerprint, "manifest": post_manifest}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Unable to persist targeted post-review fingerprint: {exc}") from exc
+    if post_fingerprint != pre_fingerprint:
+        raise ReviewStaleError("REVIEW_STALE: targeted reviewer worktree filesystem fingerprint changed during reviewer execution")
+    _assert_candidate(candidate_workspace, expected_head, expected_tree, candidate_ref)
+    result = parse_targeted_reviewer_result(
+        output_path,
+        expected_head=expected_head,
+        expected_tree=expected_tree,
+        expected_ref=candidate_ref,
+    )
+    normalized_path = evidence / "review.json"
+    normalized_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        normalized_path.write_bytes(normalized_bytes)
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Unable to persist normalized targeted review artifact: {exc}") from exc
+    return {
+        "result": result,
+        "artifact": str(normalized_path),
+        "artifact_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
+        "raw_artifact": str(output_path),
+        "raw_artifact_sha256": read_artifact_snapshot(output_path).sha256,
+        "invocation": str(evidence / "invocation.json"),
+        "reviewer_profile": str(evidence / "reviewer-profile.json"),
+        "reviewer_profile_hash": profile.reviewer_profile_hash,
+        "executable_sha256": live_exe_sha,
+        "fingerprint": pre_fingerprint,
+        "fingerprint_pre_artifact": str(evidence / "fingerprint-pre.json"),
+        "fingerprint_post_artifact": str(evidence / "fingerprint-post.json"),
+    }

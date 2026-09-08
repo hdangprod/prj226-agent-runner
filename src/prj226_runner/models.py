@@ -50,6 +50,22 @@ class WorkShape(str, Enum):
     ARCHITECTURAL = "ARCHITECTURAL"
 
 
+class ReviewMode(str, Enum):
+    """Versioned V2 review-mode selection. Exactly NONE or TARGETED."""
+
+    NONE = "NONE"
+    TARGETED = "TARGETED"
+
+
+class ReviewStatus(str, Enum):
+    """Versioned V2 review outcome. Exactly four values, no fifth status."""
+
+    NOT_REQUIRED = "NOT_REQUIRED"
+    PASS = "PASS"
+    NEEDS_FIX = "NEEDS_FIX"
+    EXECUTION_FAILURE = "EXECUTION_FAILURE"
+
+
 class ControllerPhase(str, Enum):
     """Explicit HARN-002 controller cursor phases."""
 

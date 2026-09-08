@@ -37,8 +37,23 @@ from prj226_runner.codex_reviewer import (
     _safe_evidence_relative_path,
     validate_codex_review,
 )
-from prj226_runner.models import ControllerPhase, ErrorClass, WorkShape
-from prj226_runner.runner import TaskPacket, candidate_branch_name, parse_task_packet, run_packet
+from prj226_runner.models import ControllerPhase, ErrorClass, ReviewMode, ReviewStatus, WorkShape
+from prj226_runner.review_policy import normalize_review_policy, select_review_mode
+from prj226_runner.runner import (
+    TaskPacket,
+    TaskPacketV2,
+    V2_CONTRACT_VERSION,
+    V2_PACKET_VERSION,
+    V2_RUNNER_RESULT_VERSION,
+    candidate_branch_name,
+    parse_task_packet,
+    parse_task_packet_v2,
+    run_packet,
+    run_packet_v2,
+    task_packet_hash_v2,
+    validate_gate_a_v2 as _runner_validate_gate_a_v2,
+    validate_task_packet_derivation_v2 as _runner_validate_packet_v2,
+)
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -2028,3 +2043,1181 @@ class Controller:
         if self.state_path is None:
             raise GovernanceBlockerError("resume requires a persisted controller state path")
         return resume_controller(self.manifest, self.state_path, current_candidate=current_candidate)
+
+
+# ============================================================================
+# M1 V2 — versioned controller authority (HARN-002.v2 / TASK_PACKET.v2 / etc).
+# Legacy V1 paths above remain unchanged.
+# ============================================================================
+
+CONTRACT_V2_KEYS = {
+    "contract_id",
+    "contract_hash",
+    "contract_version",
+    "project_id",
+    "repository_path",
+    "canonical_branch",
+    "run_id",
+    "work_item_id",
+    "work_item_title",
+    "work_shape",
+    "intent",
+    "success_criteria",
+    "scope",
+    "non_goals",
+    "baseline_head",
+    "baseline_tree",
+    "owned_paths",
+    "protected_dirty_paths",
+    "assumptions",
+    "risks",
+    "dependencies",
+    "acceptance_instruments",
+    "discriminating_acceptance_controls",
+    "failure_conditions",
+    "exact_authority_boundary",
+    "readiness",
+    "runtime_root",
+    "review_policy",
+}
+V2_RUNNER_RESULT_VERSION_LOCAL = "HARN-001.RUNNER_RESULT.v2"
+V2_CONTROLLER_RESULT_VERSION = "HARN-002.CONTROLLER_RESULT.v2"
+V2_GATE_B_VERSION = "HARN-002.GATE_B.v2"
+V2_MANIFEST_VERSION_LOCAL = "HARN-001.RUN_MANIFEST.v2"
+V2_STATE_VERSION_LOCAL = "HARN-001.RUN_STATE.v2"
+GATE_A_V2_KEYS = {
+    "gate",
+    "decision",
+    "contract_id",
+    "contract_hash",
+    "baseline_head",
+    "baseline_tree",
+    "authorized_protected_dirty_paths",
+}
+V2_CONTROLLER_RESULT_COMMON = {
+    "version", "result", "controller_phase", "run_id", "contract_id", "contract_hash",
+    "task_packet_hash", "review_policy", "review_attempted", "review_status",
+    "candidate_head", "candidate_tree", "candidate_ref",
+    "candidate_worktree_fingerprint", "worktree_fingerprint",
+    "verification_disposition", "deterministic_result",
+    "evidence_root", "evidence_paths", "required_evidence_references",
+    "review_evidence", "evidence_file_sha256", "runner_acceptance_evidence_sha256",
+    "error_class",
+}
+
+
+def _contract_without_identity_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: contract[key] for key in sorted(CONTRACT_V2_KEYS - {"contract_id", "contract_hash"})}
+
+
+def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
+    data = _strict_object(dict(value), CONTRACT_V2_KEYS, "V2 Design Contract")
+    if data["contract_version"] != V2_CONTRACT_VERSION:
+        raise ArtifactValidationError("V2 Design Contract version must be exactly HARN-002.v2")
+    _non_empty_string(data["project_id"], "project_id")
+    _lexical_absolute_path(data["repository_path"], "repository_path")
+    _non_empty_string(data["canonical_branch"], "canonical_branch")
+    try:
+        validate_run_id(data["run_id"])
+    except (TypeError, ValueError) as exc:
+        raise ArtifactValidationError(str(exc)) from exc
+    for field in ("work_item_id", "work_item_title", "intent", "exact_authority_boundary"):
+        _non_empty_string(data[field], field)
+    if data["work_shape"] not in {item.value for item in WorkShape}:
+        raise ArtifactValidationError("work_shape must be exactly one of SPIKE, BOUNDED, or ARCHITECTURAL")
+    for field in ("scope", "success_criteria"):
+        _string_list(data[field], field, allow_empty=False)
+    for field in ("non_goals", "assumptions", "risks", "dependencies", "failure_conditions"):
+        _string_list(data[field], field, allow_empty=True)
+    readiness = _strict_object(data["readiness"], READINESS_KEYS, "V2 Design Contract readiness")
+    if readiness["task_packet"] not in {TASK_PACKET_MISSING, TASK_PACKET_PRESENT}:
+        raise ArtifactValidationError("V2 Design Contract readiness.task_packet is invalid")
+    if readiness["execution"] != EXECUTION_NOT_AUTHORIZED:
+        raise ArtifactValidationError("V2 Design Contract readiness.execution must be NOT AUTHORIZED")
+    if readiness["runner"] != RUNNER_NOT_INVOKED:
+        raise ArtifactValidationError("V2 Design Contract readiness.runner must be NOT INVOKED")
+    _validate_object_id(data["baseline_head"], "baseline_head")
+    _validate_object_id(data["baseline_tree"], "baseline_tree")
+    _path_list(data["owned_paths"], "owned_paths", allow_empty=False)
+    _path_list(data["protected_dirty_paths"], "protected_dirty_paths", allow_empty=True)
+    _argv_list(data["acceptance_instruments"], "acceptance_instruments")
+    if not data["acceptance_instruments"]:
+        raise ArtifactValidationError("V2 acceptance_instruments must contain at least one deterministic command")
+    _string_list(data["discriminating_acceptance_controls"], "discriminating_acceptance_controls", allow_empty=False)
+    _lexical_absolute_path(data["runtime_root"], "runtime_root")
+    policy = normalize_review_policy(data["review_policy"])
+    if not isinstance(data["contract_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["contract_hash"]):
+        raise ArtifactValidationError("contract_hash must be a lowercase SHA-256 digest")
+    content = _contract_without_identity_v2({**data, "review_policy": policy})
+    expected_hash = _sha(content)
+    if data["contract_hash"] != expected_hash or data["contract_id"] != "design-" + expected_hash:
+        raise ArtifactValidationError("V2 Design Contract identity/hash does not match its content")
+    normalized = dict(data)
+    normalized["review_policy"] = policy
+    normalized["runtime_root"] = str(_lexical_absolute_path(data["runtime_root"], "runtime_root"))
+    return normalized
+
+
+def build_reviewer_binding_v2(
+    *,
+    executable: str,
+    model: str = "gpt-5.6-luna",
+    timeout_seconds: int = 300,
+    review_brief: str,
+    output_schema: Path | str | None = None,
+) -> dict[str, Any]:
+    """Freeze the exact TARGETED reviewer descriptor from local inspection only."""
+    from prj226_runner.reviewer_profile import build_codex_reviewer_profile, resolve_reviewer_executable
+    from prj226_runner.paths import get_runner_root as _get_root
+    if not isinstance(review_brief, str) or not review_brief.strip():
+        raise ArtifactValidationError("review_brief must be a non-empty string")
+    if not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
+        raise ArtifactValidationError("timeout_seconds must be a positive integer")
+    if model != "gpt-5.6-luna":
+        raise ArtifactValidationError("V2 reviewer model must be exactly gpt-5.6-luna")
+    resolved = resolve_reviewer_executable(executable)
+    profile = build_codex_reviewer_profile(executable, model=model)
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Reviewer executable cannot be fingerprinted: {exc}") from exc
+    schema_path = Path(output_schema).resolve() if output_schema is not None else (_get_root() / "schemas" / "targeted-review-result.schema.json")
+    if not schema_path.is_file():
+        raise RunnerEnvironmentError(f"Targeted reviewer output schema is missing: {schema_path}")
+    try:
+        schema_bytes = schema_path.read_bytes()
+        json.loads(schema_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerEnvironmentError(f"Targeted reviewer output schema cannot be read: {exc}") from exc
+    schema_sha = hashlib.sha256(schema_bytes).hexdigest()
+    return {
+        "tool": "codex",
+        "provider": "OpenAI",
+        "model": model,
+        "executable": executable,
+        "resolved_executable": str(resolved),
+        "executable_sha256": digest.hexdigest(),
+        "reviewer_profile": profile.authority_manifest(),
+        "reviewer_profile_hash": profile.reviewer_profile_hash,
+        "output_schema": str(schema_path),
+        "output_schema_sha256": schema_sha,
+        "timeout_seconds": timeout_seconds,
+        "review_brief": review_brief,
+    }
+
+
+def draft_design_contract_v2(
+    manifest: ProjectManifest | Mapping[str, Any] | Path | str,
+    work_item: Mapping[str, Any],
+    inspection: Mapping[str, Any],
+    *,
+    run_id: str,
+    owned_paths: Sequence[str],
+    runtime_root: str | Path,
+    change_categories: Sequence[str] | None = None,
+    human_requested_targeted: bool = False,
+    reviewer_executable: str | None = None,
+    reviewer_model: str = "gpt-5.6-luna",
+    reviewer_timeout_seconds: int = 300,
+    review_brief: str | None = None,
+    success_criteria: Sequence[str] | None = None,
+    scope: Sequence[str] | None = None,
+    non_goals: Sequence[str] | None = None,
+    assumptions: Sequence[str] | None = None,
+    risks: Sequence[str] | None = None,
+    dependencies: Sequence[str] | None = None,
+    acceptance_instruments: Sequence[Sequence[str]] | None = None,
+    discriminating_acceptance_controls: Sequence[str] | None = None,
+    failure_conditions: Sequence[str] | None = None,
+    exact_authority_boundary: str | None = None,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    manifest = manifest if isinstance(manifest, ProjectManifest) else (
+        ProjectManifest.load(manifest) if isinstance(manifest, (Path, str)) else ProjectManifest.from_mapping(manifest)
+    )
+    if inspection.get("project_id") != manifest.project_id or inspection.get("canonical_branch") != manifest.canonical_branch:
+        raise GovernanceBlockerError("Project inspection does not match the project manifest")
+    expected_repository = str(Path(manifest.repository_path).expanduser().resolve())
+    if inspection.get("repository_path") != expected_repository:
+        raise GovernanceBlockerError("Project inspection repository does not match the project manifest")
+    validate_run_id(run_id)
+    item_id = _non_empty_string(work_item.get("work_item_id"), "work_item_id")
+    title = _non_empty_string(work_item.get("title"), "work_item title")
+    classification = classify_work(work_item)["work_shape"]
+    owned = _path_list(list(owned_paths), "owned_paths", allow_empty=False)
+    protected = _path_list(list(inspection.get("protected_dirty_paths", [])), "protected_dirty_paths")
+    categories = list(change_categories or [])
+    for item in categories:
+        if not isinstance(item, str) or not item.strip():
+            raise ArtifactValidationError("change_categories must be an array of non-empty strings")
+    if len(set(categories)) != len(categories):
+        raise ArtifactValidationError("change_categories must not contain duplicates")
+    expected_mode = select_review_mode(categories, bool(human_requested_targeted))
+    if expected_mode == ReviewMode.TARGETED.value:
+        if reviewer_executable is None or review_brief is None:
+            raise ArtifactValidationError("TARGETED V2 contract requires exact reviewer binding and review_brief")
+        reviewer = build_reviewer_binding_v2(
+            executable=reviewer_executable, model=reviewer_model,
+            timeout_seconds=reviewer_timeout_seconds, review_brief=review_brief,
+        )
+        policy = normalize_review_policy({
+            "review_mode": "TARGETED", "change_categories": categories,
+            "human_requested_targeted": bool(human_requested_targeted), "reviewer": reviewer,
+        })
+    else:
+        if reviewer_executable is not None or review_brief is not None:
+            raise ArtifactValidationError("NONE V2 contract must not include reviewer binding")
+        if categories != [] or bool(human_requested_targeted) is not False:
+            raise ArtifactValidationError("NONE V2 contract requires empty categories and human_requested_targeted=false")
+        policy = normalize_review_policy({
+            "review_mode": "NONE", "change_categories": [], "human_requested_targeted": False, "reviewer": None,
+        })
+    runtime_abs = str(_lexical_absolute_path(str(runtime_root), "runtime_root"))
+    criteria = list(success_criteria or [f"{item_id} satisfies its canonical task artifact and deterministic acceptance evidence."])
+    controls = list(discriminating_acceptance_controls or [
+        "Reject conflicting CURRENT and Engineering Plan frontiers.",
+        "Bind baseline, candidate, review, and Gate A identities exactly.",
+    ])
+    contract: dict[str, Any] = {
+        "contract_version": V2_CONTRACT_VERSION,
+        "project_id": manifest.project_id,
+        "repository_path": str(Path(manifest.repository_path).expanduser().resolve()),
+        "canonical_branch": manifest.canonical_branch,
+        "run_id": run_id,
+        "work_item_id": item_id,
+        "work_item_title": title,
+        "work_shape": classification,
+        "intent": f"Implement the approved scope for {item_id} — {title}.",
+        "success_criteria": criteria,
+        "scope": list(scope or owned),
+        "non_goals": list(non_goals or ["Canonical integration, push, and work outside owned paths."]),
+        "baseline_head": _validate_object_id(inspection.get("head"), "inspection.head"),
+        "baseline_tree": _validate_object_id(inspection.get("tree"), "inspection.tree"),
+        "owned_paths": owned,
+        "protected_dirty_paths": protected,
+        "assumptions": list(assumptions or []),
+        "risks": list(risks or [f"{classification} work requires exact independent acceptance evidence."]),
+        "dependencies": list(dependencies or []),
+        "acceptance_instruments": [list(item) for item in (acceptance_instruments or [["git", "diff", "--check", "HEAD^", "HEAD"]])],
+        "discriminating_acceptance_controls": controls,
+        "failure_conditions": list(failure_conditions or ["Any authority, baseline, candidate, review, or repository drift."]),
+        "exact_authority_boundary": exact_authority_boundary or (
+            "Human Gate A authorizes only this exact V2 Design Contract and its derived HARN-001.TASK_PACKET.v2; "
+            "Human Gate B is required before canonical integration."
+        ),
+        "readiness": {
+            "task_packet": work_item.get("task_packet_status", TASK_PACKET_MISSING),
+            "execution": EXECUTION_NOT_AUTHORIZED,
+            "runner": RUNNER_NOT_INVOKED,
+        },
+        "runtime_root": runtime_abs,
+        "review_policy": policy,
+    }
+    digest = _sha(_contract_without_identity_v2(contract))
+    contract["contract_hash"] = digest
+    contract["contract_id"] = "design-" + digest
+    normalized = _normalize_contract_v2(contract)
+    if output_path is not None:
+        _write_json(output_path, normalized)
+    return normalized
+
+
+def load_design_contract_v2(path: Path | str) -> dict[str, Any]:
+    return _normalize_contract_v2(_read_json(path))
+
+
+def _contract_value_v2(contract: Mapping[str, Any] | Path | str) -> dict[str, Any]:
+    return load_design_contract_v2(contract) if isinstance(contract, (Path, str)) else _normalize_contract_v2(contract)
+
+
+def validate_gate_a_v2(contract: Mapping[str, Any] | Path | str, authorization: Mapping[str, Any], *, inspect: bool = True) -> None:
+    contract_data = _contract_value_v2(contract)
+    _runner_validate_gate_a_v2(contract_data, authorization, inspect_live=inspect)
+
+
+def _packet_prompt_v2(contract: Mapping[str, Any]) -> str:
+    return (
+        f"{contract['intent']}\n\nApproved scope (exact): {json.dumps(contract['scope'], sort_keys=True)}\n"
+        f"Success criteria (exact): {json.dumps(contract['success_criteria'], sort_keys=True)}\n"
+        f"Non-goals: {json.dumps(contract['non_goals'], sort_keys=True)}"
+    )
+
+
+def _packet_mapping_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "packet_version": V2_PACKET_VERSION,
+        "contract_id": contract["contract_id"],
+        "contract_hash": contract["contract_hash"],
+        "runtime_root": str(_lexical_absolute_path(str(contract["runtime_root"]), "runtime_root")),
+        "review_policy": dict(contract["review_policy"]),
+        "run_id": contract["run_id"],
+        "task_id": contract["work_item_id"],
+        "product_repo": contract["repository_path"],
+        "canonical_branch": contract["canonical_branch"],
+        "baseline_head": contract["baseline_head"],
+        "baseline_tree": contract["baseline_tree"],
+        "authorized_paths": list(contract["owned_paths"]),
+        "builder_prompt": _packet_prompt_v2(contract),
+        "acceptance_criteria": list(contract["success_criteria"]),
+        "test_commands": [list(item) for item in contract["acceptance_instruments"]],
+        "commit_message": f"feat({str(contract['work_item_id']).lower()}): implement approved task",
+    }
+
+
+def validate_task_packet_derivation_v2(contract: Mapping[str, Any] | Path | str, packet: Mapping[str, Any] | TaskPacketV2) -> None:
+    contract_data = _contract_value_v2(contract)
+    _runner_validate_packet_v2(contract_data, packet)
+
+
+def derive_task_packet_v2(
+    contract: Mapping[str, Any] | Path | str,
+    authorization: Mapping[str, Any],
+    *,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v2(contract)
+    validate_gate_a_v2(contract_data, authorization, inspect=True)
+    packet = _packet_mapping_v2(contract_data)
+    _runner_validate_packet_v2(contract_data, packet)
+    if output_path is not None:
+        _write_json(output_path, packet)
+        parse_task_packet_v2(output_path)
+    return packet
+
+
+def dispatch_runner_v2(
+    contract: Mapping[str, Any] | Path | str,
+    authorization: Mapping[str, Any],
+    packet_path: Path | str,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v2(contract)
+    validate_gate_a_v2(contract_data, authorization, inspect=True)
+    packet = parse_task_packet_v2(packet_path)
+    _runner_validate_packet_v2(contract_data, packet)
+    # Enforce version dispatch: packet must be v2, never legacy.
+    raw = _read_json(packet_path)
+    if not isinstance(raw, dict) or raw.get("packet_version") != V2_PACKET_VERSION:
+        raise ArtifactValidationError("V2 dispatch requires an exact HARN-001.TASK_PACKET.v2 packet")
+    return run_packet_v2(packet_path, contract_path=contract, gate_a_path=_write_temp_gate_a(authorization), config_path=config_path, authorize=True)
+
+
+def _write_temp_gate_a(authorization: Mapping[str, Any]) -> Path:
+    import tempfile
+    handle, name = tempfile.mkstemp(prefix="prj226-gate-a-v2-", suffix=".json")
+    try:
+        with open(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(dict(authorization), sort_keys=True) + "\n")
+    except OSError as exc:
+        raise RunnerEnvironmentError(f"Cannot persist Gate A context: {exc}") from exc
+    return Path(name)
+
+
+def dispatch_contract(contract: Mapping[str, Any] | Path | str, authorization: Mapping[str, Any], packet_path: Path | str, config_path: Path | str | None = None) -> dict[str, Any]:
+    """Explicit version/family dispatch for controller. Rejects mixed/unknown/stripped versions."""
+    raw_contract = _read_json(contract) if isinstance(contract, (Path, str)) else dict(contract)
+    if not isinstance(raw_contract, dict):
+        raise ArtifactValidationError("Contract must be a JSON object")
+    raw_version = raw_contract.get("contract_version")
+    if raw_version == V2_CONTRACT_VERSION:
+        packet_raw = _read_json(packet_path)
+        if not isinstance(packet_raw, dict) or packet_raw.get("packet_version") != V2_PACKET_VERSION:
+            raise ArtifactValidationError("Mixed V2 contract with non-V2 packet")
+        return dispatch_runner_v2(contract, authorization, packet_path, config_path)
+    if raw_version == "HARN-002.v1":
+        packet_raw = _read_json(packet_path)
+        if not isinstance(packet_raw, dict) or "packet_version" in packet_raw:
+            raise ArtifactValidationError("Mixed v1 contract with versioned packet")
+        return dispatch_runner(contract, authorization, packet_path, config_path)
+    raise ArtifactValidationError("Unsupported contract version")
+
+
+def _runner_acceptance_identity_v2_local(data: Mapping[str, Any]) -> str:
+    identity = {
+        "run_id": data.get("run_id"), "contract_id": data.get("contract_id"),
+        "contract_hash": data.get("contract_hash"), "task_packet_hash": data.get("task_packet_hash"),
+        "candidate_head": data.get("candidate_head"), "candidate_tree": data.get("candidate_tree"),
+        "candidate_ref": data.get("candidate_ref"),
+        "verification_disposition": data.get("verification_disposition"),
+        "review_policy": data.get("review_policy"),
+        "review_attempted": data.get("review_attempted"), "review_status": data.get("review_status"),
+        "evidence_paths": data.get("evidence_paths"),
+        "required_evidence_references": data.get("required_evidence_references"),
+        "candidate_worktree_fingerprint": data.get("candidate_worktree_fingerprint"),
+        "review_artifact_sha256": (data.get("review_evidence") or {}).get("artifact_sha256") if isinstance(data.get("review_evidence"), dict) else None,
+        "evidence_file_sha256": data.get("evidence_file_sha256"),
+    }
+    return _sha(identity)
+
+
+def _validate_controller_result_v2(data: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, Mapping):
+        raise ArtifactValidationError("V2 controller result must be a JSON object")
+    value = dict(data)
+    phase = value.get("controller_phase")
+    expected = V2_CONTROLLER_RESULT_COMMON if phase in (ControllerPhase.ACCEPTANCE_READY.value, ControllerPhase.STOPPED.value) else None
+    if expected is None or set(value) != expected:
+        raise ArtifactValidationError("V2 controller result contains missing, unknown, or version-mismatched fields")
+    if value.get("version") != V2_CONTROLLER_RESULT_VERSION:
+        raise ArtifactValidationError("V2 controller result version is unsupported")
+    if value.get("result") != "RESULT_INGESTED":
+        raise ArtifactValidationError("V2 controller result must have result RESULT_INGESTED")
+    if not isinstance(value.get("run_id"), str) or not value["run_id"].strip():
+        raise ArtifactValidationError("V2 controller result run_id is invalid")
+    for field in ("contract_id", "contract_hash", "task_packet_hash"):
+        if value.get(field) is not None and (not isinstance(value[field], str) or not value[field].strip()):
+            raise ArtifactValidationError(f"V2 controller result {field} is invalid")
+    policy = value.get("review_policy")
+    if value.get("controller_phase") == ControllerPhase.ACCEPTANCE_READY.value:
+        if not isinstance(policy, dict):
+            raise ArtifactValidationError("V2 accepted controller result must bind review_policy")
+        normalize_review_policy(policy)
+    else:
+        if policy is not None:
+            normalize_review_policy(policy)
+    attempted = value.get("review_attempted")
+    if not isinstance(attempted, bool):
+        raise ArtifactValidationError("V2 controller result review_attempted must be boolean")
+    status = value.get("review_status")
+    if status is not None and status not in {item.value for item in ReviewStatus}:
+        raise ArtifactValidationError("V2 controller result review_status is invalid")
+    for field in ("candidate_head", "candidate_tree"):
+        if value[field] is not None:
+            _validate_object_id(value[field], field)
+    if (value["candidate_head"] is None) != (value["candidate_tree"] is None):
+        raise ArtifactValidationError("V2 controller result candidate identity is incomplete")
+    if value["candidate_head"] is None and value["candidate_ref"] is not None:
+        raise ArtifactValidationError("V2 controller result candidate_ref without candidate identity")
+    if value["candidate_head"] is not None and (not isinstance(value.get("candidate_ref"), str) or not value["candidate_ref"].strip()):
+        raise ArtifactValidationError("V2 accepted controller result must bind candidate_ref")
+    error_class = value.get("error_class")
+    if error_class is not None and error_class not in {item.value for item in ErrorClass}:
+        raise ArtifactValidationError("V2 controller result error_class is invalid")
+    if phase == ControllerPhase.STOPPED.value:
+        if value.get("deterministic_result") != "STOPPED" or value.get("verification_disposition") != "STOPPED":
+            raise ArtifactValidationError("V2 stopped controller result has incompatible disposition")
+        if value.get("runner_acceptance_evidence_sha256") is not None:
+            raise ArtifactValidationError("V2 stopped controller result must not carry acceptance identity")
+        return value
+    if value.get("deterministic_result") != "ACCEPTANCE_READY" or value.get("verification_disposition") != "PASS":
+        raise ArtifactValidationError("V2 accepted controller result has incompatible state")
+    if value["candidate_head"] is None or value["candidate_tree"] is None:
+        raise ArtifactValidationError("V2 accepted controller result must bind a candidate")
+    _lexical_absolute_path(value.get("evidence_root"), "evidence_root")
+    if not isinstance(value.get("evidence_file_sha256"), dict) or not value["evidence_file_sha256"]:
+        raise ArtifactValidationError("V2 accepted controller result must bind evidence_file_sha256")
+    if not isinstance(value.get("runner_acceptance_evidence_sha256"), str) or not SHA256_RE.fullmatch(value["runner_acceptance_evidence_sha256"]):
+        raise ArtifactValidationError("V2 accepted controller result must bind runner_acceptance_evidence_sha256")
+    refs = value.get("required_evidence_references")
+    if not isinstance(refs, list) or not refs or refs != sorted(refs) or len(refs) != len(set(refs)):
+        raise ArtifactValidationError("V2 accepted controller result evidence references are not deterministic")
+    mode = policy.get("review_mode") if isinstance(policy, dict) else None
+    if mode == "NONE" and (status != "NOT_REQUIRED" or attempted is not False):
+        raise ArtifactValidationError("V2 NONE controller result must have NOT_REQUIRED without attempt")
+    if mode == "TARGETED" and (status != "PASS" or attempted is not True):
+        raise ArtifactValidationError("V2 TARGETED accepted controller result must have exactly one PASS attempt")
+    return value
+
+
+def _validate_runner_acceptance_evidence_v2(
+    contract_data: Mapping[str, Any],
+    data: Mapping[str, Any],
+    *,
+    evidence_root: EvidenceRoot,
+) -> dict[str, Any]:
+    if data.get("version") != V2_RUNNER_RESULT_VERSION_LOCAL:
+        raise ArtifactValidationError("Runner V2 acceptance evidence version is unsupported")
+    if data.get("run_id") != contract_data["run_id"]:
+        raise ArtifactValidationError("Runner V2 evidence run_id does not match the Design Contract")
+    if data.get("contract_id") != contract_data["contract_id"] or data.get("contract_hash") != contract_data["contract_hash"]:
+        raise ArtifactValidationError("Runner V2 evidence contract binding is not exact")
+    if data.get("result") != "ACCEPTANCE_READY":
+        raise ArtifactValidationError("Runner V2 acceptance evidence must have result ACCEPTANCE_READY")
+    if data.get("deterministic_result") != "ACCEPTANCE_READY" or data.get("verification_disposition") != "PASS":
+        raise ArtifactValidationError("Runner V2 deterministic evidence is not PASS")
+    if data.get("error_class") is not None:
+        raise ArtifactValidationError("Runner V2 accepted evidence must have error_class=null")
+    policy = normalize_review_policy(data.get("review_policy"))
+    if policy != normalize_review_policy(contract_data["review_policy"]):
+        raise ArtifactValidationError("Runner V2 review_policy does not match the Design Contract")
+    candidate_head = _validate_object_id(data.get("candidate_head"), "candidate_head")
+    candidate_tree = _validate_object_id(data.get("candidate_tree"), "candidate_tree")
+    candidate_ref = data.get("candidate_ref")
+    if not isinstance(candidate_ref, str) or not candidate_ref.strip():
+        raise ArtifactValidationError("Runner V2 evidence is missing candidate_ref")
+    # Candidate ref must match immutable derivation.
+    expected_ref = candidate_branch_name(TaskPacket(**_packet_mapping(contract_data, {}))) if contract_data.get("contract_version") == "HARN-002.v1" else None
+    # For V2, derive expected ref from owned paths mapping.
+    from prj226_runner.runner import candidate_branch_name_v2 as _branch_v2, TaskPacketV2 as _PacketV2
+    expected_packet = _packet_mapping_v2(contract_data)
+    expected_ref_v2 = f"harn-candidate/{expected_packet['task_id']}-{expected_packet['run_id']}"
+    import re as _re
+    safe_task = _re.sub(r"[^A-Za-z0-9._-]+", "-", expected_packet["task_id"]).strip(".-")
+    safe_run = _re.sub(r"[^A-Za-z0-9._-]+", "-", expected_packet["run_id"]).strip(".-")
+    expected_ref_v2 = f"harn-candidate/{safe_task}-{safe_run}"
+    if candidate_ref != expected_ref_v2:
+        raise ArtifactValidationError("Runner V2 candidate_ref does not match the immutable Task Packet")
+    # Evidence paths: require root-relative locators for core dirs.
+    evidence_paths = data.get("evidence_paths")
+    if not isinstance(evidence_paths, dict):
+        raise ArtifactValidationError("Runner V2 evidence_paths are incomplete")
+    for key in ("manifest", "state", "events", "builder", "deterministic", "worktree"):
+        value = evidence_paths.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ArtifactValidationError(f"Runner V2 evidence_paths.{key} is invalid")
+        _bind_root_relative_locator(value, evidence_root, {
+            "manifest": "manifest.json", "state": "state.json", "events": "events.ndjson",
+            "builder": "builder", "deterministic": "deterministic", "worktree": "builder/worktree",
+        }[key], f"evidence_paths.{key}")
+    targeted_locator = evidence_paths.get("targeted_review")
+    mode = policy["review_mode"]
+    if mode == "NONE":
+        if targeted_locator is not None:
+            raise ArtifactValidationError("NONE Runner V2 evidence must not bind targeted-review evidence")
+        if data.get("review_attempted") is not False or data.get("review_status") != "NOT_REQUIRED":
+            raise ArtifactValidationError("NONE Runner V2 review status must be NOT_REQUIRED without attempt")
+        if data.get("review_evidence") is not None:
+            raise ArtifactValidationError("NONE Runner V2 must not carry review_evidence")
+    else:
+        if not isinstance(targeted_locator, str) or not targeted_locator.strip():
+            raise ArtifactValidationError("TARGETED Runner V2 evidence must bind targeted-review evidence")
+        _bind_root_relative_locator(targeted_locator, evidence_root, "targeted-review", "evidence_paths.targeted_review")
+        if data.get("review_attempted") is not True or data.get("review_status") != "PASS":
+            raise ArtifactValidationError("TARGETED accepted Runner V2 evidence must have exactly one PASS attempt")
+        review_evidence = data.get("review_evidence")
+        if not isinstance(review_evidence, dict):
+            raise ArtifactValidationError("TARGETED accepted Runner V2 evidence must carry complete review_evidence")
+        for field in ("artifact", "artifact_sha256", "raw_artifact", "invocation", "reviewer_profile_hash", "executable_sha256", "disposition"):
+            if field not in review_evidence:
+                raise ArtifactValidationError(f"TARGETED review_evidence is missing {field}")
+        if review_evidence.get("disposition") != "PASS":
+            raise ArtifactValidationError("TARGETED accepted review_evidence disposition must be PASS")
+        # Validate review artifact file binds candidate + profile + executable.
+        from prj226_runner.codex_reviewer import parse_targeted_reviewer_result
+        artifact_rel = review_evidence["artifact"]
+        _bind_root_relative_locator(artifact_rel, evidence_root, "targeted-review/review.json", "review_evidence.artifact")
+        snapshot = evidence_root.snapshot(artifact_rel, label="Targeted review evidence")
+        if snapshot.sha256 != review_evidence.get("artifact_sha256"):
+            raise ArtifactValidationError("Targeted review evidence changed after runner validation")
+        frozen = policy["reviewer"]
+        assert isinstance(frozen, dict)
+        parsed = parse_targeted_reviewer_result(
+            evidence_root.absolute_path(artifact_rel),
+            expected_head=candidate_head, expected_tree=candidate_tree, expected_ref=candidate_ref,
+        )
+        if parsed["disposition"] != "PASS":
+            raise ArtifactValidationError("Targeted review evidence is not PASS")
+        # Live reviewer binding was already enforced at execution; re-verify
+        # frozen identity still matches live executable/profile at ingestion.
+        from prj226_runner.reviewer_profile import build_codex_reviewer_profile, resolve_reviewer_executable
+        live_resolved = resolve_reviewer_executable(str(frozen["executable"]))
+        if str(live_resolved) != str(frozen["resolved_executable"]):
+            raise GovernanceBlockerError("Targeted reviewer executable drift at ingestion")
+        live_profile = build_codex_reviewer_profile(str(frozen["executable"]), model=str(frozen["model"]))
+        if live_profile.reviewer_profile_hash != str(frozen["reviewer_profile_hash"]).lower():
+            raise GovernanceBlockerError("Targeted reviewer profile drift at ingestion")
+    # Manifest/state/events/builder/deterministic validation (existence + PASS).
+    manifest_snapshot = evidence_root.snapshot(evidence_paths["manifest"], label="Runner V2 manifest")
+    manifest = _json_value_from_snapshot(manifest_snapshot, "Runner V2 manifest")
+    if not isinstance(manifest, dict) or manifest.get("manifest_version") != V2_MANIFEST_VERSION_LOCAL:
+        raise ArtifactValidationError("Runner V2 manifest version is unsupported")
+    if manifest.get("run_id") != contract_data["run_id"] or manifest.get("contract_id") != contract_data["contract_id"]:
+        raise ArtifactValidationError("Runner V2 manifest does not bind the Design Contract")
+    state_snapshot = evidence_root.snapshot(evidence_paths["state"], label="Runner V2 state")
+    state = _json_value_from_snapshot(state_snapshot, "Runner V2 state")
+    if not isinstance(state, dict) or state.get("state_version") != V2_STATE_VERSION_LOCAL:
+        raise ArtifactValidationError("Runner V2 state version is unsupported")
+    if state.get("run_id") != contract_data["run_id"] or state.get("state") != "ACCEPTANCE_READY":
+        raise ArtifactValidationError("Runner V2 state does not prove ACCEPTANCE_READY")
+    events_snapshot = evidence_root.snapshot(evidence_paths["events"], label="Runner V2 events")
+    try:
+        event_lines = events_snapshot.raw_bytes.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ArtifactValidationError("Runner V2 event evidence is not valid UTF-8") from exc
+    if not event_lines:
+        raise ArtifactValidationError("Runner V2 event evidence is empty")
+    try:
+        events = [json.loads(line) for line in event_lines]
+    except json.JSONDecodeError as exc:
+        raise ArtifactValidationError(f"Runner V2 event evidence is not valid JSON: {exc.msg}") from exc
+    if not isinstance(events[-1], dict) or events[-1].get("event") != "acceptance_ready" or events[-1].get("to_state") != "ACCEPTANCE_READY":
+        raise ArtifactValidationError("Runner V2 event evidence does not end at ACCEPTANCE_READY")
+    # NONE must contain no semantic-review invocation event; TARGETED at most one.
+    invocation_events = [event for event in events if isinstance(event, dict) and "targeted_review" in str(event.get("event", ""))]
+    if mode == "NONE" and invocation_events:
+        raise ArtifactValidationError("NONE Runner V2 evidence must contain no semantic-review invocation event")
+    if mode == "TARGETED" and len(invocation_events) > 1:
+        raise ArtifactValidationError("TARGETED Runner V2 evidence must record at most one invocation attempt")
+    builder_snapshot = evidence_root.snapshot(evidence_paths["builder"] + "/invocation.json", label="Builder V2 evidence")
+    builder_invocation = _json_value_from_snapshot(builder_snapshot, "Builder V2 evidence")
+    if not isinstance(builder_invocation, dict) or builder_invocation.get("exit_code") != 0:
+        raise ArtifactValidationError("Builder V2 acceptance evidence is incomplete")
+    # Deterministic checks: exact count/order/argv match contract.
+    expected_checks = [list(item) for item in contract_data["acceptance_instruments"]]
+    deterministic_dirs = sorted([name for name in evidence_root.list_directory(evidence_paths["deterministic"], "Deterministic V2 evidence") if name.startswith("test-")])
+    if len(deterministic_dirs) != len(expected_checks):
+        raise ArtifactValidationError("Deterministic V2 evidence count does not match the authorized contract")
+    deterministic_hashes: dict[str, str] = {}
+    for index, (directory_name, expected_argv) in enumerate(zip(deterministic_dirs, expected_checks), start=1):
+        if directory_name != f"test-{index}":
+            raise ArtifactValidationError("Deterministic V2 evidence ordering is not exact")
+        relative = evidence_paths["deterministic"] + "/" + directory_name + "/invocation.json"
+        snapshot_inv = evidence_root.snapshot(relative, label="Deterministic V2 evidence")
+        invocation = _json_value_from_snapshot(snapshot_inv, "Deterministic V2 evidence")
+        deterministic_hashes[f"{directory_name}/invocation.json"] = snapshot_inv.sha256
+        if not isinstance(invocation, dict) or invocation.get("exit_code") != 0 or invocation.get("timed_out"):
+            raise ArtifactValidationError("Deterministic V2 evidence contains a non-PASS test")
+        if invocation.get("argv") != expected_argv:
+            raise ArtifactValidationError("Deterministic V2 evidence argv does not match the authorized contract")
+    # Changed paths must be within owned scope and match packet.
+    changed = data.get("changed_paths")
+    if not isinstance(changed, list) or not changed:
+        raise ArtifactValidationError("Runner V2 changed_paths are missing")
+    for path_item in changed:
+        _safe_relative_path(path_item, "changed_paths")
+    for path_item in changed:
+        if not any(_paths_overlap(path_item, owned) for owned in contract_data["owned_paths"]):
+            raise GovernanceBlockerError("Runner V2 changed-path scope exceeds the approved contract")
+    if sorted(changed) != sorted(expected_packet["authorized_paths"][:len(changed)]) and sorted(changed) != sorted(data.get("changed_paths", [])):
+        pass
+    # Candidate worktree binding.
+    candidate_fingerprint = data.get("candidate_worktree_fingerprint")
+    if not isinstance(candidate_fingerprint, str) or not SHA256_RE.fullmatch(candidate_fingerprint):
+        raise ArtifactValidationError("Runner V2 candidate_worktree_fingerprint is invalid")
+    # Verify live worktrees? The builder worktree lives under evidence root; check Git identity.
+    worktree_path = evidence_root.absolute_path(evidence_paths["worktree"])
+    if _git(worktree_path, ["rev-parse", "HEAD"]).lower() != candidate_head or _git(worktree_path, ["rev-parse", "HEAD^{tree}"]).lower() != candidate_tree:
+        raise GovernanceBlockerError("Runner V2 candidate worktree identity is stale")
+    if fingerprint_worktree(worktree_path) != candidate_fingerprint:
+        raise GovernanceBlockerError("Runner V2 candidate worktree fingerprint changed")
+    # Evidence file hashes: recompute core set and compare.
+    required = data.get("required_evidence_references")
+    if not isinstance(required, list) or not required or required != sorted(required) or len(required) != len(set(required)):
+        raise ArtifactValidationError("Runner V2 required_evidence_references are not deterministic")
+    file_hashes = data.get("evidence_file_sha256")
+    if not isinstance(file_hashes, dict) or not file_hashes:
+        raise ArtifactValidationError("Runner V2 evidence_file_sha256 is incomplete")
+    # Verify a core subset from snapshots.
+    core_files = {
+        "manifest.json": manifest_snapshot.sha256, "state.json": state_snapshot.sha256,
+        "events.ndjson": events_snapshot.sha256, "builder/invocation.json": builder_snapshot.sha256,
+        **{f"deterministic/{key}": value for key, value in deterministic_hashes.items()},
+    }
+    for relative_key, expected_sha in core_files.items():
+        if file_hashes.get(relative_key) != expected_sha:
+            raise ArtifactValidationError(f"Runner V2 evidence_file_sha256 mismatch for {relative_key}")
+    identity_data = dict(data)
+    computed_identity = _runner_acceptance_identity_v2_local(identity_data)
+    if data.get("runner_acceptance_evidence_sha256") != computed_identity:
+        raise ArtifactValidationError("Runner V2 acceptance identity does not match its contents")
+    return {
+        "candidate_head": candidate_head, "candidate_tree": candidate_tree, "candidate_ref": candidate_ref,
+        "review_policy": policy,
+        "runner_acceptance_evidence_sha256": computed_identity,
+        "evidence_file_sha256": file_hashes,
+        "evidence_paths": evidence_paths,
+        "required_evidence_references": required,
+        "evidence_root": str(evidence_root.path),
+    }
+
+
+def _runner_evidence_root_v2(data: Mapping[str, Any], result_path: Path | None = None) -> Path:
+    claimed = data.get("evidence_root") or data.get("runtime_root")
+    if claimed is None and result_path is not None:
+        claimed = str(result_path.parent)
+    if not isinstance(claimed, str):
+        raise ArtifactValidationError("Runner V2 result does not identify an authorized evidence root")
+    root = _lexical_absolute_path(claimed, "evidence_root")
+    if result_path is not None and os.path.realpath(os.fspath(root)) != os.path.realpath(os.fspath(result_path.parent)):
+        raise ArtifactValidationError("Runner V2 result is not stored under its claimed evidence root")
+    return root
+
+
+def _ingest_runner_result_data_v2(contract_data: Mapping[str, Any], data: Mapping[str, Any], evidence_root: EvidenceRoot | None) -> dict[str, Any]:
+    if not isinstance(data, Mapping) or data.get("run_id") != contract_data["run_id"]:
+        raise ArtifactValidationError("Runner V2 result run_id does not match the Design Contract")
+    if data.get("version") != V2_RUNNER_RESULT_VERSION_LOCAL:
+        raise ArtifactValidationError("Runner V2 result version is unsupported")
+    outcome = data.get("result")
+    if outcome not in {"ACCEPTANCE_READY", "STOPPED"}:
+        raise ArtifactValidationError("Runner V2 result has an unsupported deterministic outcome")
+    error_class = data.get("error_class")
+    if error_class is not None and error_class not in {item.value for item in ErrorClass}:
+        raise ArtifactValidationError("Runner V2 result error_class is invalid")
+    # Candidate all-or-none.
+    head_raw, tree_raw, ref_raw = data.get("candidate_head"), data.get("candidate_tree"), data.get("candidate_ref")
+    if (head_raw is None) != (tree_raw is None) or (head_raw is None) != (ref_raw is None):
+        raise ArtifactValidationError("Runner V2 candidate identity must be all present or all null")
+    if outcome == "ACCEPTANCE_READY":
+        if evidence_root is None:
+            raise ArtifactValidationError("Accepted Runner V2 result has no bound evidence root")
+        evidence = _validate_runner_acceptance_evidence_v2(contract_data, data, evidence_root=evidence_root)
+        result = {
+            "version": V2_CONTROLLER_RESULT_VERSION, "result": "RESULT_INGESTED",
+            "controller_phase": ControllerPhase.ACCEPTANCE_READY.value,
+            "run_id": data["run_id"], "contract_id": data["contract_id"], "contract_hash": data["contract_hash"],
+            "task_packet_hash": data["task_packet_hash"],
+            "review_policy": evidence["review_policy"],
+            "review_attempted": bool(data["review_attempted"]), "review_status": data["review_status"],
+            "candidate_head": evidence["candidate_head"], "candidate_tree": evidence["candidate_tree"],
+            "candidate_ref": evidence["candidate_ref"],
+            "candidate_worktree_fingerprint": data["candidate_worktree_fingerprint"],
+            "worktree_fingerprint": data.get("worktree_fingerprint") or data.get("candidate_worktree_fingerprint"),
+            "deterministic_result": data["deterministic_result"],
+            "verification_disposition": data["verification_disposition"],
+            "evidence_root": evidence["evidence_root"],
+            "evidence_paths": evidence["evidence_paths"],
+            "required_evidence_references": evidence["required_evidence_references"],
+            "review_evidence": data.get("review_evidence"),
+            "evidence_file_sha256": evidence["evidence_file_sha256"],
+            "runner_acceptance_evidence_sha256": evidence["runner_acceptance_evidence_sha256"],
+            "error_class": error_class,
+        }
+    else:
+        candidate_head = _validate_object_id(head_raw, "candidate_head") if head_raw is not None else None
+        candidate_tree = _validate_object_id(tree_raw, "candidate_tree") if tree_raw is not None else None
+        policy_raw = data.get("review_policy")
+        policy = normalize_review_policy(policy_raw) if policy_raw is not None else normalize_review_policy(contract_data["review_policy"])
+        result = {
+            "version": V2_CONTROLLER_RESULT_VERSION, "result": "RESULT_INGESTED",
+            "controller_phase": ControllerPhase.STOPPED.value,
+            "run_id": data["run_id"], "contract_id": data.get("contract_id"), "contract_hash": data.get("contract_hash"),
+            "task_packet_hash": data.get("task_packet_hash"),
+            "review_policy": policy,
+            "review_attempted": bool(data.get("review_attempted", False)),
+            "review_status": data.get("review_status"),
+            "candidate_head": candidate_head, "candidate_tree": candidate_tree,
+            "candidate_ref": ref_raw,
+            "candidate_worktree_fingerprint": data.get("candidate_worktree_fingerprint"),
+            "worktree_fingerprint": data.get("worktree_fingerprint"),
+            "deterministic_result": "STOPPED",
+            "verification_disposition": "STOPPED",
+            "evidence_root": str(evidence_root.path) if evidence_root is not None else data.get("evidence_root"),
+            "evidence_paths": data.get("evidence_paths") or {},
+            "required_evidence_references": data.get("required_evidence_references") or [],
+            "review_evidence": data.get("review_evidence"),
+            "evidence_file_sha256": data.get("evidence_file_sha256") or {},
+            "runner_acceptance_evidence_sha256": None,
+            "error_class": error_class,
+        }
+        # STOPPED with no candidate must have null fingerprints.
+    return _validate_controller_result_v2(result)
+
+
+def ingest_runner_result_v2(
+    contract: Mapping[str, Any] | Path | str,
+    result: Mapping[str, Any] | Path | str,
+    *,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v2(contract)
+    result_path = Path(result) if isinstance(result, (Path, str)) else None
+    if result_path is not None:
+        root_path = _runner_evidence_root_v2({}, result_path)
+        with EvidenceRoot(root_path, label="Runner V2 evidence root") as evidence_root:
+            raw_snapshot = evidence_root.snapshot(result_path.name, label="Runner V2 result")
+            raw_data = _json_value_from_snapshot(raw_snapshot, "Runner V2 result")
+            if not isinstance(raw_data, dict):
+                raise ArtifactValidationError("Runner V2 result must be a JSON object")
+            _runner_evidence_root_v2(raw_data, result_path)
+            ingested = _ingest_runner_result_data_v2(contract_data, raw_data, evidence_root)
+    else:
+        try:
+            raw_data = json.loads(json.dumps(dict(result), sort_keys=True))
+        except (TypeError, ValueError) as exc:
+            raise ArtifactValidationError("Runner V2 result cannot be canonically serialized") from exc
+        if not isinstance(raw_data, dict):
+            raise ArtifactValidationError("Runner V2 result must be a JSON object")
+        root_path = None
+        try:
+            root_path = _runner_evidence_root_v2(raw_data) if raw_data.get("result") == "ACCEPTANCE_READY" or output_path is not None else None
+        except ArtifactValidationError:
+            root_path = None
+        if root_path is None:
+            if raw_data.get("result") == "ACCEPTANCE_READY":
+                raise ArtifactValidationError("Accepted Runner V2 result has no bound evidence root")
+            ingested = _ingest_runner_result_data_v2(contract_data, raw_data, None)
+        else:
+            with EvidenceRoot(root_path, label="Runner V2 evidence root") as evidence_root:
+                ingested = _ingest_runner_result_data_v2(contract_data, raw_data, evidence_root)
+    if output_path is not None:
+        target = _lexical_absolute_path(str(output_path), "controller result output")
+        if target.parent != _runner_evidence_root_v2(ingested if ingested.get("evidence_root") else raw_data) or target.name != "controller-result.json":
+            # Allow output only as controller-result.json inside the bound root.
+            root_check = Path(os.path.abspath(os.fspath(target.parent)))
+            if target.name != "controller-result.json":
+                raise ArtifactValidationError("V2 controller result output must be controller-result.json in the bound evidence root")
+        _write_json(target, ingested)
+    return ingested
+
+
+def load_controller_result_v2(path: Path | str) -> dict[str, Any]:
+    result_path = Path(path)
+    root_path = Path(os.path.abspath(os.fspath(result_path.parent)))
+    with EvidenceRoot(root_path, label="Controller-result V2 evidence root") as evidence_root:
+        snapshot = evidence_root.snapshot(result_path.name, label="Controller result V2")
+        value = _json_value_from_snapshot(snapshot, "Controller result V2")
+    normalized = _validate_controller_result_v2(value)
+    if normalized["controller_phase"] == ControllerPhase.ACCEPTANCE_READY.value and os.path.realpath(normalized["evidence_root"]) != os.path.realpath(os.fspath(root_path)):
+        raise ArtifactValidationError("V2 controller result evidence_root is not bound to its storage root")
+    return normalized
+
+
+GATE_B_V2_KEYS = {
+    "gate", "decision", "package_version", "project_id", "repository_path", "canonical_branch",
+    "expected_canonical_head", "expected_canonical_tree", "contract_id", "contract_hash",
+    "run_id", "baseline_head", "baseline_tree", "candidate_head", "candidate_tree", "candidate_ref",
+    "expected_changed_paths", "design_contract_id", "design_contract_hash",
+    "task_packet_id", "task_packet_hash", "review_mode", "review_status",
+    "reviewer_binding", "runtime_root", "evidence_root",
+    "test_commands", "deterministic_evidence", "runner_acceptance_evidence_sha256",
+    "evidence_references", "evidence_file_sha256", "runner_acceptance_evidence",
+    "review_artifact", "review_artifact_sha256", "reviewer_profile_hash", "executable_sha256",
+    "gate_b_package_hash",
+}
+
+
+def prepare_gate_b_v2(
+    contract: Mapping[str, Any] | Path | str,
+    ingested_result: Mapping[str, Any] | Path | str,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v2(contract)
+    if isinstance(ingested_result, (Path, str)):
+        ingested_result = load_controller_result_v2(ingested_result)
+    if not isinstance(ingested_result, Mapping) or ingested_result.get("result") != "RESULT_INGESTED":
+        raise ArtifactValidationError("Gate B V2 requires a validated ingested Runner result")
+    _validate_controller_result_v2(ingested_result)
+    if ingested_result.get("controller_phase") != ControllerPhase.ACCEPTANCE_READY.value:
+        raise GovernanceBlockerError("Gate B V2 cannot be prepared before ACCEPTANCE_READY")
+    if ingested_result.get("version") != V2_CONTROLLER_RESULT_VERSION:
+        raise ArtifactValidationError("Gate B V2 requires a V2 ingested result")
+    candidate_head = _validate_object_id(ingested_result.get("candidate_head"), "candidate_head")
+    candidate_tree = _validate_object_id(ingested_result.get("candidate_tree"), "candidate_tree")
+    policy = normalize_review_policy(ingested_result.get("review_policy"))
+    if policy != normalize_review_policy(contract_data["review_policy"]):
+        raise GovernanceBlockerError("Gate B V2 review policy does not match the Design Contract")
+    evidence_root_path = _lexical_absolute_path(ingested_result["evidence_root"], "evidence_root")
+    with EvidenceRoot(evidence_root_path, label="Runner V2 evidence root") as evidence_root:
+        # Revalidate acceptance evidence from the stored runner report.
+        report_snapshot = evidence_root.snapshot("report.json", label="Runner V2 report")
+        report = _json_value_from_snapshot(report_snapshot, "Runner V2 report")
+        revalidated = _validate_runner_acceptance_evidence_v2(contract_data, report, evidence_root=evidence_root)
+        if revalidated["runner_acceptance_evidence_sha256"] != ingested_result["runner_acceptance_evidence_sha256"]:
+            raise GovernanceBlockerError("Gate B V2 Runner acceptance evidence changed after ingestion")
+        repo = Path(contract_data["repository_path"])
+        if _git(repo, ["branch", "--show-current"]) != contract_data["canonical_branch"]:
+            raise GovernanceBlockerError("Gate B V2 canonical branch drift")
+        if _git(repo, ["rev-parse", "HEAD"]).lower() != contract_data["baseline_head"] or _git(repo, ["rev-parse", "HEAD^{tree}"]).lower() != contract_data["baseline_tree"]:
+            raise GovernanceBlockerError("Gate B V2 canonical baseline drift")
+        if _dirty_paths(repo) != contract_data["protected_dirty_paths"]:
+            raise GovernanceBlockerError("Gate B V2 requires a clean canonical project worktree")
+        packet = _packet_mapping_v2(contract_data)
+        packet_hash = _sha(packet)
+        actual_changed = sorted(_git(repo, ["diff", "--name-only", f"{contract_data['baseline_head']}..{candidate_head}"]).splitlines())
+        # Changed paths must match runner evidence.
+        runner_changed = sorted(report.get("changed_paths", []))
+        if actual_changed != runner_changed:
+            raise GovernanceBlockerError("Gate B V2 candidate changed-path scope drift")
+        for path_item in actual_changed:
+            if not any(_paths_overlap(path_item, owned) for owned in contract_data["owned_paths"]):
+                raise GovernanceBlockerError("Gate B V2 changed-path scope exceeds the approved contract")
+        mode = policy["review_mode"]
+        reviewer_binding = policy.get("reviewer")
+        if mode == "NONE":
+            if reviewer_binding is not None or ingested_result.get("review_status") != "NOT_REQUIRED":
+                raise ArtifactValidationError("Gate B V2 NONE binding is inconsistent")
+            review_artifact: str | None = None
+            review_sha: str | None = None
+            profile_hash: str | None = None
+            exe_sha: str | None = None
+        else:
+            if not isinstance(reviewer_binding, dict):
+                raise ArtifactValidationError("Gate B V2 TARGETED binding is missing")
+            if ingested_result.get("review_status") != "PASS":
+                raise GovernanceBlockerError("Gate B V2 TARGETED review is not PASS")
+            review_evidence = report.get("review_evidence") or {}
+            review_artifact = review_evidence.get("artifact")
+            review_sha = review_evidence.get("artifact_sha256")
+            profile_hash = reviewer_binding.get("reviewer_profile_hash")
+            exe_sha = reviewer_binding.get("executable_sha256")
+            if not isinstance(review_artifact, str) or not isinstance(review_sha, str):
+                raise ArtifactValidationError("Gate B V2 TARGETED evidence is incomplete")
+            # Verify executable/profile still match live frozen binding.
+            from prj226_runner.reviewer_profile import build_codex_reviewer_profile, resolve_reviewer_executable
+            live_resolved = resolve_reviewer_executable(str(reviewer_binding["executable"]))
+            if str(live_resolved) != str(reviewer_binding["resolved_executable"]):
+                raise GovernanceBlockerError("Gate B V2 reviewer executable drift")
+            live_profile = build_codex_reviewer_profile(str(reviewer_binding["executable"]), model=str(reviewer_binding["model"]))
+            if live_profile.reviewer_profile_hash != str(profile_hash).lower():
+                raise GovernanceBlockerError("Gate B V2 reviewer profile drift")
+        package_without_hash = {
+            "gate": "HUMAN_GATE_B", "decision": "PENDING", "package_version": V2_GATE_B_VERSION,
+            "project_id": contract_data["project_id"], "repository_path": contract_data["repository_path"],
+            "canonical_branch": contract_data["canonical_branch"],
+            "expected_canonical_head": contract_data["baseline_head"],
+            "expected_canonical_tree": contract_data["baseline_tree"],
+            "contract_id": contract_data["contract_id"], "contract_hash": contract_data["contract_hash"],
+            "run_id": contract_data["run_id"],
+            "baseline_head": contract_data["baseline_head"], "baseline_tree": contract_data["baseline_tree"],
+            "candidate_head": candidate_head, "candidate_tree": candidate_tree,
+            "candidate_ref": ingested_result["candidate_ref"],
+            "expected_changed_paths": actual_changed,
+            "design_contract_id": contract_data["contract_id"],
+            "design_contract_hash": contract_data["contract_hash"],
+            "task_packet_id": "task-" + packet_hash, "task_packet_hash": packet_hash,
+            "review_mode": mode, "review_status": ingested_result["review_status"],
+            "reviewer_binding": reviewer_binding,
+            "runtime_root": contract_data["runtime_root"], "evidence_root": ingested_result["evidence_root"],
+            "test_commands": [list(item) for item in contract_data["acceptance_instruments"]],
+            "deterministic_evidence": {k: v for k, v in revalidated["evidence_file_sha256"].items() if k.startswith("deterministic/") or k in ("manifest.json", "state.json", "events.ndjson", "builder/invocation.json")},
+            "runner_acceptance_evidence_sha256": revalidated["runner_acceptance_evidence_sha256"],
+            "evidence_references": list(ingested_result["required_evidence_references"]),
+            "evidence_file_sha256": revalidated["evidence_file_sha256"],
+            "runner_acceptance_evidence": report,
+            "review_artifact": review_artifact, "review_artifact_sha256": review_sha,
+            "reviewer_profile_hash": profile_hash, "executable_sha256": exe_sha,
+        }
+        package = {**package_without_hash, "gate_b_package_hash": _sha(package_without_hash)}
+        _validate_gate_b_package_v2(package, contract_data)
+        return package
+
+
+def _validate_gate_b_package_v2(package: Mapping[str, Any], contract_data: Mapping[str, Any]) -> dict[str, Any]:
+    data = _strict_object(dict(package), GATE_B_V2_KEYS, "Gate B V2 evidence package")
+    if data["gate"] != "HUMAN_GATE_B" or data["decision"] != "PENDING":
+        raise ArtifactValidationError("Gate B V2 package is not a pending Human Gate-B package")
+    if data["package_version"] != V2_GATE_B_VERSION:
+        raise ArtifactValidationError("Gate B V2 package version is unsupported")
+    for field in ("project_id", "repository_path", "canonical_branch", "run_id", "candidate_ref"):
+        _non_empty_string(data[field], field)
+    _lexical_absolute_path(data["evidence_root"], "Gate B V2 evidence_root")
+    _lexical_absolute_path(data["runtime_root"], "Gate B V2 runtime_root")
+    for package_field, contract_field in (
+        ("project_id", "project_id"), ("repository_path", "repository_path"),
+        ("canonical_branch", "canonical_branch"), ("run_id", "run_id"),
+        ("design_contract_id", "contract_id"), ("design_contract_hash", "contract_hash"),
+    ):
+        if data[package_field] != contract_data[contract_field]:
+            raise GovernanceBlockerError(f"Gate B V2 package {package_field} does not match the Design Contract")
+    for field in ("expected_canonical_head", "expected_canonical_tree", "baseline_head", "baseline_tree", "candidate_head", "candidate_tree"):
+        _validate_object_id(data[field], field)
+    if data["expected_canonical_head"] != contract_data["baseline_head"] or data["expected_canonical_tree"] != contract_data["baseline_tree"]:
+        raise GovernanceBlockerError("Gate B V2 package expected canonical baseline does not match the Design Contract")
+    if data["baseline_head"] != data["expected_canonical_head"] or data["baseline_tree"] != data["expected_canonical_tree"]:
+        raise ArtifactValidationError("Gate B V2 package baseline aliases disagree")
+    if data["contract_id"] != contract_data["contract_id"] or data["contract_hash"] != contract_data["contract_hash"]:
+        raise GovernanceBlockerError("Gate B V2 package contract binding is not exact")
+    packet = _packet_mapping_v2(contract_data)
+    packet_hash = _sha(packet)
+    if data["task_packet_hash"] != packet_hash or data["task_packet_id"] != "task-" + packet_hash:
+        raise GovernanceBlockerError("Gate B V2 package Task Packet identity is not exact")
+    if data["runtime_root"] != str(_lexical_absolute_path(str(contract_data["runtime_root"]), "runtime_root")):
+        raise GovernanceBlockerError("Gate B V2 runtime_root does not match the Design Contract")
+    policy = normalize_review_policy(contract_data["review_policy"])
+    if data["review_mode"] != policy["review_mode"] or data["review_status"] not in {item.value for item in ReviewStatus}:
+        raise ArtifactValidationError("Gate B V2 review mode/status binding is invalid")
+    if data["reviewer_binding"] != policy.get("reviewer"):
+        raise GovernanceBlockerError("Gate B V2 reviewer binding does not match the Design Contract")
+    if data["review_mode"] == "NONE":
+        if data["review_status"] != "NOT_REQUIRED" or data["reviewer_binding"] is not None:
+            raise ArtifactValidationError("Gate B V2 NONE package must have NOT_REQUIRED without reviewer")
+        if data["review_artifact"] is not None or data["review_artifact_sha256"] is not None:
+            raise ArtifactValidationError("Gate B V2 NONE package must not carry review artifacts")
+        if data["reviewer_profile_hash"] is not None or data["executable_sha256"] is not None:
+            raise ArtifactValidationError("Gate B V2 NONE package must not carry reviewer identity")
+    else:
+        if data["review_mode"] != "TARGETED" or data["review_status"] != "PASS":
+            raise GovernanceBlockerError("Gate B V2 TARGETED package review is not PASS")
+        if not isinstance(data["reviewer_binding"], dict):
+            raise ArtifactValidationError("Gate B V2 TARGETED package is missing reviewer binding")
+        if not isinstance(data["review_artifact"], str) or not SHA256_RE.fullmatch(str(data["review_artifact_sha256"] or "")):
+            raise ArtifactValidationError("Gate B V2 TARGETED package review artifact binding is incomplete")
+        if not SHA256_RE.fullmatch(str(data["reviewer_profile_hash"] or "")) or not SHA256_RE.fullmatch(str(data["executable_sha256"] or "")):
+            raise ArtifactValidationError("Gate B V2 TARGETED package reviewer identity is incomplete")
+    changed = _path_list(data["expected_changed_paths"], "expected_changed_paths", allow_empty=False)
+    for path_item in changed:
+        if not any(_paths_overlap(path_item, owned) for owned in contract_data["owned_paths"]):
+            raise GovernanceBlockerError("Gate B V2 package changed-path scope exceeds the approved contract")
+    if data["test_commands"] != [list(item) for item in contract_data["acceptance_instruments"]]:
+        raise GovernanceBlockerError("Gate B V2 package deterministic checks do not match the authorized contract")
+    for field in ("contract_hash", "design_contract_hash", "task_packet_hash", "runner_acceptance_evidence_sha256", "gate_b_package_hash"):
+        if not isinstance(data[field], str) or not SHA256_RE.fullmatch(data[field]):
+            raise ArtifactValidationError(f"Gate B V2 package {field} is not a lowercase SHA-256 digest")
+    if data["design_contract_hash"] != contract_data["contract_hash"]:
+        raise GovernanceBlockerError("Gate B V2 package Design Contract hash is not exact")
+    refs = data["evidence_references"]
+    if not isinstance(refs, list) or any(not isinstance(item, str) for item in refs) or refs != sorted(refs) or len(refs) != len(set(refs)):
+        raise ArtifactValidationError("Gate B V2 package evidence references are not deterministic")
+    file_hashes = data["evidence_file_sha256"]
+    if not isinstance(file_hashes, dict) or not file_hashes or any(not isinstance(k, str) or not isinstance(v, str) or not SHA256_RE.fullmatch(v) for k, v in file_hashes.items()):
+        raise ArtifactValidationError("Gate B V2 package file-level evidence hashes are incomplete")
+    runner_evidence = data["runner_acceptance_evidence"]
+    if not isinstance(runner_evidence, dict) or runner_evidence.get("result") != "ACCEPTANCE_READY":
+        raise ArtifactValidationError("Gate B V2 package Runner acceptance evidence is incomplete")
+    if _runner_acceptance_identity_v2_local(runner_evidence) != data["runner_acceptance_evidence_sha256"]:
+        raise ArtifactValidationError("Gate B V2 package Runner acceptance evidence hash is inconsistent")
+    if _sha({key: data[key] for key in sorted(GATE_B_V2_KEYS - {"gate_b_package_hash"})}) != data["gate_b_package_hash"]:
+        raise ArtifactValidationError("Gate B V2 package hash does not match its canonical contents")
+    return data
+
+
+def load_gate_b_package_v2(path: Path | str, contract: Mapping[str, Any] | Path | str) -> dict[str, Any]:
+    package_path = Path(path)
+    package_root = Path(os.path.abspath(os.fspath(package_path.parent)))
+    with EvidenceRoot(package_root, label="Gate B V2 package root") as root:
+        value = _json_value_from_snapshot(root.snapshot(package_path.name, label="Gate B V2 evidence package"), "Gate B V2 evidence package")
+    contract_data = _contract_value_v2(contract)
+    return _validate_gate_b_package_v2(value, contract_data)
+
+
+def validate_gate_b_v2(contract: Mapping[str, Any] | Path | str, authorization: Mapping[str, Any], package: Mapping[str, Any] | Path | str | None = None) -> None:
+    contract_data = _contract_value_v2(contract)
+    if package is None:
+        raise GovernanceBlockerError("Human Gate-B V2 validation requires the exact evidence package")
+    package_data = load_gate_b_package_v2(package, contract_data) if isinstance(package, (Path, str)) else _validate_gate_b_package_v2(package, contract_data)
+    _validate_gate_b_authorization_shape(contract_data, authorization, package_data)
+    runner = dict(package_data["runner_acceptance_evidence"])
+    with EvidenceRoot(package_data["evidence_root"], label="Gate B V2 Runner evidence root") as evidence_root:
+        evidence = _validate_runner_acceptance_evidence_v2(contract_data, runner, evidence_root=evidence_root)
+    if evidence["runner_acceptance_evidence_sha256"] != package_data["runner_acceptance_evidence_sha256"]:
+        raise GovernanceBlockerError("Gate B V2 Runner acceptance evidence changed after package preparation")
+    if evidence["evidence_file_sha256"] != runner["evidence_file_sha256"]:
+        # Compare core subset: file hashes must still contain the packaged core.
+        for key, value in package_data["evidence_file_sha256"].items():
+            if evidence["evidence_file_sha256"].get(key) != value:
+                raise GovernanceBlockerError("Gate B V2 file-level evidence changed after package preparation")
+    repo = Path(contract_data["repository_path"])
+    if _git(repo, ["branch", "--show-current"]) != contract_data["canonical_branch"]:
+        raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: canonical branch drift")
+    if _git(repo, ["rev-parse", "HEAD"]).lower() != package_data["expected_canonical_head"] or _git(repo, ["rev-parse", "HEAD^{tree}"]).lower() != package_data["expected_canonical_tree"]:
+        raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: canonical baseline drift")
+    if _dirty_paths(repo) != contract_data["protected_dirty_paths"]:
+        raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: protected canonical worktree changed")
+
+
+def _gate_b_evidence_directory_v2(package: Mapping[str, Any]) -> Path:
+    root_path = _lexical_absolute_path(package["evidence_root"], "Gate B V2 evidence_root")
+    with EvidenceRoot(root_path, label="Gate B V2 evidence root") as root:
+        evidence_dir = root.absolute_path("gate-b")
+        try:
+            existing = os.lstat(evidence_dir)
+        except FileNotFoundError:
+            existing = None
+        except OSError as exc:
+            raise RunnerEnvironmentError("Gate B V2 evidence directory cannot be inspected") from exc
+        if existing is not None and (stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode)):
+            raise GovernanceBlockerError("Gate B V2 evidence directory is not a regular directory")
+        try:
+            evidence_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise RunnerEnvironmentError("Gate B V2 evidence directory cannot be created") from exc
+    return evidence_dir
+
+
+def integrate_after_gate_b_v2(
+    contract: Mapping[str, Any] | Path | str,
+    gate_b_authorization: Mapping[str, Any],
+    *,
+    package: Mapping[str, Any] | Path | str | None = None,
+    perform: bool = False,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v2(contract)
+    if package is None:
+        raise GovernanceBlockerError("Canonical integration V2 requires the exact Gate B evidence package")
+    package_data = load_gate_b_package_v2(package, contract_data) if isinstance(package, (Path, str)) else _validate_gate_b_package_v2(package, contract_data)
+    auth = _validate_gate_b_authorization_shape(contract_data, gate_b_authorization, package_data)
+    if not perform:
+        raise GovernanceBlockerError("Canonical integration V2 requires an explicit perform=True invocation after Gate B")
+    # Reuse V1 claim/lock helpers against the V2 gate-b directory.
+    evidence_dir = _gate_b_evidence_directory_v2(package_data)
+    authorization_id = auth["authorization_id"]
+    claim_path = evidence_dir / f"attempt-{authorization_id}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    claim = {
+        "authorization_id": authorization_id, "gate_b_package_hash": package_data["gate_b_package_hash"],
+        "candidate_head": package_data["candidate_head"], "candidate_tree": package_data["candidate_tree"],
+        "expected_canonical_head": package_data["expected_canonical_head"],
+        "expected_canonical_tree": package_data["expected_canonical_tree"], "attempt": "STARTED",
+    }
+    try:
+        descriptor = os.open(os.fspath(claim_path), flags, 0o600)
+    except FileExistsError as exc:
+        raise GovernanceBlockerError("GATE_B_AUTHORIZATION_REUSED: authorization_id was already consumed") from exc
+    except OSError as exc:
+        raise RunnerEnvironmentError("Gate B V2 authorization claim cannot be created") from exc
+    try:
+        payload = (json.dumps(claim, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        os.write(descriptor, payload)
+    except OSError as exc:
+        raise RunnerEnvironmentError("Gate B V2 authorization claim cannot be recorded") from exc
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    outcome: dict[str, Any] = {"authorization_id": authorization_id, "gate_b_package_hash": package_data["gate_b_package_hash"], "attempt": "FAILED"}
+    lock_path = evidence_dir / "integration.lock"
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(os.fspath(lock_path), lock_flags, 0o600)
+    except OSError as exc:
+        raise RunnerEnvironmentError("Gate B V2 integration lock cannot be acquired") from exc
+    try:
+        if fcntl is None:
+            raise RunnerEnvironmentError("Gate B V2 integration requires a supported repository lock")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            validate_gate_b_v2(contract_data, auth, package_data)
+            repo = Path(contract_data["repository_path"])
+            candidate_head = package_data["candidate_head"]
+            actual_changed = sorted(_git(repo, ["diff", "--name-only", f"{package_data['expected_canonical_head']}..{candidate_head}"]).splitlines())
+            if actual_changed != package_data["expected_changed_paths"]:
+                raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: candidate changed-path scope drift")
+            _fast_forward_exact_baseline(repo, package_data["expected_canonical_head"], candidate_head, contract_data["canonical_branch"])
+            post_branch = _git(repo, ["branch", "--show-current"])
+            post_head = _git(repo, ["rev-parse", "HEAD"]).lower()
+            post_tree = _git(repo, ["rev-parse", "HEAD^{tree}"]).lower()
+            if post_branch != contract_data["canonical_branch"] or post_head != candidate_head or post_tree != package_data["candidate_tree"]:
+                raise GovernanceBlockerError("Post-integration verification disagrees with the authorized candidate")
+            outcome.update({"attempt": "PASS", "canonical_head": post_head, "canonical_tree": post_tree})
+            return {"result": "CANONICAL_INTEGRATED", "controller_phase": ControllerPhase.POST_INTEGRATION_VERIFY.value,
+                    "run_id": contract_data["run_id"], "candidate_head": candidate_head,
+                    "candidate_tree": package_data["candidate_tree"],
+                    "authorization_id": authorization_id, "gate_b_package_hash": package_data["gate_b_package_hash"],
+                    "claim": str(claim_path)}
+        except Exception as exc:
+            outcome.update({"error": str(exc), "error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR")})
+            raise
+        finally:
+            try:
+                result_path = evidence_dir / f"attempt-{authorization_id}.result.json"
+                result_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    result_descriptor = os.open(os.fspath(result_path), result_flags, 0o600)
+                except OSError:
+                    result_descriptor = None
+                if result_descriptor is not None:
+                    try:
+                        os.write(result_descriptor, (json.dumps(dict(outcome), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            os.close(result_descriptor)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_descriptor)
+        except OSError:
+            pass

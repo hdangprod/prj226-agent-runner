@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ControllerResultV2",
+  "description": "Closed V2 controller ingestion record using the same common projection as Runner Result V2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "result", "controller_phase", "run_id", "contract_id", "contract_hash",
+    "task_packet_hash", "review_policy", "review_attempted", "review_status",
+    "candidate_head", "candidate_tree", "candidate_ref",
+    "candidate_worktree_fingerprint", "worktree_fingerprint",
+    "deterministic_result", "verification_disposition",
+    "evidence_root", "evidence_paths", "required_evidence_references",
+    "review_evidence", "evidence_file_sha256", "runner_acceptance_evidence_sha256",
+    "error_class"
+  ],
+  "properties": {
+    "version": {"const": "HARN-002.CONTROLLER_RESULT.v2"},
+    "result": {"const": "RESULT_INGESTED"},
+    "controller_phase": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "contract_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+    "contract_hash": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "task_packet_hash": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "review_policy": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+    "review_attempted": {"type": "boolean"},
+    "review_status": {"anyOf": [{"type": "string", "enum": ["NOT_REQUIRED", "PASS", "NEEDS_FIX", "EXECUTION_FAILURE"]}, {"type": "null"}]},
+    "candidate_head": {"anyOf": [{"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}, {"type": "null"}]},
+    "candidate_tree": {"anyOf": [{"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}, {"type": "null"}]},
+    "candidate_ref": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+    "candidate_worktree_fingerprint": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "worktree_fingerprint": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "deterministic_result": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "verification_disposition": {"type": "string", "enum": ["PASS", "STOPPED"]},
+    "evidence_root": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+    "evidence_paths": {"type": "object"},
+    "required_evidence_references": {"type": "array"},
+    "review_evidence": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+    "evidence_file_sha256": {"type": "object"},
+    "runner_acceptance_evidence_sha256": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "error_class": {"anyOf": [{"type": "string", "enum": ["ENVIRONMENT_ERROR", "AGENT_EXECUTION_ERROR", "ARTIFACT_VALIDATION_ERROR", "IMPLEMENTATION_FAILURE", "GOVERNANCE_BLOCKER"]}, {"type": "null"}]}
+  }
+}

@@ -9,15 +9,18 @@ from pathlib import Path
 from prj226_runner.controller import (
     Controller,
     derive_task_packet,
+    derive_task_packet_v2,
     discover_next_work,
     ingest_runner_result,
+    ingest_runner_result_v2,
     inspect_project,
     load_project_manifest,
     prepare_gate_b,
+    prepare_gate_b_v2,
     resume_controller,
 )
 from prj226_runner.errors import ArtifactValidationError, RunnerEnvironmentError, RunnerError
-from prj226_runner.runner import inspect_packet, run_packet
+from prj226_runner.runner import inspect_packet, inspect_packet_v2, run_packet, run_packet_v2
 
 
 def _json_artifact(path: Path) -> object:
@@ -63,6 +66,40 @@ def _parser() -> argparse.ArgumentParser:
     item = sub.add_parser("resume")
     item.add_argument("manifest", type=Path)
     item.add_argument("state", type=Path)
+    # M1 V2 plumbing only: versioned contract/packet/runner context arguments.
+    item = sub.add_parser("inspect-v2")
+    item.add_argument("packet", type=Path)
+    item.add_argument("contract", type=Path)
+    item.add_argument("gate_a", type=Path)
+    item.add_argument("--config", type=Path, default=None)
+    item = sub.add_parser("run-v2")
+    item.add_argument("packet", type=Path)
+    item.add_argument("contract", type=Path)
+    item.add_argument("gate_a", type=Path)
+    item.add_argument("--config", type=Path, default=None)
+    item.add_argument("--authorize", action="store_true")
+    item = sub.add_parser("draft-contract-v2")
+    item.add_argument("manifest", type=Path)
+    item.add_argument("--run-id", required=True)
+    item.add_argument("--owned-path", action="append", required=True)
+    item.add_argument("--output", type=Path, required=True)
+    item.add_argument("--runtime-root", required=True)
+    item.add_argument("--change-category", action="append", default=None)
+    item.add_argument("--human-requested-targeted", action="store_true")
+    item.add_argument("--reviewer-executable", default=None)
+    item.add_argument("--review-brief", default=None)
+    item.add_argument("--success-criterion", action="append", default=None)
+    item.add_argument("--test-command", action="append", default=None, help="JSON argv array")
+    item = sub.add_parser("derive-task-packet-v2")
+    item.add_argument("contract", type=Path)
+    item.add_argument("gate_a", type=Path)
+    item.add_argument("output", type=Path)
+    item = sub.add_parser("ingest-result-v2")
+    item.add_argument("contract", type=Path)
+    item.add_argument("result_artifact", type=Path)
+    item = sub.add_parser("prepare-gate-b-v2")
+    item.add_argument("contract", type=Path)
+    item.add_argument("result_artifact", type=Path)
     return parser
 
 
@@ -100,6 +137,42 @@ def main(argv: list[str] | None = None) -> int:
                 contract,
                 ingest_runner_result(contract, args.result_artifact),
                 args.review,
+            )
+        elif args.command == "inspect-v2":
+            result = inspect_packet_v2(args.packet, args.contract, args.gate_a, args.config)
+        elif args.command == "run-v2":
+            result = run_packet_v2(args.packet, args.contract, args.gate_a, args.config, authorize=args.authorize)
+        elif args.command == "draft-contract-v2":
+            from prj226_runner.controller import draft_design_contract_v2
+            manifest = load_project_manifest(args.manifest)
+            controller = Controller(manifest)
+            inspection = controller.inspect()
+            work_item = controller.discover()
+            instruments = [_json_artifact(Path(command)) if command.endswith(".json") else json.loads(command) for command in args.test_command or []]
+            result = draft_design_contract_v2(
+                manifest,
+                work_item,
+                inspection,
+                run_id=args.run_id,
+                owned_paths=args.owned_path,
+                runtime_root=args.runtime_root,
+                change_categories=args.change_category or [],
+                human_requested_targeted=args.human_requested_targeted,
+                reviewer_executable=args.reviewer_executable,
+                review_brief=args.review_brief,
+                success_criteria=args.success_criterion,
+                acceptance_instruments=instruments or None,
+                output_path=args.output,
+            )
+        elif args.command == "derive-task-packet-v2":
+            result = derive_task_packet_v2(args.contract, _json_artifact(args.gate_a), output_path=args.output)
+        elif args.command == "ingest-result-v2":
+            result = ingest_runner_result_v2(args.contract, args.result_artifact)
+        elif args.command == "prepare-gate-b-v2":
+            contract = _json_artifact(args.contract)
+            result = prepare_gate_b_v2(
+                contract,
+                ingest_runner_result_v2(contract, args.result_artifact),
             )
         else:
             result = resume_controller(args.manifest, args.state)

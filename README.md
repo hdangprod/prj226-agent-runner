@@ -124,3 +124,27 @@ single-owner immutable evidence lifecycle. The controller result is
 schema-validated before persistence, and
 Gate-B reloads and revalidates that result and its evidence before it can be
 prepared or consumed.
+
+## M1 V2 review semantics
+
+M1 replaces the mandatory V1 `builder → DV → S/O/S` sequence for new runs
+with versioned V2 semantics while preserving legacy behavior byte-for-byte:
+
+```text
+NONE:     builder → candidate freeze → deterministic PASS → NOT_REQUIRED → ACCEPTANCE_READY
+TARGETED: builder → candidate freeze → deterministic PASS → one targeted review → PASS → ACCEPTANCE_READY
+```
+
+Review selection is static and frozen before Gate A (`NONE` unless a
+`PUBLIC_INTERFACE`, `AUTHORIZATION_DATA_ACCESS`, `PERSISTENT_DATA_SEMANTICS`,
+`MODULE_BOUNDARY`, or `BEHAVIOR_PRESERVING_REFACTOR` category is declared or
+`human_requested_targeted=true`). `NONE` performs zero reviewer setup,
+invocation, or artifacts. `TARGETED` makes at most one attempt bound to the
+exact frozen candidate, evidence, profile, and executable fingerprint.
+Deterministic failure blocks any review invocation. Legacy runs retain the
+mandatory DV + S/O/S behavior exactly.
+
+V2 plumbing only: `inspect-v2`, `run-v2 --contract --gate-a --authorize`,
+`draft-contract-v2`, `derive-task-packet-v2`, `ingest-result-v2`, and
+`prepare-gate-b-v2`. Direct V2 execution requires the exact Design Contract
+plus Gate A context; `--authorize` alone is insufficient.

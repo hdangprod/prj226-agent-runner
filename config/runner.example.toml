@@ -22,3 +22,12 @@ tool = "codex"
 executable = "/Users/dangnguyen/.nvm/versions/node/v20.5.0/bin/codex"
 model = "gpt-5.6-luna"
 timeout_seconds = 300
+
+# M1 V2 notes:
+# - V2 builder binding above remains the only provider binding read from config
+#   during a V2 run. Legacy dv/sos_reviewer entries are preserved for V1
+#   compatibility but are never resolved, inspected, or invoked for V2 NONE.
+# - V2 TARGETED reviewer authority (tool/provider/model, resolved executable,
+#   content fingerprint, profile hash, output-schema SHA-256, timeout,
+#   review_brief) is frozen at Gate A in the V2 Design Contract review_policy,
+#   never taken from config overrides at execution time.

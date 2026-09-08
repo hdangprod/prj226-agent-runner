@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunnerResultV2",
+  "description": "Closed V2 runner result with versioned NONE/TARGETED semantics and candidate/evidence binding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "result", "run_id", "contract_id", "contract_hash", "task_packet_hash",
+    "review_policy", "review_attempted", "review_status",
+    "candidate_head", "candidate_tree", "candidate_ref",
+    "candidate_worktree_fingerprint", "worktree_fingerprint",
+    "verification_disposition", "deterministic_result",
+    "changed_paths", "test_commands",
+    "evidence_root", "runtime_root",
+    "evidence_paths", "required_evidence_references",
+    "review_evidence", "evidence_file_sha256", "runner_acceptance_evidence_sha256",
+    "error_class"
+  ],
+  "properties": {
+    "version": {"const": "HARN-001.RUNNER_RESULT.v2"},
+    "result": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "contract_id": {"type": "string", "minLength": 1},
+    "contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_packet_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "review_policy": {"type": "object"},
+    "review_attempted": {"type": "boolean"},
+    "review_status": {"anyOf": [{"type": "string", "enum": ["NOT_REQUIRED", "PASS", "NEEDS_FIX", "EXECUTION_FAILURE"]}, {"type": "null"}]},
+    "candidate_head": {"anyOf": [{"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}, {"type": "null"}]},
+    "candidate_tree": {"anyOf": [{"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}, {"type": "null"}]},
+    "candidate_ref": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+    "candidate_worktree_fingerprint": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "worktree_fingerprint": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "verification_disposition": {"type": "string", "enum": ["PASS", "STOPPED"]},
+    "deterministic_result": {"type": "string", "enum": ["ACCEPTANCE_READY", "STOPPED"]},
+    "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "test_commands": {"type": "array"},
+    "evidence_root": {"type": "string", "minLength": 1},
+    "runtime_root": {"type": "string", "minLength": 1},
+    "candidate_branch": {"type": "string"},
+    "evidence_paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "state", "events", "builder", "deterministic", "worktree", "targeted_review"],
+      "properties": {
+        "manifest": {"type": "string", "minLength": 1},
+        "state": {"type": "string", "minLength": 1},
+        "events": {"type": "string", "minLength": 1},
+        "builder": {"type": "string", "minLength": 1},
+        "deterministic": {"type": "string", "minLength": 1},
+        "worktree": {"type": "string", "minLength": 1},
+        "targeted_review": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}
+      }
+    },
+    "required_evidence_references": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "review_evidence": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+    "evidence_file_sha256": {"type": "object"},
+    "runner_acceptance_evidence_sha256": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+    "error_class": {"anyOf": [{"type": "string", "enum": ["ENVIRONMENT_ERROR", "AGENT_EXECUTION_ERROR", "ARTIFACT_VALIDATION_ERROR", "IMPLEMENTATION_FAILURE", "GOVERNANCE_BLOCKER"]}, {"type": "null"}]},
+    "error": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    "tests": {"type": "array"}
+  }
+}

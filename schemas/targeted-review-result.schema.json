@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TargetedReviewResult",
+  "description": "Closed HARN-002.TARGETED_REVIEW.v1 result from exactly one targeted semantic review. Candidate binding is exact; reviewer/profile/executable binding is enforced live against frozen Gate A authority, not via result-file echo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "review_version",
+    "disposition",
+    "reviewed_head",
+    "reviewed_tree",
+    "reviewed_ref",
+    "blocking_findings",
+    "non_blocking_findings"
+  ],
+  "properties": {
+    "review_version": {"const": "HARN-002.TARGETED_REVIEW.v1"},
+    "disposition": {"type": "string", "enum": ["PASS", "NEEDS_FIX"]},
+    "reviewed_head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "reviewed_tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+    "reviewed_ref": {"type": "string", "minLength": 1},
+    "blocking_findings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "non_blocking_findings": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  }
+}
