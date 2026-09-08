@@ -25,8 +25,13 @@ from prj226_runner.review_policy import select_review_mode
 
 
 SCHEMA_VERSION_DEFAULTS = "PRJ226.PROJECT_DEFAULTS.v1"
+SCHEMA_VERSION_SCOPE_CATALOG = "PRJ226.WORKFLOW_SCOPE_CATALOG.v1"
 SCHEMA_VERSION_TASK = "PRJ226.WORKFLOW_TASK.v1"
 SCHEMA_VERSION_CONTINUATION = "PRJ226.CONTINUATION.v1"
+
+M2_SCOPE_REQUIRED = "M2_SCOPE_REQUIRED"
+M2_SCOPE_UNKNOWN = "M2_SCOPE_UNKNOWN"
+M2_SCOPE_CATALOG_INVALID = "M2_SCOPE_CATALOG_INVALID"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -132,7 +137,48 @@ def _derive_project_id(manifest: Any) -> str:
     return safe
 
 
-def init_project(manifest_path: Path | str, config_path: Path | str) -> dict[str, Any]:
+def load_scope_catalog(path: Path | str) -> dict[str, Any]:
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        raise WorkflowError(f"Scope catalog file not found: {p}", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID)
+    try:
+        text = p.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except OSError as exc:
+        raise WorkflowError(f"Cannot read scope catalog file: {p}", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID) from exc
+    except json.JSONDecodeError as exc:
+        raise WorkflowError(f"Scope catalog file is not valid JSON: {p}", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID) from exc
+    if not isinstance(data, dict):
+        raise WorkflowError(f"Scope catalog must be a JSON object: {p}", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID)
+
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "workflow-scope-catalog.schema.json"
+    if not schema_path.is_file():
+        raise WorkflowError(f"Scope catalog schema missing: {schema_path}", EXIT_BLOCKER, M2_SCOPE_CATALOG_INVALID)
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        import jsonschema
+        validator_cls = jsonschema.validators.validator_for(schema)
+        validator_cls(schema).validate(data)
+    except Exception as exc:
+        raise WorkflowError(f"Invalid scope catalog schema: {exc}", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID) from exc
+
+    default_scope = data.get("default_scope")
+    scopes = data.get("scopes", {})
+    if default_scope is not None and default_scope not in scopes:
+        raise WorkflowError(f"default_scope '{default_scope}' is not defined in scopes", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID)
+
+    return {
+        "schema_version": SCHEMA_VERSION_SCOPE_CATALOG,
+        "default_scope": default_scope,
+        "scopes": scopes,
+    }
+
+
+def init_project(
+    manifest_path: Path | str,
+    config_path: Path | str,
+    scopes_path: Path | str | None = None,
+) -> dict[str, Any]:
     """Establish durable project defaults. No provider execution."""
     manifest_p = Path(manifest_path).expanduser().resolve()
     config_p = Path(config_path).expanduser().resolve()
@@ -163,8 +209,17 @@ def init_project(manifest_path: Path | str, config_path: Path | str) -> dict[str
     runtime_root = Path(config.runtime_root).resolve()
     product_repo = str(Path(manifest.repository_path).expanduser().resolve())
     canonical_branch = str(manifest.canonical_branch)
-    # Deterministic defaults: only user/workflow info, never generated authority.
-    py = sys.executable
+
+    if scopes_path is not None:
+        catalog = load_scope_catalog(scopes_path)
+        scopes_source: str | None = str(Path(scopes_path).expanduser().resolve())
+        default_scope: str | None = catalog["default_scope"]
+        scopes: dict[str, Any] = catalog["scopes"]
+    else:
+        scopes_source = None
+        default_scope = None
+        scopes = {}
+
     defaults: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION_DEFAULTS,
         "project_id": project_id,
@@ -173,10 +228,21 @@ def init_project(manifest_path: Path | str, config_path: Path | str) -> dict[str
         "runtime_root": str(runtime_root),
         "manifest_source": str(manifest_p),
         "config_source": str(config_p),
-        "default_owned_paths": ["src/app.txt"],
-        "default_checks": [[py, "-c", "import sys; sys.exit(0)"]],
-        "scopes": {},
+        "scopes_source": scopes_source,
+        "default_scope": default_scope,
+        "scopes": scopes,
     }
+
+    defaults_schema_p = Path(__file__).resolve().parents[2] / "schemas" / "project-defaults.schema.json"
+    if defaults_schema_p.is_file():
+        try:
+            d_schema = json.loads(defaults_schema_p.read_text(encoding="utf-8"))
+            import jsonschema
+            validator_cls = jsonschema.validators.validator_for(d_schema)
+            validator_cls(d_schema).validate(defaults)
+        except Exception as exc:
+            raise WorkflowError(f"Project defaults schema validation failed: {exc}", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE") from exc
+
     dest = _defaults_path_for(runtime_root, project_id)
     _write_atomic(dest, defaults)
     _write_atomic(_active_project_path(runtime_root), {"project_id": project_id, "updated_at": _utc_now()})
@@ -190,6 +256,9 @@ def init_project(manifest_path: Path | str, config_path: Path | str) -> dict[str
         "defaults_path": str(dest),
         "manifest_source": str(manifest_p),
         "config_source": str(config_p),
+        "scopes_source": scopes_source,
+        "default_scope": default_scope,
+        "scopes_count": len(scopes),
     }
 
 
@@ -235,10 +304,6 @@ def load_project_defaults(
     for field in ("project_id", "product_repository", "canonical_branch", "runtime_root", "manifest_source", "config_source"):
         if not isinstance(data.get(field), str) or not str(data[field]).strip():
             raise WorkflowError(f"Project defaults field invalid: {field}", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE")
-    if not isinstance(data.get("default_owned_paths"), list) or not data["default_owned_paths"]:
-        raise WorkflowError("Project defaults owned paths invalid", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE")
-    if not isinstance(data.get("default_checks"), list) or not data["default_checks"]:
-        raise WorkflowError("Project defaults checks invalid", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE")
     if not isinstance(data.get("scopes"), dict):
         raise WorkflowError("Project defaults scopes invalid", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE")
     return data, path
@@ -272,7 +337,55 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
     desc = description.strip()
     if len(desc) > 2000:
         raise WorkflowError("Task description is too long", EXIT_USAGE, "WORKFLOW_INPUT_ERROR")
-    scope_name = _validate_scope_name(scope)
+
+    scopes = dict(defaults.get("scopes") or {})
+    default_scope = defaults.get("default_scope")
+
+    if scope is not None:
+        scope_name = _validate_scope_name(scope)
+        if scope_name not in scopes:
+            available = ", ".join(sorted(scopes.keys())) if scopes else "(none)"
+            raise WorkflowError(
+                f"Scope '{scope_name}' is not defined in project scope catalog. Available scopes: {available}",
+                EXIT_USAGE,
+                M2_SCOPE_UNKNOWN,
+            )
+    else:
+        if default_scope is None or not isinstance(default_scope, str) or not default_scope.strip():
+            raise WorkflowError(
+                "No scope specified and no default_scope defined in project defaults. Specify --scope <name> or initialize with a default_scope.",
+                EXIT_USAGE,
+                M2_SCOPE_REQUIRED,
+            )
+        scope_name = default_scope.strip()
+        if scope_name not in scopes:
+            raise WorkflowError(
+                f"Default scope '{scope_name}' is not defined in project scope catalog",
+                EXIT_BLOCKER,
+                M2_SCOPE_UNKNOWN,
+            )
+
+    scope_entry = scopes[scope_name]
+    if not isinstance(scope_entry, dict):
+        raise WorkflowError(f"Scope entry for '{scope_name}' is invalid", EXIT_BLOCKER, M2_SCOPE_CATALOG_INVALID)
+
+    owned = list(scope_entry.get("owned_paths") or [])
+    if not owned:
+        raise WorkflowError(f"Scope '{scope_name}' defines no owned_paths", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID)
+
+    raw_checks = scope_entry.get("checks") or []
+    if not raw_checks:
+        raise WorkflowError(f"Scope '{scope_name}' defines no checks", EXIT_USAGE, M2_SCOPE_CATALOG_INVALID)
+    checks = [list(c) for c in raw_checks]
+    for argv in checks:
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
+            raise WorkflowError("Deterministic checks are malformed", EXIT_BLOCKER, M2_SCOPE_CATALOG_INVALID)
+
+    raw_cats = scope_entry.get("change_categories") or []
+    categories = [str(c) for c in raw_cats] if isinstance(raw_cats, list) else []
+    human_flag = bool(scope_entry.get("human_requested_targeted", False))
+    uncertainties: list[str] = []
+
     manifest, config = _load_manifest_and_config(defaults)
     try:
         inspection = C.inspect_project(manifest)
@@ -280,89 +393,24 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
         raise WorkflowError(f"Project state blocked: {exc.message}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE") from exc
     except RunnerError as exc:
         raise WorkflowError(f"Project inspection failed: {exc.message}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE") from exc
-    # Authorized files.
-    scopes = dict(defaults.get("scopes") or {})
-    owned: list[str] = list(defaults.get("default_owned_paths") or ["src/app.txt"])
-    if scope_name and scope_name in scopes and isinstance(scopes[scope_name], dict):
-        scoped_owned = scopes[scope_name].get("owned_paths")
-        if isinstance(scoped_owned, list) and scoped_owned:
-            owned = list(scoped_owned)
-    # Deterministic checks.
-    checks: list[list[str]] = [list(c) for c in (defaults.get("default_checks") or [])]
-    if scope_name and scope_name in scopes and isinstance(scopes[scope_name], dict):
-        scoped_checks = scopes[scope_name].get("checks")
-        if isinstance(scoped_checks, list) and scoped_checks:
-            checks = [list(c) for c in scoped_checks]
-    # Scope-driven deterministic overrides for fixtures (no inference).
-    uncertainties: list[str] = []
-    categories: list[str] = []
-    human_flag = False
-    review_brief: str | None = None
-    if scope_name in (None, "default"):
-        # Description-triggered targeted only for explicit marker (no silent planning).
-        lowered = desc.lower()
-        if "[targeted]" in lowered or lowered.startswith("targeted:") or "targeted review" in lowered:
-            categories = ["MODULE_BOUNDARY"]
-    elif scope_name == "targeted":
-        categories = ["MODULE_BOUNDARY"]
-    elif scope_name == "targeted-human":
-        categories = []
-        human_flag = True
-    elif scope_name == "public-api":
-        categories = ["PUBLIC_INTERFACE"]
-    elif scope_name == "failing":
-        categories = []
-        checks = [[sys.executable, "-c", "import sys; sys.exit(1)"]]
-    elif scope_name == "failing-targeted":
-        categories = ["MODULE_BOUNDARY"]
-        checks = [[sys.executable, "-c", "import sys; sys.exit(1)"]]
-    elif scope_name == "needs-fix":
-        categories = ["MODULE_BOUNDARY"]
-    else:
-        # Unknown scope: stay NONE with explicit uncertainty, no silent substitution.
-        uncertainties.append(f"Unknown scope '{scope_name}'; using default files and checks.")
-        # Also check scoped definition for categories if user added custom scope.
-        if scope_name in scopes and isinstance(scopes[scope_name], dict):
-            raw_cats = scopes[scope_name].get("change_categories") or []
-            raw_human = scopes[scope_name].get("human_requested_targeted") or False
-            if isinstance(raw_cats, list):
-                categories = [str(c) for c in raw_cats]
-            human_flag = bool(raw_human)
-    # Scoped custom categories override (for user-defined scopes in defaults).
-    if scope_name and scope_name in scopes and isinstance(scopes[scope_name], dict):
-        entry = scopes[scope_name]
-        if scope_name not in ("targeted", "targeted-human", "public-api", "failing", "failing-targeted", "needs-fix"):
-            # Already handled unknown above; keep values.
-            pass
-        else:
-            # Known fixture scopes already set; allow explicit scoped checks to win (done).
-            pass
-    # Validate checks shape.
-    if not checks:
-        raise WorkflowError("No deterministic checks available for task", EXIT_USAGE, "WORKFLOW_INPUT_ERROR")
-    for argv in checks:
-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
-            raise WorkflowError("Deterministic checks are malformed", EXIT_BLOCKER, "WORKFLOW_DEFAULTS_STALE")
+
     # Static review selection (frozen M1 semantics, no inference).
     try:
         mode = select_review_mode(list(categories), bool(human_flag))
     except RunnerError as exc:
         raise WorkflowError(f"Review selection failed: {exc.message}", EXIT_USAGE, "WORKFLOW_INPUT_ERROR") from exc
+
+    review_brief: str | None = None
     if mode == "TARGETED":
-        if scope_name == "needs-fix":
+        custom_brief = scope_entry.get("review_brief")
+        if isinstance(custom_brief, str) and custom_brief.strip():
+            review_brief = custom_brief.strip()
+        elif scope_name == "needs-fix":
             review_brief = f"FORCE_NEEDS_FIX Targeted semantic review for: {desc[:300]}"
         else:
-            # Honor custom scoped brief if present.
-            custom_brief = None
-            if scope_name and scope_name in scopes and isinstance(scopes[scope_name], dict):
-                custom_brief = scopes[scope_name].get("review_brief")
-            if isinstance(custom_brief, str) and custom_brief.strip():
-                review_brief = custom_brief.strip()
-            else:
-                review_brief = f"Targeted semantic review for: {desc[:300]}"
-    # Behavior: literal user intent, no doc replacement.
+            review_brief = f"Targeted semantic review for: {desc[:300]}"
+
     behavior = f"Implement requested change: {desc}"
-    # Execution binding already fixed by M1 configuration.
     builder = config.agents.get("builder")
     execution = {
         "builder_tool": getattr(builder, "tool", ""),
@@ -382,6 +430,7 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
             review_reason += " (fixture expects NEEDS_FIX)"
     else:
         review_reason = "static policy: no targeted category"
+
     return {
         "project_id": str(defaults["project_id"]),
         "description": desc,

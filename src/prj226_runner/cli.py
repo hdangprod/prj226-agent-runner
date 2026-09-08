@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     item = sub.add_parser("init")
     item.add_argument("--manifest", type=Path, required=True)
     item.add_argument("--config", type=Path, required=True)
+    item.add_argument("--scopes", type=Path, default=None)
     item = sub.add_parser("task")
     item.add_argument("description", type=str)
     item.add_argument("--scope", type=str, default=None)
@@ -136,10 +137,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
     from prj226_runner import workflow as W
 
     try:
-        summary = W.init_project(args.manifest, args.config)
+        summary = W.init_project(args.manifest, args.config, scopes_path=args.scopes)
     except W.WorkflowError as exc:
         print(f"Init blocked: {exc.message}", file=sys.stderr)
-        if exc.error_code == "WORKFLOW_INPUT_ERROR" or exc.exit_code == 2:
+        if exc.exit_code == 2 or exc.error_code in ("WORKFLOW_INPUT_ERROR", "M2_SCOPE_CATALOG_INVALID"):
             return 2
         return 20
     print(P.format_init_summary(summary))

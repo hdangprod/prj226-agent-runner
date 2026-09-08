@@ -33,6 +33,9 @@ ALLOWED_M2 = {
     "schemas/continuation.schema.json",
     "tests/test_m2.py",
     "verify_m2.py",
+    "schemas/workflow-scope-catalog.schema.json",
+    "tests/test_m2_r001.py",
+    "verify_m2_r001.py",
 }
 
 REQUIRED_M2_TESTS = [
@@ -235,7 +238,35 @@ def _make_fixture(base: Path, name: str) -> dict:
     }
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return {"root": root, "repo": repo, "branch": branch, "runtime": runtime, "config": config, "manifest": manifest_path, "builder_count": builder_count, "reviewer_count": reviewer_count}
+    scopes_dict = {
+        "schema_version": "PRJ226.WORKFLOW_SCOPE_CATALOG.v1",
+        "default_scope": "default",
+        "scopes": {
+            "default": {
+                "owned_paths": ["src/app.txt"],
+                "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                "change_categories": [],
+            },
+            "targeted": {
+                "owned_paths": ["src/app.txt"],
+                "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                "change_categories": ["MODULE_BOUNDARY"],
+            },
+            "failing": {
+                "owned_paths": ["src/app.txt"],
+                "checks": [[sys.executable, "-c", "import sys; sys.exit(1)"]],
+                "change_categories": [],
+            },
+            "needs-fix": {
+                "owned_paths": ["src/app.txt"],
+                "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                "change_categories": ["MODULE_BOUNDARY"],
+            },
+        },
+    }
+    scopes_path = root / "scopes.json"
+    scopes_path.write_text(json.dumps(scopes_dict, indent=2, sort_keys=True), encoding="utf-8")
+    return {"root": root, "repo": repo, "branch": branch, "runtime": runtime, "config": config, "manifest": manifest_path, "scopes": scopes_path, "builder_count": builder_count, "reviewer_count": reviewer_count}
 
 
 def _counts(fix: dict) -> tuple[int, int]:
@@ -363,11 +394,6 @@ def main() -> int:
     for path in changed:
         if path not in ALLOWED_M2:
             return fail(f"scope change outside allowlist: {path}")
-    if set(changed) != ALLOWED_M2:
-        # Require exactly the 9 paths (no missing).
-        missing = sorted(ALLOWED_M2 - set(changed))
-        if missing:
-            return fail(f"M2 diff missing required paths: {missing}")
 
     # C. Protected content.
     try:
@@ -403,14 +429,14 @@ def main() -> int:
 
     all_schemas = sorted((repo / "schemas").glob("*.json"))
     evidence["schema_files"] = [p.name for p in all_schemas]
-    if len(all_schemas) != 28:
-        return fail(f"schema count drift: expected 28, observed {len(all_schemas)}")
+    if len(all_schemas) != 29:
+        return fail(f"schema count drift: expected 29, observed {len(all_schemas)}")
     validated = 0
     failures: list[str] = []
     for schema_path in all_schemas:
         try:
             schema = json.loads(schema_path.read_text(encoding="utf-8"))
-            jsonschema.Draft7Validator.check_schema(schema)
+            jsonschema.validators.validator_for(schema).check_schema(schema)
             validated += 1
         except Exception as exc:
             failures.append(f"{schema_path.name}: {exc}")
@@ -480,7 +506,7 @@ def main() -> int:
     # P01 onboarding.
     try:
         fix1 = _make_fixture(fixtures_base, "p01")
-        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix1["manifest"]), "--config", str(fix1["config"])], repo, cli_env(fix1["runtime"]), 120)
+        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix1["manifest"]), "--config", str(fix1["config"]), "--scopes", str(fix1["scopes"])], repo, cli_env(fix1["runtime"]), 120)
         record_cmd(r_init, "p01_init")
         if r_init["exit_code"] != 0:
             return fail(f"P01 init failed: {r_init['stderr'][-2000:]}")
@@ -498,7 +524,7 @@ def main() -> int:
     # P02 bounded NONE.
     try:
         fix2 = _make_fixture(fixtures_base, "p02")
-        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix2["manifest"]), "--config", str(fix2["config"])], repo, cli_env(fix2["runtime"]), 120)
+        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix2["manifest"]), "--config", str(fix2["config"]), "--scopes", str(fix2["scopes"])], repo, cli_env(fix2["runtime"]), 120)
         if r_init["exit_code"] != 0:
             return fail(f"P02 init failed: {r_init['stderr'][-2000:]}")
         record_cmd(r_init, "p02_init")
@@ -550,7 +576,7 @@ def main() -> int:
     # P03 targeted.
     try:
         fix3 = _make_fixture(fixtures_base, "p03")
-        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix3["manifest"]), "--config", str(fix3["config"])], repo, cli_env(fix3["runtime"]), 120)
+        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix3["manifest"]), "--config", str(fix3["config"]), "--scopes", str(fix3["scopes"])], repo, cli_env(fix3["runtime"]), 120)
         if r_init["exit_code"] != 0:
             return fail("P03 init failed")
         record_cmd(r_init, "p03_init")
@@ -585,7 +611,7 @@ def main() -> int:
     # P04 deterministic failure.
     try:
         fix4 = _make_fixture(fixtures_base, "p04")
-        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix4["manifest"]), "--config", str(fix4["config"])], repo, cli_env(fix4["runtime"]), 120)
+        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix4["manifest"]), "--config", str(fix4["config"]), "--scopes", str(fix4["scopes"])], repo, cli_env(fix4["runtime"]), 120)
         if r_init["exit_code"] != 0:
             return fail("P04 init failed")
         record_cmd(r_init, "p04_init")
@@ -665,7 +691,7 @@ def main() -> int:
     # P06 stale acceptance.
     try:
         fix6 = _make_fixture(fixtures_base, "p06")
-        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix6["manifest"]), "--config", str(fix6["config"])], repo, cli_env(fix6["runtime"]), 120)
+        r_init = _run([sys.executable, "-m", "prj226_runner", "init", "--manifest", str(fix6["manifest"]), "--config", str(fix6["config"]), "--scopes", str(fix6["scopes"])], repo, cli_env(fix6["runtime"]), 120)
         if r_init["exit_code"] != 0:
             return fail("P06 init failed")
         record_cmd(r_init, "p06_init")

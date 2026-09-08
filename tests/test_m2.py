@@ -161,6 +161,34 @@ class M2Fixture:
             },
         }
         self.manifest_path.write_text(json.dumps(self.manifest_dict, indent=2, sort_keys=True), encoding="utf-8")
+        self.scopes_path = root / "scopes.json"
+        self.scopes_dict = {
+            "schema_version": "PRJ226.WORKFLOW_SCOPE_CATALOG.v1",
+            "default_scope": "default",
+            "scopes": {
+                "default": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                    "change_categories": [],
+                },
+                "targeted": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                    "change_categories": ["MODULE_BOUNDARY"],
+                },
+                "failing": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(1)"]],
+                    "change_categories": [],
+                },
+                "needs-fix": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                    "change_categories": ["MODULE_BOUNDARY"],
+                },
+            },
+        }
+        self.scopes_path.write_text(json.dumps(self.scopes_dict, indent=2, sort_keys=True), encoding="utf-8")
 
     def write_config(self) -> None:
         self.config.write_text(
@@ -184,8 +212,9 @@ class M2Fixture:
     def reviewer_calls(self) -> int:
         return int(self.reviewer_count.read_text(encoding="utf-8")) if self.reviewer_count.exists() else 0
 
-    def init(self) -> dict:
-        return W.init_project(self.manifest_path, self.config)
+    def init(self, scopes_path: Path | str | None = ...) -> dict:
+        sp = self.scopes_path if scopes_path is ... else scopes_path
+        return W.init_project(self.manifest_path, self.config, scopes_path=sp)
 
     def task(self, desc: str, scope: str | None = None, approve: str | None = "approve", preview_only: bool = False) -> dict:
         return W.create_task(desc, scope, preview_only=preview_only, approval_text=approve, runtime_root=self.runtime)

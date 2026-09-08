@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "M2WorkflowScopeCatalog",
+  "description": "Declarative project scope catalog binding task scopes to owned paths, checks, and change categories.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scopes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "PRJ226.WORKFLOW_SCOPE_CATALOG.v1"
+    },
+    "default_scope": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scopes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/scopeDef"
+      }
+    }
+  },
+  "definitions": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(^|/)\\.{1,2}(/|$))(?!.*(^|/)\\.git(/|$)).+$"
+    },
+    "scopeDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owned_paths",
+        "checks"
+      ],
+      "properties": {
+        "owned_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/relativePath"
+          }
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "change_categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "PUBLIC_INTERFACE",
+              "AUTHORIZATION_DATA_ACCESS",
+              "PERSISTENT_DATA_SEMANTICS",
+              "MODULE_BOUNDARY",
+              "BEHAVIOR_PRESERVING_REFACTOR"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -4,18 +4,84 @@
   "description": "Durable M2 workflow defaults outside the product repository. No generated M1 authority.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "project_id", "product_repository", "canonical_branch", "runtime_root", "manifest_source", "config_source", "default_owned_paths", "default_checks", "scopes"],
+  "required": [
+    "schema_version",
+    "project_id",
+    "product_repository",
+    "canonical_branch",
+    "runtime_root",
+    "manifest_source",
+    "config_source",
+    "scopes"
+  ],
   "properties": {
-    "schema_version": {"const": "PRJ226.PROJECT_DEFAULTS.v1"},
-    "project_id": {"type": "string", "minLength": 1},
-    "product_repository": {"type": "string", "minLength": 1, "pattern": "^/"},
-    "canonical_branch": {"type": "string", "minLength": 1},
-    "runtime_root": {"type": "string", "minLength": 1, "pattern": "^/"},
-    "manifest_source": {"type": "string", "minLength": 1},
-    "config_source": {"type": "string", "minLength": 1},
-    "default_owned_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/definitions/relativePath"}},
-    "default_checks": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}},
-    "scopes": {"type": "object", "additionalProperties": {"$ref": "#/definitions/scopeDef"}}
+    "schema_version": {
+      "const": "PRJ226.PROJECT_DEFAULTS.v1"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "product_repository": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
+    "canonical_branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime_root": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
+    "manifest_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "config_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scopes_source": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "default_scope": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "default_owned_paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/definitions/relativePath"
+      }
+    },
+    "default_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "scopes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/scopeDef"
+      }
+    }
   },
   "definitions": {
     "relativePath": {
@@ -26,12 +92,46 @@
     "scopeDef": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "owned_paths",
+        "checks"
+      ],
       "properties": {
-        "owned_paths": {"type": "array", "items": {"$ref": "#/definitions/relativePath"}},
-        "change_categories": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "human_requested_targeted": {"type": "boolean"},
-        "checks": {"type": "array", "items": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}},
-        "review_brief": {"type": "string", "minLength": 1}
+        "owned_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/relativePath"
+          }
+        },
+        "change_categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "human_requested_targeted": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "review_brief": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     }
   }
