@@ -165,38 +165,13 @@ def _cmd_task(args: argparse.Namespace) -> int:
         print(f"TASK_ID {outcome['task_id']} (preview only; no execution)")
         return 0
     # Normal path: show preview first, then require literal approval.
-    # Derive preview without side effects for display: use a dry plan.
     try:
-        rt = W.resolve_runtime_root(None)
-        try:
-            defaults, _ = W.load_project_defaults(rt)
-            plan = W.derive_plan(defaults, description, scope)
-            # Allocate display-only task id preview (next id, not yet persisted).
-            display_id = W._next_task_id(rt, str(defaults["project_id"]))
-            preview = {
-                "task_id": display_id,
-                "request": plan["description"],
-                "behavior": plan["behavior"],
-                "files": list(plan["authorized_paths"]),
-                "checks": [list(c) for c in plan["checks"]],
-                "execution": dict(plan["execution"]),
-                "review_mode": plan["review_mode"],
-                "review_reason": plan["review_reason"],
-                "uncertainties": list(plan["uncertainties"]),
-                "baseline_head": plan["baseline_head"],
-                "baseline_tree": plan["baseline_tree"],
-                "canonical_branch": plan["canonical_branch"],
-                "product_repository": plan["product_repository"],
-                "scope": plan["scope"],
-            }
-        except W.WorkflowError as exc:
-            print(f"Task preparation blocked: {exc.message}", file=sys.stderr)
-            return exc.exit_code if exc.exit_code in (2, 10, 20) else 2
-        print(P.format_gate_a_preview(preview))
+        prepared = W.create_task(description, scope, preview_only=True)
+        print(P.format_gate_a_preview(prepared["preview"]))
         print("")
         print("Type exactly 'approve' to authorize one M1 execution, or anything else to abort:")
         approval = _read_approval()
-        outcome = W.create_task(description, scope, preview_only=False, approval_text=approval)
+        outcome = W.create_task(description, scope, preview_only=False, approval_text=approval, task_id=prepared["task_id"])
     except W.WorkflowError as exc:
         # Distinguish declined Gate A (10) from blockers (20) and input errors (2).
         if exc.error_code == "WORKFLOW_GATE_A_DECLINED":

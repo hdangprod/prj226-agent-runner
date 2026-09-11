@@ -76,6 +76,17 @@ def _write_atomic(path: Path, value: Any) -> None:
         raise WorkflowError(f"Cannot write file: {target}", EXIT_BLOCKER, "WORKFLOW_WRITE_ERROR") from exc
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        raise WorkflowError(f"Cannot write file: {target}", EXIT_BLOCKER, "WORKFLOW_WRITE_ERROR") from exc
+
+
 def _git(repo: Path, args: list[str]) -> str:
     try:
         result = subprocess.run(
@@ -331,6 +342,100 @@ def _load_manifest_and_config(defaults: Mapping[str, Any]) -> tuple[Any, Any]:
     return manifest, config
 
 
+def _extract_builder_binding(config: Any) -> dict[str, Any]:
+    if hasattr(config, "agents") and "builder" in config.agents:
+        builder = config.agents.get("builder")
+    elif isinstance(config, dict) and "agents" in config:
+        builder = config["agents"].get("builder")
+    else:
+        builder = None
+    if not builder:
+        raise WorkflowError("Runner config missing agents.builder", EXIT_BLOCKER, "WORKFLOW_CONFIG_ERROR")
+    tool = getattr(builder, "tool", None) if hasattr(builder, "tool") else (builder.get("tool") if isinstance(builder, dict) else None)
+    model = getattr(builder, "model", None) if hasattr(builder, "model") else (builder.get("model") if isinstance(builder, dict) else None)
+    executable = getattr(builder, "executable", None) if hasattr(builder, "executable") else (builder.get("executable") if isinstance(builder, dict) else None)
+    timeout = getattr(builder, "timeout_seconds", None) if hasattr(builder, "timeout_seconds") else (builder.get("timeout_seconds", 300) if isinstance(builder, dict) else 300)
+    if not tool or not model or not executable or not isinstance(timeout, int) or timeout <= 0:
+        raise WorkflowError("Runner config agents.builder is incomplete or invalid", EXIT_BLOCKER, "WORKFLOW_CONFIG_ERROR")
+    return {
+        "tool": str(tool),
+        "model": str(model),
+        "executable": str(executable),
+        "timeout_seconds": int(timeout),
+    }
+
+
+def _create_execution_config_snapshot(
+    wdir: Path,
+    defaults: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    builder_binding: Mapping[str, Any],
+    live_config: Any,
+) -> Path:
+    """Snapshot execution configuration to ensure executed builder/reviewer authority matches Gate A."""
+    exec_config_path = wdir / "execution_config.toml"
+    runtime_root = str(defaults["runtime_root"])
+
+    def _extract_role_tuple(agent: Any) -> tuple[str, str, str, int]:
+        if agent is None:
+            raise WorkflowError("Missing agent role in config", EXIT_BLOCKER, "WORKFLOW_CONFIG_ERROR")
+        tool = getattr(agent, "tool", None) if hasattr(agent, "tool") else (agent.get("tool") if isinstance(agent, dict) else None)
+        model = getattr(agent, "model", None) if hasattr(agent, "model") else (agent.get("model") if isinstance(agent, dict) else None)
+        exe = getattr(agent, "executable", None) if hasattr(agent, "executable") else (agent.get("executable") if isinstance(agent, dict) else None)
+        timeout = getattr(agent, "timeout_seconds", None) if hasattr(agent, "timeout_seconds") else (agent.get("timeout_seconds", 300) if isinstance(agent, dict) else 300)
+        return str(tool), str(model), str(exe), int(timeout)
+
+    # Builder role strictly from frozen builder_binding
+    b_tool = str(builder_binding["tool"])
+    b_model = str(builder_binding["model"])
+    b_exe = str(builder_binding["executable"])
+    b_timeout = int(builder_binding["timeout_seconds"])
+
+    # SOS Reviewer: from contract if TARGETED, else from live_config
+    if contract.get("review_policy", {}).get("review_mode") == "TARGETED" and contract.get("review_policy", {}).get("reviewer"):
+        r_info = contract["review_policy"]["reviewer"]
+        r_tool = str(r_info.get("tool", "codex"))
+        r_model = str(r_info.get("model", "gpt-5.6-luna"))
+        r_exe = str(r_info.get("executable"))
+        r_timeout = int(r_info.get("timeout_seconds", 300))
+    elif hasattr(live_config, "agents") and "sos_reviewer" in live_config.agents:
+        r_tool, r_model, r_exe, r_timeout = _extract_role_tuple(live_config.agents["sos_reviewer"])
+    elif isinstance(live_config, dict) and "agents" in live_config and "sos_reviewer" in live_config["agents"]:
+        r_tool, r_model, r_exe, r_timeout = _extract_role_tuple(live_config["agents"]["sos_reviewer"])
+    else:
+        r_tool, r_model, r_exe, r_timeout = "codex", "gpt-5.6-luna", b_exe, 300
+
+    # DV role: from live_config
+    if hasattr(live_config, "agents") and "dv" in live_config.agents:
+        dv_tool, dv_model, dv_exe, dv_timeout = _extract_role_tuple(live_config.agents["dv"])
+    elif isinstance(live_config, dict) and "agents" in live_config and "dv" in live_config["agents"]:
+        dv_tool, dv_model, dv_exe, dv_timeout = _extract_role_tuple(live_config["agents"]["dv"])
+    else:
+        dv_tool, dv_model, dv_exe, dv_timeout = "opencode2", "dv-default", b_exe, 300
+
+    content = (
+        f"[runner]\n"
+        f"runtime_root = {json.dumps(runtime_root)}\n\n"
+        f"[agents.builder]\n"
+        f"tool = {json.dumps(b_tool)}\n"
+        f"executable = {json.dumps(b_exe)}\n"
+        f"model = {json.dumps(b_model)}\n"
+        f"timeout_seconds = {b_timeout}\n\n"
+        f"[agents.dv]\n"
+        f"tool = {json.dumps(dv_tool)}\n"
+        f"executable = {json.dumps(dv_exe)}\n"
+        f"model = {json.dumps(dv_model)}\n"
+        f"timeout_seconds = {dv_timeout}\n\n"
+        f"[agents.sos_reviewer]\n"
+        f"tool = {json.dumps(r_tool)}\n"
+        f"executable = {json.dumps(r_exe)}\n"
+        f"model = {json.dumps(r_model)}\n"
+        f"timeout_seconds = {r_timeout}\n"
+    )
+    _write_text_atomic(exec_config_path, content)
+    return exec_config_path
+
+
 def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None) -> dict[str, Any]:
     if not isinstance(description, str) or not description.strip():
         raise WorkflowError("Task description must be a non-empty string", EXIT_USAGE, "WORKFLOW_INPUT_ERROR")
@@ -411,11 +516,12 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
             review_brief = f"Targeted semantic review for: {desc[:300]}"
 
     behavior = f"Implement requested change: {desc}"
-    builder = config.agents.get("builder")
+    builder_binding = _extract_builder_binding(config)
     execution = {
-        "builder_tool": getattr(builder, "tool", ""),
-        "builder_model": getattr(builder, "model", ""),
-        "builder_executable": getattr(builder, "executable", ""),
+        "builder_tool": builder_binding["tool"],
+        "builder_model": builder_binding["model"],
+        "builder_executable": builder_binding["executable"],
+        "builder_timeout_seconds": builder_binding["timeout_seconds"],
         "config_source": str(defaults["config_source"]),
     }
     review_reason = ""
@@ -444,6 +550,7 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
         "review_brief": review_brief,
         "review_reason": review_reason,
         "uncertainties": list(uncertainties),
+        "builder_binding": builder_binding,
         "execution": dict(execution),
         "baseline_head": str(inspection.get("head")).lower(),
         "baseline_tree": str(inspection.get("tree")).lower(),
@@ -528,8 +635,21 @@ def find_latest_task_id(runtime_root: Path | str | None = None, project_id: str 
     return candidates[-1]
 
 
-def _new_task_record(plan: Mapping[str, Any], task_id: str, status: str, run_id: str | None) -> dict[str, Any]:
+def _new_task_record(
+    plan: Mapping[str, Any],
+    task_id: str,
+    status: str,
+    run_id: str | None,
+    contract_path: str | None = None,
+    contract_hash: str | None = None,
+    builder_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     now = _utc_now()
+    b_binding = None
+    if builder_binding is not None:
+        b_binding = dict(builder_binding)
+    elif contract_hash is not None and "builder_binding" in plan and plan["builder_binding"] is not None:
+        b_binding = dict(plan["builder_binding"])
     return {
         "schema_version": SCHEMA_VERSION_TASK,
         "task_id": task_id,
@@ -552,7 +672,183 @@ def _new_task_record(plan: Mapping[str, Any], task_id: str, status: str, run_id:
         "review_status": None,
         "error_class": None,
         "error": None,
+        "contract_path": contract_path,
+        "contract_hash": contract_hash,
+        "builder_binding": b_binding,
     }
+
+
+def task_requires_frozen_contract_binding(
+    task_record: Mapping[str, Any],
+    runtime_root: Path | str | None = None,
+) -> bool:
+    """Return True if this task record requires a valid frozen contract binding."""
+    status = str(task_record.get("status") or "")
+    if status in ("PREVIEW", "AWAITING_GATE_A", "ACCEPTANCE_READY", "ACCEPTED"):
+        return True
+    if task_record.get("run_id"):
+        return True
+    for field in ("candidate_head", "candidate_tree", "candidate_ref", "review_status"):
+        if task_record.get(field) is not None:
+            return True
+    if task_record.get("contract_path") is not None or task_record.get("contract_hash") is not None:
+        return True
+    if runtime_root is not None:
+        task_id = str(task_record.get("task_id") or "").strip()
+        if task_id:
+            try:
+                rt = resolve_runtime_root(runtime_root)
+                wdir = _workflow_dir(rt, task_id)
+                if (wdir / "contract.json").is_file() or (wdir / "preview.json").is_file():
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def task_requires_frozen_builder_binding(
+    task_record: Mapping[str, Any],
+    runtime_root: Path | str | None = None,
+) -> bool:
+    """Return True if this task record requires a valid frozen builder execution binding."""
+    return task_requires_frozen_contract_binding(task_record, runtime_root)
+
+
+def load_frozen_builder_binding_for_task(
+    task_record: Mapping[str, Any],
+    task_id: str,
+    runtime_root: Path | str,
+) -> dict[str, Any]:
+    """Load and verify the builder execution binding frozen in the task record."""
+    rt = resolve_runtime_root(runtime_root)
+    if not task_requires_frozen_builder_binding(task_record, rt):
+        return {}
+
+    raw = task_record.get("builder_binding")
+    if raw is None or not isinstance(raw, dict):
+        raise WorkflowError(
+            f"Task {task_id} missing required builder_binding (WORKFLOW_EXECUTION_BINDING_MISMATCH)",
+            EXIT_BLOCKER,
+            "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+        )
+
+    for key in ("tool", "model", "executable", "timeout_seconds"):
+        val = raw.get(key)
+        if val is None:
+            raise WorkflowError(
+                f"Task {task_id} builder_binding missing field {key} (WORKFLOW_EXECUTION_BINDING_MISMATCH)",
+                EXIT_BLOCKER,
+                "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+            )
+        if key == "timeout_seconds":
+            if not isinstance(val, int) or val <= 0:
+                raise WorkflowError(
+                    f"Task {task_id} builder_binding timeout_seconds must be positive int (WORKFLOW_EXECUTION_BINDING_MISMATCH)",
+                    EXIT_BLOCKER,
+                    "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+                )
+        else:
+            if not isinstance(val, str) or not val.strip():
+                raise WorkflowError(
+                    f"Task {task_id} builder_binding field {key} must be non-empty string (WORKFLOW_EXECUTION_BINDING_MISMATCH)",
+                    EXIT_BLOCKER,
+                    "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+                )
+
+    wdir = _workflow_dir(rt, task_id)
+    preview_path = wdir / "preview.json"
+    if preview_path.is_file():
+        try:
+            preview_data = json.loads(preview_path.read_text(encoding="utf-8"))
+            p_binding = preview_data.get("builder_binding")
+            if p_binding is not None:
+                for key in ("tool", "model", "executable", "timeout_seconds"):
+                    if p_binding.get(key) != raw.get(key):
+                        raise WorkflowError(
+                            f"Task {task_id} builder_binding field {key} mismatches preview.json (WORKFLOW_EXECUTION_BINDING_MISMATCH)",
+                            EXIT_BLOCKER,
+                            "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+                        )
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return {
+        "tool": str(raw["tool"]),
+        "model": str(raw["model"]),
+        "executable": str(raw["executable"]),
+        "timeout_seconds": int(raw["timeout_seconds"]),
+    }
+
+
+def load_frozen_contract_for_task(
+    task_record: Mapping[str, Any],
+    task_id: str,
+    runtime_root: Path | str,
+) -> dict[str, Any]:
+    """Load and verify that the task's contract is the exact contract frozen in the task record."""
+    rt = resolve_runtime_root(runtime_root)
+    persisted_path_str = task_record.get("contract_path")
+    if not isinstance(persisted_path_str, str) or not persisted_path_str.strip():
+        raise WorkflowError(
+            f"Task {task_id} missing contract_path in task record (WORKFLOW_CONTRACT_BINDING_MISMATCH)",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        )
+    wdir = _workflow_dir(rt, task_id)
+    expected_contract_path = wdir / "contract.json"
+    try:
+        persisted_resolved = Path(persisted_path_str).resolve()
+    except Exception as exc:
+        raise WorkflowError(
+            f"Task {task_id} contract_path cannot be resolved (WORKFLOW_CONTRACT_BINDING_MISMATCH): {exc}",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        ) from exc
+    if persisted_resolved != expected_contract_path.resolve():
+        raise WorkflowError(
+            f"Task {task_id} contract_path {persisted_path_str!r} does not match expected workflow contract {expected_contract_path} (WORKFLOW_CONTRACT_BINDING_MISMATCH)",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        )
+
+    persisted_hash = task_record.get("contract_hash")
+    if not isinstance(persisted_hash, str) or not re.fullmatch(r"^[0-9a-f]{64}$", persisted_hash):
+        raise WorkflowError(
+            f"Task {task_id} has invalid or missing contract_hash in task record (WORKFLOW_CONTRACT_BINDING_MISMATCH): {persisted_hash!r}",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        )
+
+    if not expected_contract_path.is_file():
+        raise WorkflowError(
+            f"Task {task_id} missing pre-approved contract: {expected_contract_path}",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_MISSING",
+        )
+
+    try:
+        contract = C.load_design_contract_v2(expected_contract_path)
+    except RunnerError as exc:
+        raise WorkflowError(f"Contract loading failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_ERROR") from exc
+
+    loaded_hash = str(contract.get("contract_hash") or "")
+    if loaded_hash != persisted_hash:
+        raise WorkflowError(
+            f"Task {task_id} contract hash mismatch (WORKFLOW_CONTRACT_BINDING_MISMATCH): loaded {loaded_hash} != persisted {persisted_hash}",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        )
+
+    expected_id = f"design-{persisted_hash}"
+    loaded_id = str(contract.get("contract_id") or "")
+    if loaded_id != expected_id:
+        raise WorkflowError(
+            f"Task {task_id} contract id mismatch (WORKFLOW_CONTRACT_BINDING_MISMATCH): loaded {loaded_id} != expected {expected_id}",
+            EXIT_BLOCKER,
+            "WORKFLOW_CONTRACT_BINDING_MISMATCH",
+        )
+
+    return contract
 
 
 def _gate_a_for_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
@@ -580,121 +876,206 @@ def create_task(
     preview_only: bool = False,
     approval_text: str | None = None,
     runtime_root: Path | str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Prepare, optionally execute, and persist one M2 task. No retries."""
     rt = resolve_runtime_root(runtime_root)
     defaults, _ = load_project_defaults(rt)
-    plan = derive_plan(defaults, description, scope)
-    task_id = _next_task_id(rt, str(defaults["project_id"]))
-    wdir = _workflow_dir(rt, task_id)
-    wdir.mkdir(parents=True, exist_ok=True)
+
+    if task_id is not None:
+        if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
+            raise WorkflowError(f"Task ID is invalid: {task_id!r}", EXIT_BLOCKER, "WORKFLOW_TASK_ID")
+        wdir = _workflow_dir(rt, task_id)
+        record = load_task_record(rt, task_id)
+        contract = load_frozen_contract_for_task(record, task_id, rt)
+        frozen_builder = load_frozen_builder_binding_for_task(record, task_id, rt)
+        contract_path = wdir / "contract.json"
+        if record.get("status") not in ("PREVIEW", "AWAITING_GATE_A"):
+            raise WorkflowError(f"Task {task_id} is in status {record.get('status')} and cannot be executed", EXIT_USAGE, "WORKFLOW_TASK_ALREADY_EXECUTED")
+        if scope is not None and record.get("scope") is not None and scope != record.get("scope"):
+            raise WorkflowError(f"Scope mismatch for existing task {task_id}: expected {record.get('scope')!r}, got {scope!r}", EXIT_BLOCKER, "WORKFLOW_AUTHORITY_DRIFT")
+        if description and record.get("description") and description != record.get("description"):
+            raise WorkflowError(f"Description mismatch for existing task {task_id}: expected {record.get('description')!r}, got {description!r}", EXIT_BLOCKER, "WORKFLOW_AUTHORITY_DRIFT")
+        manifest, config = _load_manifest_and_config(defaults)
+        try:
+            inspection = C.inspect_project(manifest)
+        except RunnerError as exc:
+            raise WorkflowError(f"Project inspection failed: {exc}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE") from exc
+        if str(inspection.get("head")).lower() != str(contract["baseline_head"]).lower() or str(inspection.get("tree")).lower() != str(contract["baseline_tree"]).lower():
+            raise WorkflowError(f"Baseline drifted between preview and approval for {task_id}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE")
+
+        # Validate builder execution authority against frozen binding
+        live_builder = _extract_builder_binding(config)
+        for key in ("tool", "model", "executable", "timeout_seconds"):
+            if live_builder[key] != frozen_builder.get(key):
+                raise WorkflowError(
+                    f"Builder {key} drifted between preview and approval for {task_id}: expected {frozen_builder.get(key)!r}, got {live_builder[key]!r}",
+                    EXIT_BLOCKER,
+                    "WORKFLOW_EXECUTION_BINDING_MISMATCH",
+                )
+
+        if contract["review_policy"]["review_mode"] == "TARGETED":
+            current_reviewer_exe = str(config.agents["sos_reviewer"].executable)
+            contract_reviewer = contract["review_policy"]["reviewer"]
+            if current_reviewer_exe != contract_reviewer.get("executable"):
+                raise WorkflowError("Reviewer configuration drifted between preview and approval", EXIT_BLOCKER, "WORKFLOW_CONFIG_DRIFT")
+            current_reviewer_model = getattr(config.agents["sos_reviewer"], "model", None)
+            if current_reviewer_model is not None and contract_reviewer.get("model") is not None:
+                if str(current_reviewer_model) != str(contract_reviewer.get("model")):
+                    raise WorkflowError("Reviewer configuration drifted between preview and approval", EXIT_BLOCKER, "WORKFLOW_CONFIG_DRIFT")
+            from prj226_runner.reviewer_profile import resolve_reviewer_executable
+            resolved_exe = resolve_reviewer_executable(current_reviewer_exe)
+            digest = hashlib.sha256()
+            with resolved_exe.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            current_sha = digest.hexdigest()
+            if current_sha != contract_reviewer.get("executable_sha256"):
+                raise WorkflowError("Reviewer executable binary drifted between preview and approval", EXIT_BLOCKER, "WORKFLOW_EXECUTABLE_DRIFT")
+        plan = {
+            "project_id": contract["project_id"],
+            "description": description or record.get("description", str(contract["work_item_title"])),
+            "scope": scope or record.get("scope"),
+            "behavior": record.get("behavior", f"Implement requested change: {contract['work_item_title']}"),
+            "authorized_paths": list(contract["owned_paths"]),
+            "checks": [list(c) for c in contract["acceptance_instruments"]],
+            "change_categories": list(contract["review_policy"].get("change_categories", [])),
+            "human_requested_targeted": bool(contract["review_policy"].get("human_requested_targeted", False)),
+            "review_mode": str(contract["review_policy"]["review_mode"]),
+            "review_brief": contract["review_policy"].get("reviewer", {}).get("review_brief") if contract["review_policy"].get("reviewer") else None,
+            "review_reason": record.get("review_mode", ""),
+            "uncertainties": [],
+            "builder_binding": frozen_builder,
+            "execution": {
+                "builder_tool": frozen_builder["tool"],
+                "builder_model": frozen_builder["model"],
+                "builder_executable": frozen_builder["executable"],
+                "builder_timeout_seconds": frozen_builder["timeout_seconds"],
+                "config_source": str(defaults["config_source"]),
+            },
+            "baseline_head": str(contract["baseline_head"]).lower(),
+            "baseline_tree": str(contract["baseline_tree"]).lower(),
+            "canonical_branch": str(contract["canonical_branch"]),
+            "product_repository": str(contract["repository_path"]),
+            "protected_dirty_paths": list(contract.get("protected_dirty_paths", [])),
+            "runtime_root": str(defaults["runtime_root"]),
+        }
+    else:
+        plan = derive_plan(defaults, description, scope)
+        task_id = _next_task_id(rt, str(defaults["project_id"]))
+        wdir = _workflow_dir(rt, task_id)
+        wdir.mkdir(parents=True, exist_ok=True)
+        run_id = f"{task_id}-RUN"
+        manifest, config = _load_manifest_and_config(defaults)
+        try:
+            inspection = C.inspect_project(manifest)
+        except RunnerError as exc:
+            record = _new_task_record(plan, task_id, "STOPPED", None, contract_path=None, contract_hash=None)
+            record.update({"error_class": "GOVERNANCE_BLOCKER", "error": exc.message if hasattr(exc, "message") else str(exc)})
+            save_task_record(rt, record)
+            raise WorkflowError(f"Project inspection failed: {exc}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE") from exc
+        work_item = {"work_item_id": task_id, "title": plan["description"]}
+        draft_kwargs: dict[str, Any] = {
+            "run_id": run_id,
+            "owned_paths": list(plan["authorized_paths"]),
+            "runtime_root": str(defaults["runtime_root"]),
+            "change_categories": list(plan["change_categories"]),
+            "human_requested_targeted": bool(plan["human_requested_targeted"]),
+            "acceptance_instruments": [list(c) for c in plan["checks"]],
+        }
+        if plan["review_mode"] == "TARGETED":
+            reviewer_agent = config.agents.get("sos_reviewer")
+            if reviewer_agent is None:
+                raise WorkflowError("TARGETED review requires agents.sos_reviewer in config", EXIT_BLOCKER, "WORKFLOW_CONFIG_ERROR")
+            reviewer_exe = str(reviewer_agent.executable)
+            configured_model = getattr(reviewer_agent, "model", None)
+            draft_kwargs.update(
+                {
+                    "reviewer_executable": reviewer_exe,
+                    "reviewer_model": str(configured_model) if configured_model is not None else "gpt-5.6-luna",
+                    "reviewer_timeout_seconds": int(reviewer_agent.timeout_seconds),
+                    "review_brief": str(plan["review_brief"]),
+                }
+            )
+        contract_path = wdir / "contract.json"
+        try:
+            contract = C.draft_design_contract_v2(manifest, work_item, inspection, output_path=contract_path, **draft_kwargs)
+        except RunnerError as exc:
+            record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=None, contract_hash=None)
+            record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
+            save_task_record(rt, record)
+            raise WorkflowError(f"Contract draft failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_ERROR") from exc
+
     preview = {
         "task_id": task_id,
+        "contract_hash": contract["contract_hash"],
+        "contract_path": str(contract_path),
         "request": plan["description"],
         "behavior": plan["behavior"],
-        "files": list(plan["authorized_paths"]),
-        "checks": [list(c) for c in plan["checks"]],
+        "files": list(contract["owned_paths"]),
+        "checks": [list(c) for c in contract["acceptance_instruments"]],
+        "builder_binding": dict(plan["builder_binding"]),
         "execution": dict(plan["execution"]),
-        "review_mode": plan["review_mode"],
+        "review_mode": contract["review_policy"]["review_mode"],
         "review_reason": plan["review_reason"],
+        "reviewer": contract["review_policy"].get("reviewer"),
         "uncertainties": list(plan["uncertainties"]),
-        "baseline_head": plan["baseline_head"],
-        "baseline_tree": plan["baseline_tree"],
-        "canonical_branch": plan["canonical_branch"],
-        "product_repository": plan["product_repository"],
+        "baseline_head": contract["baseline_head"],
+        "baseline_tree": contract["baseline_tree"],
+        "canonical_branch": contract["canonical_branch"],
+        "product_repository": contract["repository_path"],
         "scope": plan["scope"],
     }
+    try:
+        (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise WorkflowError(f"Cannot write preview: {exc}", EXIT_BLOCKER, "WORKFLOW_WRITE_ERROR") from exc
+
     if preview_only:
-        record = _new_task_record(plan, task_id, "PREVIEW", None)
+        record = _new_task_record(plan, task_id, "PREVIEW", None, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         save_task_record(rt, record)
-        # Persist preview for audit (not authority).
-        try:
-            (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise WorkflowError(f"Cannot write preview: {exc}", EXIT_BLOCKER, "WORKFLOW_WRITE_ERROR") from exc
-        return {"task_id": task_id, "status": "PREVIEW", "preview": preview, "plan": plan, "record": record}
+        return {"task_id": task_id, "status": "PREVIEW", "preview": preview, "plan": plan, "record": record, "contract": contract}
+
     # Normal path requires explicit literal approval.
     approved = isinstance(approval_text, str) and approval_text.strip() == "approve"
     if not approved:
-        record = _new_task_record(plan, task_id, "AWAITING_GATE_A", None)
+        record = _new_task_record(plan, task_id, "AWAITING_GATE_A", None, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         save_task_record(rt, record)
-        try:
-            (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise WorkflowError(f"Cannot write preview: {exc}", EXIT_BLOCKER, "WORKFLOW_WRITE_ERROR") from exc
         raise WorkflowError(
             f"Gate A requires literal 'approve'. Task {task_id} preserved without execution.",
             EXIT_STOPPED,
             "WORKFLOW_GATE_A_DECLINED",
         )
-    # Approved: construct exact M1 v2 authority internally.
+
+    # Approved:
     run_id = f"{task_id}-RUN"
-    manifest, config = _load_manifest_and_config(defaults)
-    # Fresh inspection for contract (already in plan, but re-inspect to bind exact truth).
-    try:
-        inspection = C.inspect_project(manifest)
-    except RunnerError as exc:
-        record = _new_task_record(plan, task_id, "STOPPED", None)
-        record.update({"error_class": "GOVERNANCE_BLOCKER", "error": exc.message if hasattr(exc, "message") else str(exc)})
-        save_task_record(rt, record)
-        raise WorkflowError(f"Project inspection failed: {exc}", EXIT_BLOCKER, "WORKFLOW_BASELINE_STALE") from exc
-    work_item = {"work_item_id": task_id, "title": plan["description"]}
-    draft_kwargs: dict[str, Any] = {
-        "run_id": run_id,
-        "owned_paths": list(plan["authorized_paths"]),
-        "runtime_root": str(defaults["runtime_root"]),
-        "change_categories": list(plan["change_categories"]),
-        "human_requested_targeted": bool(plan["human_requested_targeted"]),
-        "acceptance_instruments": [list(c) for c in plan["checks"]],
-    }
-    if plan["review_mode"] == "TARGETED":
-        # Reuse the configured sos_reviewer executable as the frozen reviewer source.
-        reviewer_exe = str(config.agents["sos_reviewer"].executable)
-        draft_kwargs.update(
-            {
-                "reviewer_executable": reviewer_exe,
-                "reviewer_model": "gpt-5.6-luna",
-                "reviewer_timeout_seconds": int(config.agents["sos_reviewer"].timeout_seconds),
-                "review_brief": str(plan["review_brief"]),
-            }
-        )
-    try:
-        contract = C.draft_design_contract_v2(manifest, work_item, inspection, **draft_kwargs)
-    except RunnerError as exc:
-        record = _new_task_record(plan, task_id, "STOPPED", run_id)
-        record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
-        save_task_record(rt, record)
-        raise WorkflowError(f"Contract draft failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_ERROR") from exc
     gate_a = _gate_a_for_contract(contract)
-    # Persist internal M1 authority under workflow dir (operator never hand-edits).
-    contract_path = wdir / "contract.json"
     gate_path = wdir / "gate-a.json"
     packet_path = wdir / "packet.json"
-    _write_atomic(contract_path, contract)
     _write_atomic(gate_path, gate_a)
     try:
         packet = C.derive_task_packet_v2(contract, gate_a, output_path=packet_path)
     except RunnerError as exc:
-        record = _new_task_record(plan, task_id, "STOPPED", run_id)
+        record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
         save_task_record(rt, record)
         raise WorkflowError(f"Packet derivation failed: {exc}", EXIT_BLOCKER, "WORKFLOW_PACKET_ERROR") from exc
-    # Execute exactly once via frozen M1 (no retry, no fallback).
-    config_path = Path(str(defaults["config_source"]))
+
+    exec_config_path = _create_execution_config_snapshot(wdir, defaults, contract, plan["builder_binding"], config)
     try:
-        result = R.run_packet_v2(packet_path, contract_path, gate_path, config_path, authorize=True)
+        result = R.run_packet_v2(packet_path, contract_path, gate_path, exec_config_path, authorize=True)
     except RunnerError as exc:
-        # Fail-closed blockers (baseline drift, Gate A drift, etc.).
-        record = _new_task_record(plan, task_id, "STOPPED", run_id)
+        record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
-        record["authorized_paths"] = list(plan["authorized_paths"])
+        record["authorized_paths"] = list(contract["owned_paths"])
         save_task_record(rt, record)
         raise WorkflowError(f"Execution blocked: {getattr(exc, 'message', str(exc))}", EXIT_BLOCKER, "WORKFLOW_EXECUTION_BLOCKED") from exc
     except Exception as exc:
-        record = _new_task_record(plan, task_id, "STOPPED", run_id)
+        record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update({"error_class": "ENVIRONMENT_ERROR", "error": f"Unexpected runner failure: {exc}"})
         save_task_record(rt, record)
         raise WorkflowError(f"Execution failed: {exc}", EXIT_BLOCKER, "WORKFLOW_EXECUTION_BLOCKED") from exc
+
     # Ingest for controller verification (validates evidence binding).
     run_root = Path(str(defaults["runtime_root"])) / run_id
     report_path = run_root / "report.json"
@@ -717,7 +1098,7 @@ def create_task(
             ingest_error = getattr(exc, "message", str(exc))
     else:
         ingest_error = f"M1 report missing: {report_path}"
-    # Persist controller result alongside workflow for status/resume/accept.
+
     if ingested is not None:
         try:
             _write_atomic(wdir / "controller-result.json", ingested)
@@ -727,8 +1108,7 @@ def create_task(
         status = "ACCEPTANCE_READY"
         acceptance_ref = str(wdir / "controller-result.json")
     elif outcome == "ACCEPTANCE_READY":
-        # Runner claims acceptance but evidence cannot be validated: fail closed.
-        record = _new_task_record(plan, task_id, "STOPPED", run_id)
+        record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update(
             {
                 "candidate_head": candidate_head,
@@ -753,7 +1133,8 @@ def create_task(
     else:
         status = "STOPPED"
         acceptance_ref = None
-    record = _new_task_record(plan, task_id, status, run_id)
+
+    record = _new_task_record(plan, task_id, status, run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
     record.update(
         {
             "candidate_head": candidate_head,
@@ -766,7 +1147,6 @@ def create_task(
         }
     )
     save_task_record(rt, record)
-    # Also persist preview for audit.
     try:
         (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except OSError:
@@ -793,14 +1173,8 @@ def _load_m1_authority_for_task(task_record: Mapping[str, Any], defaults: Mappin
     """Load persisted contract + validate M1 evidence. Fail closed on any drift."""
     rt = Path(str(defaults["runtime_root"]))
     task_id = str(task_record.get("task_id"))
-    wdir = _workflow_dir(rt, task_id)
-    contract_path = wdir / "contract.json"
-    if not contract_path.is_file():
-        raise WorkflowError(f"Task {task_id} has no persisted M1 contract", EXIT_BLOCKER, "WORKFLOW_MISSING_AUTHORITY")
-    try:
-        contract = C.load_design_contract_v2(contract_path)
-    except RunnerError as exc:
-        raise WorkflowError(f"Contract reload failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_STALE") from exc
+    contract = load_frozen_contract_for_task(task_record, task_id, rt)
+    load_frozen_builder_binding_for_task(task_record, task_id, rt)
     run_id = task_record.get("run_id")
     if not run_id:
         return contract, None, None
@@ -839,6 +1213,9 @@ def get_status(task_id: str | None = None, runtime_root: Path | str | None = Non
     ingested: dict[str, Any] | None = None
     if record.get("run_id"):
         contract, report, ingested = _load_m1_authority_for_task(record, defaults)
+    elif task_requires_frozen_contract_binding(record, rt):
+        contract = load_frozen_contract_for_task(record, tid, rt)
+        load_frozen_builder_binding_for_task(record, tid, rt)
         # Cross-check cached candidate/review against authoritative evidence.
         if report is not None:
             for field in ("candidate_head", "candidate_tree", "candidate_ref", "review_status"):
@@ -852,6 +1229,9 @@ def get_status(task_id: str | None = None, runtime_root: Path | str | None = Non
                         EXIT_BLOCKER,
                         "WORKFLOW_RECORD_DRIFT",
                     )
+    elif task_requires_frozen_contract_binding(record, rt):
+        contract = load_frozen_contract_for_task(record, tid, rt)
+        load_frozen_builder_binding_for_task(record, tid, rt)
     # Derive human-facing status fields without mutation.
     status = str(record.get("status"))
     candidate_head = record.get("candidate_head")
@@ -925,6 +1305,9 @@ def build_continuation(task_id: str, runtime_root: Path | str | None = None) -> 
     ingested: dict[str, Any] | None = None
     if record.get("run_id"):
         contract, report, ingested = _load_m1_authority_for_task(record, defaults)
+    elif task_requires_frozen_contract_binding(record, rt):
+        contract = load_frozen_contract_for_task(record, tid, rt)
+        load_frozen_builder_binding_for_task(record, tid, rt)
     status = str(record.get("status"))
     run_id = record.get("run_id")
     candidate_head = record.get("candidate_head")

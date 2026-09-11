@@ -133,8 +133,8 @@ class R001Fixture:
             "tool = 'opencode2'\n"
             f"executable = {json.dumps(str(self.fake_builder))}\nmodel = 'fake-muse'\ntimeout_seconds = 20\n\n"
             "[agents.sos_reviewer]\n"
-            "tool = 'opencode2'\n"
-            f"executable = {json.dumps(str(self.fake_reviewer))}\nmodel = 'fake-mimo'\ntimeout_seconds = 20\n",
+            "tool = 'codex'\n"
+            f"executable = {json.dumps(str(self.fake_reviewer))}\nmodel = 'gpt-5.6-luna'\ntimeout_seconds = 20\n",
             encoding="utf-8",
         )
         self.manifest_dict = {

@@ -201,8 +201,8 @@ class M2Fixture:
             "tool = 'opencode2'\n"
             f"executable = {json.dumps(str(self.fake_builder))}\nmodel = 'fake-muse'\ntimeout_seconds = 20\n\n"
             "[agents.sos_reviewer]\n"
-            "tool = 'opencode2'\n"
-            f"executable = {json.dumps(str(self.fake_reviewer))}\nmodel = 'fake-mimo'\ntimeout_seconds = 20\n",
+            "tool = 'codex'\n"
+            f"executable = {json.dumps(str(self.fake_reviewer))}\nmodel = 'gpt-5.6-luna'\ntimeout_seconds = 20\n",
             encoding="utf-8",
         )
 
@@ -275,7 +275,7 @@ class TestM2(unittest.TestCase):
         outcome = W.create_task("Add bounded widget", None, preview_only=True, runtime_root=self.fix.runtime)
         preview = outcome["preview"]
         text = P.format_gate_a_preview(preview)
-        for field in ("REQUEST", "BEHAVIOR", "FILES", "CHECKS", "EXECUTION", "REVIEW", "UNCERTAINTY"):
+        for field in ("REQUEST", "BEHAVIOR", "FILES", "CHECKS", "EXECUTION", "REVIEW", "CONTRACT", "UNCERTAINTY"):
             self.assertIn(field, text, field)
         self.assertIn("Add bounded widget", text)
         self.assertIn("src/app.txt", text)

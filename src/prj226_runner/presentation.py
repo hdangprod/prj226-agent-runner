@@ -56,6 +56,25 @@ def format_gate_a_preview(preview: Mapping[str, Any]) -> str:
     if reason:
         lines.append(f"- reason: {reason}")
     lines.append("")
+    contract_hash = preview.get("contract_hash")
+    if contract_hash:
+        lines.append("CONTRACT")
+        lines.append(f"- {contract_hash}")
+        lines.append("")
+    if preview.get("review_mode") == "TARGETED":
+        reviewer = preview.get("reviewer") or {}
+        r_tool = reviewer.get("tool", "")
+        r_model = reviewer.get("model", "")
+        r_exe = reviewer.get("executable") or reviewer.get("resolved_executable", "")
+        r_profile_hash = reviewer.get("reviewer_profile_hash") or reviewer.get("profile_hash", "")
+        r_exe_sha = reviewer.get("executable_sha256", "")
+        lines.append("REVIEWER")
+        lines.append(f"- tool: {r_tool}")
+        lines.append(f"- model: {r_model}")
+        lines.append(f"- executable: {r_exe}")
+        lines.append(f"- profile_hash: {r_profile_hash}")
+        lines.append(f"- executable_sha256: {r_exe_sha}")
+        lines.append("")
     lines.append("UNCERTAINTY")
     uncertainties = preview.get("uncertainties") or []
     if uncertainties:

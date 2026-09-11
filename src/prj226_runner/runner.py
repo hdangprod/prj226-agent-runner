@@ -980,15 +980,15 @@ def _targeted_schema_path() -> Path:
     return get_runner_root() / "schemas" / "targeted-review-result.schema.json"
 
 
-def _targeted_review_prompt(packet: TaskPacketV2, contract: Mapping[str, Any], candidate: str, tree: str, changes: list[str], tests: list[dict[str, Any]]) -> str:
+def _targeted_review_prompt(packet: TaskPacketV2, contract: Mapping[str, Any], candidate: str, tree: str, changes: list[str], tests: list[dict[str, Any]], candidate_ref: str) -> str:
     brief = str(packet.review_policy["reviewer"]["review_brief"])
     context = json.dumps({"task_id": packet.task_id, "run_id": packet.run_id,
                           "baseline_head": packet.baseline_head, "baseline_tree": packet.baseline_tree,
-                          "candidate_head": candidate, "candidate_tree": tree,
+                          "candidate_head": candidate, "candidate_tree": tree, "candidate_ref": candidate_ref,
                           "authorized_paths": packet.authorized_paths, "actual_changed_paths": changes,
                           "acceptance_criteria": packet.acceptance_criteria,
                           "deterministic_tests": [{"argv": item["argv"], "exit_code": item["exit_code"]} for item in tests]})
-    return brief + "\n\nTargeted semantic review. Inspect the current immutable candidate read-only. Do not edit, commit, or repair. Return only JSON conforming to HARN-002.TARGETED_REVIEW.v1.\n\n" + context
+    return brief + "\n\nTargeted semantic review. Inspect the current immutable candidate read-only. Do not edit, commit, or repair. Return only JSON conforming to HARN-002.TARGETED_REVIEW.v1. `reviewed_ref` MUST equal the exact `candidate_ref` supplied in the context.\n\n" + context
 
 
 class _RunEvidenceV2:
@@ -1321,7 +1321,7 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
             finalized = _finalize_stopped(exc.error_class.value, exc.message, extra)
             return finalized
         # Single invocation; process failure wins over any PASS file.
-        prompt = _targeted_review_prompt(packet, contract, candidate, tree, changes, tests)
+        prompt = _targeted_review_prompt(packet, contract, candidate, tree, changes, tests, candidate_ref=branch)
         schema_path = _targeted_schema_path()
         # Verify frozen schema sha still matches live schema file.
         try:
