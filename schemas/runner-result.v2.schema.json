@@ -58,6 +58,8 @@
     "runner_acceptance_evidence_sha256": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
     "error_class": {"anyOf": [{"type": "string", "enum": ["ENVIRONMENT_ERROR", "AGENT_EXECUTION_ERROR", "ARTIFACT_VALIDATION_ERROR", "IMPLEMENTATION_FAILURE", "GOVERNANCE_BLOCKER"]}, {"type": "null"}]},
     "error": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-    "tests": {"type": "array"}
+    "tests": {"type": "array"},
+    "candidate_authority": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+    "candidate_authority_sha256": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]}
   }
 }

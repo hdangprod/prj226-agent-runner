@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CandidateAuthorityV1",
+  "description": "Closed candidate authority manifest binding Git truth, tracked files, and transient policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_head",
+    "candidate_tree",
+    "candidate_ref",
+    "baseline_head",
+    "approved_changed_paths",
+    "transient_paths",
+    "tracked_manifest",
+    "authority_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "PRJ226.M2.FINGERPRINT_001.CANDIDATE.v1"
+    },
+    "candidate_head": {
+      "$ref": "#/definitions/objectId"
+    },
+    "candidate_tree": {
+      "$ref": "#/definitions/objectId"
+    },
+    "candidate_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "baseline_head": {
+      "$ref": "#/definitions/objectId"
+    },
+    "approved_changed_paths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/relativePath"
+      }
+    },
+    "transient_paths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/relativePath"
+      }
+    },
+    "tracked_manifest": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "type",
+          "mode",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/definitions/relativePath"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "file",
+              "symlink"
+            ]
+          },
+          "mode": {
+            "type": "integer"
+          },
+          "target": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "authority_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "definitions": {
+    "objectId": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(^|/)\\.{1,2}(/|$))(?!.*(^|/)\\.git(/|$)).+$"
+    }
+  }
+}

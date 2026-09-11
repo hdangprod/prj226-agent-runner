@@ -54,6 +54,15 @@
     "builder_prompt": {"type": "string", "minLength": 1},
     "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
     "test_commands": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}},
-    "commit_message": {"type": "string", "minLength": 1}
+    "commit_message": {"type": "string", "minLength": 1},
+    "transient_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^(?!/)(?!.*\\\\)(?!.*(^|/)\\.{1,2}(/|$))(?!.*(^|/)\\.git(/|$)).+$"
+      }
+    }
   }
 }

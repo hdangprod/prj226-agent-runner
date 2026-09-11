@@ -2080,6 +2080,9 @@ CONTRACT_V2_KEYS = {
     "runtime_root",
     "review_policy",
 }
+CONTRACT_V2_OPTIONAL_KEYS = {
+    "transient_paths",
+}
 V2_RUNNER_RESULT_VERSION_LOCAL = "HARN-001.RUNNER_RESULT.v2"
 V2_CONTROLLER_RESULT_VERSION = "HARN-002.CONTROLLER_RESULT.v2"
 V2_GATE_B_VERSION = "HARN-002.GATE_B.v2"
@@ -2107,11 +2110,19 @@ V2_CONTROLLER_RESULT_COMMON = {
 
 
 def _contract_without_identity_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: contract[key] for key in sorted(CONTRACT_V2_KEYS - {"contract_id", "contract_hash"})}
+    active_keys = set(CONTRACT_V2_KEYS)
+    if "transient_paths" in contract:
+        active_keys.add("transient_paths")
+    return {key: contract[key] for key in sorted(active_keys - {"contract_id", "contract_hash"})}
 
 
 def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
-    data = _strict_object(dict(value), CONTRACT_V2_KEYS, "V2 Design Contract")
+    if not isinstance(value, (dict, Mapping)):
+        raise ArtifactValidationError("V2 Design Contract must be an object")
+    raw_keys = set(value)
+    if not (CONTRACT_V2_KEYS <= raw_keys <= (CONTRACT_V2_KEYS | CONTRACT_V2_OPTIONAL_KEYS)):
+        raise ArtifactValidationError("V2 Design Contract must contain exactly the HARN-002 contract fields")
+    data = dict(value)
     if data["contract_version"] != V2_CONTRACT_VERSION:
         raise ArtifactValidationError("V2 Design Contract version must be exactly HARN-002.v2")
     _non_empty_string(data["project_id"], "project_id")
@@ -2140,6 +2151,8 @@ def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
     _validate_object_id(data["baseline_tree"], "baseline_tree")
     _path_list(data["owned_paths"], "owned_paths", allow_empty=False)
     _path_list(data["protected_dirty_paths"], "protected_dirty_paths", allow_empty=True)
+    if "transient_paths" in data:
+        _path_list(data["transient_paths"], "transient_paths", allow_empty=True)
     _argv_list(data["acceptance_instruments"], "acceptance_instruments")
     if not data["acceptance_instruments"]:
         raise ArtifactValidationError("V2 acceptance_instruments must contain at least one deterministic command")
@@ -2155,6 +2168,8 @@ def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(data)
     normalized["review_policy"] = policy
     normalized["runtime_root"] = str(_lexical_absolute_path(data["runtime_root"], "runtime_root"))
+    if "transient_paths" in data:
+        normalized["transient_paths"] = list(data["transient_paths"])
     return normalized
 
 
@@ -2233,6 +2248,7 @@ def draft_design_contract_v2(
     discriminating_acceptance_controls: Sequence[str] | None = None,
     failure_conditions: Sequence[str] | None = None,
     exact_authority_boundary: str | None = None,
+    transient_paths: Sequence[str] | None = None,
     output_path: Path | str | None = None,
 ) -> dict[str, Any]:
     manifest = manifest if isinstance(manifest, ProjectManifest) else (
@@ -2316,6 +2332,8 @@ def draft_design_contract_v2(
         "runtime_root": runtime_abs,
         "review_policy": policy,
     }
+    if transient_paths is not None:
+        contract["transient_paths"] = _path_list(list(transient_paths), "transient_paths", allow_empty=True)
     digest = _sha(_contract_without_identity_v2(contract))
     contract["contract_hash"] = digest
     contract["contract_id"] = "design-" + digest
@@ -2347,7 +2365,7 @@ def _packet_prompt_v2(contract: Mapping[str, Any]) -> str:
 
 
 def _packet_mapping_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    packet: dict[str, Any] = {
         "packet_version": V2_PACKET_VERSION,
         "contract_id": contract["contract_id"],
         "contract_hash": contract["contract_hash"],
@@ -2365,6 +2383,9 @@ def _packet_mapping_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
         "test_commands": [list(item) for item in contract["acceptance_instruments"]],
         "commit_message": f"feat({str(contract['work_item_id']).lower()}): implement approved task",
     }
+    if "transient_paths" in contract:
+        packet["transient_paths"] = list(contract["transient_paths"])
+    return packet
 
 
 def validate_task_packet_derivation_v2(contract: Mapping[str, Any] | Path | str, packet: Mapping[str, Any] | TaskPacketV2) -> None:
@@ -2691,8 +2712,39 @@ def _validate_runner_acceptance_evidence_v2(
     worktree_path = evidence_root.absolute_path(evidence_paths["worktree"])
     if _git(worktree_path, ["rev-parse", "HEAD"]).lower() != candidate_head or _git(worktree_path, ["rev-parse", "HEAD^{tree}"]).lower() != candidate_tree:
         raise GovernanceBlockerError("Runner V2 candidate worktree identity is stale")
-    if fingerprint_worktree(worktree_path) != candidate_fingerprint:
-        raise GovernanceBlockerError("Runner V2 candidate worktree fingerprint changed")
+
+    authority_data = data.get("candidate_authority")
+    if authority_data is None:
+        try:
+            authority_snapshot = evidence_root.snapshot("candidate-authority.json", label="Candidate authority artifact")
+            authority_data = _json_value_from_snapshot(authority_snapshot, "Candidate authority artifact")
+        except Exception:
+            authority_data = None
+
+    if authority_data is not None:
+        from prj226_runner.candidate_authority import verify_candidate_authority, compute_authority_digest
+        if not isinstance(authority_data, dict):
+            raise ArtifactValidationError("Runner V2 candidate authority is not an object")
+        computed_digest = compute_authority_digest(authority_data)
+        if computed_digest != candidate_fingerprint:
+            raise GovernanceBlockerError("Runner V2 candidate authority digest mismatch")
+        verify_candidate_authority(worktree_path, authority_data)
+    else:
+        if fingerprint_worktree(worktree_path) != candidate_fingerprint:
+            raise GovernanceBlockerError("Runner V2 candidate worktree fingerprint changed")
+
+    if "candidate_authority_sha256" in data and data["candidate_authority_sha256"] is not None:
+        expected_auth_sha = data["candidate_authority_sha256"]
+        if not isinstance(expected_auth_sha, str) or not SHA256_RE.fullmatch(expected_auth_sha):
+            raise ArtifactValidationError("Runner V2 candidate_authority_sha256 is invalid")
+        try:
+            auth_snap = evidence_root.snapshot("candidate-authority.json", label="Candidate authority artifact")
+            if auth_snap.sha256 != expected_auth_sha:
+                raise ArtifactValidationError("Runner V2 candidate-authority.json sha256 mismatch")
+        except Exception as exc:
+            if isinstance(exc, ArtifactValidationError):
+                raise
+            raise ArtifactValidationError("Runner V2 candidate-authority.json missing or unreadable") from exc
     # Evidence file hashes: recompute core set and compare.
     required = data.get("required_evidence_references")
     if not isinstance(required, list) or not required or required != sorted(required) or len(required) != len(set(required)):

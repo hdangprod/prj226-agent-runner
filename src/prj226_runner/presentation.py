@@ -30,6 +30,12 @@ def format_gate_a_preview(preview: Mapping[str, Any]) -> str:
     else:
         lines.append("- <none>")
     lines.append("")
+    transient = preview.get("transient_paths") or []
+    if transient:
+        lines.append("TRANSIENT")
+        for path in transient:
+            lines.append(f"- {path}")
+        lines.append("")
     lines.append("CHECKS")
     checks = preview.get("checks") or []
     if checks:

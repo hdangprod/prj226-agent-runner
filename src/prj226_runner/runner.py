@@ -12,10 +12,10 @@ import os
 import re
 import subprocess
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from prj226_runner.calibration import (
     build_opencode_config_dict,
@@ -365,6 +365,7 @@ def _verify_candidate_identity(
     expected_paths: Iterable[str],
     candidate_ref: str | None = None,
     expected_fingerprint: str | None = None,
+    expected_authority: Mapping[str, Any] | None = None,
 ) -> None:
     if _git(repo, ["rev-parse", "HEAD"]).lower() != candidate:
         raise GovernanceBlockerError("Candidate HEAD changed after freeze")
@@ -372,6 +373,10 @@ def _verify_candidate_identity(
         raise GovernanceBlockerError("Candidate TREE changed after freeze")
     if candidate_ref is not None and _git(repo, ["rev-parse", candidate_ref]).lower() != candidate:
         raise GovernanceBlockerError("Candidate reference changed after freeze")
+    if expected_authority is not None:
+        from prj226_runner.candidate_authority import verify_candidate_authority
+        verify_candidate_authority(repo, expected_authority)
+        return
     if _git(repo, ["status", "--porcelain"]):
         raise GovernanceBlockerError("Candidate worktree is not clean")
     if expected_fingerprint is not None and fingerprint_worktree(repo) != expected_fingerprint:
@@ -721,6 +726,7 @@ class TaskPacketV2:
     acceptance_criteria: list[str]
     test_commands: list[list[str]]
     commit_message: str
+    transient_paths: list[str] = field(default_factory=list)
 
 
 def _v2_lexical_absolute(value: Any, field: str) -> str:
@@ -742,7 +748,8 @@ def parse_task_packet_v2(path: Path | str) -> TaskPacketV2:
         "baseline_tree", "authorized_paths", "builder_prompt", "acceptance_criteria",
         "test_commands", "commit_message",
     }
-    if not isinstance(data, dict) or set(data) != required:
+    allowed = required | {"transient_paths"}
+    if not isinstance(data, dict) or not (required <= set(data) <= allowed):
         raise ArtifactValidationError("Task packet V2 must contain exactly the HARN-001.TASK_PACKET.v2 fields")
     if data["packet_version"] != V2_PACKET_VERSION:
         raise ArtifactValidationError("Task packet V2 version is unsupported")
@@ -778,6 +785,16 @@ def parse_task_packet_v2(path: Path | str) -> TaskPacketV2:
         for command in commands
     ):
         raise ArtifactValidationError("V2 test_commands must be a non-empty array of non-empty argv arrays")
+    transient_paths: list[str] = []
+    if "transient_paths" in data:
+        raw_tp = data["transient_paths"]
+        if not isinstance(raw_tp, list) or not all(isinstance(x, str) for x in raw_tp):
+            raise ArtifactValidationError("transient_paths must be an array of strings")
+        from prj226_runner.candidate_authority import normalize_transient_paths
+        try:
+            transient_paths = normalize_transient_paths(raw_tp)
+        except Exception as exc:
+            raise ArtifactValidationError(f"Invalid transient_paths: {exc}") from exc
     return TaskPacketV2(
         packet_version=V2_PACKET_VERSION,
         contract_id=data["contract_id"], contract_hash=data["contract_hash"].lower(),
@@ -790,6 +807,7 @@ def parse_task_packet_v2(path: Path | str) -> TaskPacketV2:
         acceptance_criteria=list(criteria),
         test_commands=[list(command) for command in commands],
         commit_message=data["commit_message"],
+        transient_paths=transient_paths,
     )
 
 
@@ -805,6 +823,8 @@ def task_packet_hash_v2(packet: TaskPacketV2 | Mapping[str, Any]) -> str:
             "acceptance_criteria": packet.acceptance_criteria, "test_commands": packet.test_commands,
             "commit_message": packet.commit_message,
         }
+        if packet.transient_paths:
+            value["transient_paths"] = packet.transient_paths
     else:
         value = dict(packet)
     return _sha_canonical_v2(value)
@@ -826,11 +846,15 @@ def _load_contract_v2(path: Path | str) -> dict[str, Any]:
         "acceptance_instruments", "discriminating_acceptance_controls", "failure_conditions",
         "exact_authority_boundary", "readiness", "runtime_root", "review_policy",
     }
-    if set(data) != required_min:
+    allowed = required_min | {"transient_paths"}
+    if not (required_min <= set(data) <= allowed):
         raise ArtifactValidationError("V2 Design Contract must contain exactly the HARN-002.v2 fields")
     policy = normalize_review_policy(data["review_policy"])
+    active_keys = set(required_min)
+    if "transient_paths" in data:
+        active_keys.add("transient_paths")
     # Recompute identity over all content except id/hash.
-    content = {k: data[k] for k in sorted(required_min - {"contract_id", "contract_hash"})}
+    content = {k: data[k] for k in sorted(active_keys - {"contract_id", "contract_hash"})}
     # Normalize policy inside content for hashing stability.
     content["review_policy"] = policy
     expected_hash = _sha_canonical_v2(content)
@@ -850,7 +874,7 @@ def _v2_packet_prompt(contract: Mapping[str, Any]) -> str:
 
 
 def _v2_expected_packet_mapping(contract: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    packet = {
         "packet_version": V2_PACKET_VERSION,
         "contract_id": contract["contract_id"],
         "contract_hash": contract["contract_hash"],
@@ -868,6 +892,9 @@ def _v2_expected_packet_mapping(contract: Mapping[str, Any]) -> dict[str, Any]:
         "test_commands": [list(item) for item in contract["acceptance_instruments"]],
         "commit_message": f"feat({str(contract['work_item_id']).lower()}): implement approved task",
     }
+    if "transient_paths" in contract:
+        packet["transient_paths"] = list(contract["transient_paths"])
+    return packet
 
 
 def validate_task_packet_derivation_v2(contract: Mapping[str, Any], packet: TaskPacketV2 | Mapping[str, Any]) -> None:
@@ -902,9 +929,13 @@ def validate_task_packet_derivation_v2(contract: Mapping[str, Any], packet: Task
             actual["review_policy"] = normalize_review_policy(actual["review_policy"])
     except ArtifactValidationError as exc:
         raise ArtifactValidationError(f"V2 packet review_policy is invalid: {exc.message}") from exc
+    if "transient_paths" in expected or (isinstance(packet, TaskPacketV2) and packet.transient_paths) or (isinstance(packet, Mapping) and "transient_paths" in packet):
+        actual["transient_paths"] = list(packet.transient_paths) if isinstance(packet, TaskPacketV2) else list(packet.get("transient_paths") or [])
     for field in expected:
         if actual.get(field) != expected[field]:
             raise GovernanceBlockerError(f"Derived V2 Task Packet widens or changes approved field: {field}")
+    if "transient_paths" not in expected and actual.get("transient_paths"):
+        raise GovernanceBlockerError("Derived V2 Task Packet widens or changes approved field: transient_paths")
 
 
 def validate_gate_a_v2(contract: Mapping[str, Any], authorization: Mapping[str, Any], *, inspect_live: bool = True) -> None:
@@ -1116,7 +1147,16 @@ def inspect_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a
     return _inspect_v2(packet, config, contract)
 
 
-def _run_tests_v2(repo: Path, packet: TaskPacketV2, evidence: _RunEvidenceV2, candidate: str, tree: str, changes: list[str], expected_fingerprint: str) -> list[dict[str, Any]]:
+def _run_tests_v2(
+    repo: Path,
+    packet: TaskPacketV2,
+    evidence: _RunEvidenceV2,
+    candidate: str,
+    tree: str,
+    changes: list[str],
+    expected_fingerprint: str,
+    expected_authority: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, argv in enumerate(packet.test_commands, start=1):
         try:
@@ -1129,12 +1169,16 @@ def _run_tests_v2(repo: Path, packet: TaskPacketV2, evidence: _RunEvidenceV2, ca
         results.append(result)
         if result["exit_code"] != 0:
             raise ImplementationFailureError(f"Deterministic test {index} failed")
-        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
+        _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes,
+                                   expected_fingerprint=expected_fingerprint,
+                                   expected_authority=expected_authority)
     check = subprocess.run(["git", "-C", str(repo), "diff", "--check", f"{packet.baseline_head}..{candidate}"],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, shell=False, check=False)
     if check.returncode != 0:
         raise ImplementationFailureError("Frozen candidate fails git diff --check")
-    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes, expected_fingerprint=expected_fingerprint)
+    _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes,
+                               expected_fingerprint=expected_fingerprint,
+                               expected_authority=expected_authority)
     return results
 
 
@@ -1208,6 +1252,7 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
         "review_attempted": False, "review_status": ("NOT_REQUIRED" if mode == "NONE" else None),
         "candidate_head": None, "candidate_tree": None, "candidate_ref": None,
         "candidate_worktree_fingerprint": None, "worktree_fingerprint": None,
+        "candidate_authority": None, "candidate_authority_sha256": None,
         "verification_disposition": "STOPPED", "deterministic_result": "STOPPED",
         "changed_paths": [], "test_commands": packet.test_commands,
         "evidence_root": str(paths["root"]), "runtime_root": str(paths["root"]),
@@ -1238,7 +1283,8 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
         heads = (summary.get("candidate_head"), summary.get("candidate_tree"), summary.get("candidate_ref"))
         if any(v is not None for v in heads) and not all(v is not None for v in heads):
             summary.update({"candidate_head": None, "candidate_tree": None, "candidate_ref": None,
-                            "candidate_worktree_fingerprint": None, "worktree_fingerprint": None})
+                            "candidate_worktree_fingerprint": None, "worktree_fingerprint": None,
+                            "candidate_authority": None, "candidate_authority_sha256": None})
         _write_json(paths["root"] / "report.json", summary)
         return summary
 
@@ -1256,9 +1302,23 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
         if unauthorized:
             raise GovernanceBlockerError(f"Builder changed unauthorized paths: {unauthorized}")
         candidate, tree = _freeze_candidate(paths["worktree"], _adapt_packet_v1(packet), changes)
-        candidate_fingerprint = fingerprint_worktree(paths["worktree"])
+        from prj226_runner.candidate_authority import build_candidate_authority
+        authority = build_candidate_authority(
+            paths["worktree"],
+            candidate,
+            branch,
+            packet.baseline_head,
+            changes,
+            packet.transient_paths,
+        )
+        authority_json = json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        authority_path = paths["root"] / "candidate-authority.json"
+        authority_path.write_text(authority_json, encoding="utf-8")
+        authority_sha256 = hashlib.sha256(authority_json.encode("utf-8")).hexdigest()
+        candidate_fingerprint = authority["authority_digest"]
         summary.update({"candidate_head": candidate, "candidate_tree": tree, "candidate_ref": branch,
                         "candidate_worktree_fingerprint": candidate_fingerprint, "worktree_fingerprint": candidate_fingerprint,
+                        "candidate_authority": authority, "candidate_authority_sha256": authority_sha256,
                         "changed_paths": changes})
         evidence.transition(RunState.CANDIDATE_FROZEN, "candidate_frozen",
                             {"head": candidate, "tree": tree, "changed_paths": changes,
@@ -1268,7 +1328,7 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
                             {"review_attempted": False, "review_status": summary["review_status"],
                              "candidate_head": candidate, "candidate_tree": tree, "candidate_ref": branch})
         try:
-            tests = _run_tests_v2(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint)
+            tests = _run_tests_v2(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint, expected_authority=authority)
         except ImplementationFailureError as exc:
             # Deterministic failure blocks any semantic-review setup/invocation.
             evidence.stop(exc.message, exc.error_class.value,
@@ -1382,7 +1442,8 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
         # Validate exact targeted result binding already done inside run_targeted_review;
         # re-verify candidate identity after review and check disposition.
         _verify_candidate_identity(paths["worktree"], packet.baseline_head, candidate, tree, changes, branch,
-                                   expected_fingerprint=candidate_fingerprint)
+                                   expected_fingerprint=candidate_fingerprint,
+                                   expected_authority=authority)
         result_value = targeted["result"]
         disposition = result_value["disposition"]
         # Evidence hashes already bound via snapshots; verify artifact sha matches.

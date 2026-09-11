@@ -76,6 +76,13 @@
         }
       }
     },
+    "default_transient_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/definitions/relativePath"
+      }
+    },
     "scopes": {
       "type": "object",
       "additionalProperties": {
@@ -131,6 +138,13 @@
         "review_brief": {
           "type": "string",
           "minLength": 1
+        },
+        "transient_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/relativePath"
+          }
         }
       }
     }

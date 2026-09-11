@@ -489,6 +489,8 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
     raw_cats = scope_entry.get("change_categories") or []
     categories = [str(c) for c in raw_cats] if isinstance(raw_cats, list) else []
     human_flag = bool(scope_entry.get("human_requested_targeted", False))
+    raw_transient = scope_entry.get("transient_paths") or []
+    transient_paths = [str(p) for p in raw_transient] if isinstance(raw_transient, list) else []
     uncertainties: list[str] = []
 
     manifest, config = _load_manifest_and_config(defaults)
@@ -557,6 +559,7 @@ def derive_plan(defaults: Mapping[str, Any], description: str, scope: str | None
         "canonical_branch": str(inspection.get("canonical_branch")),
         "product_repository": str(inspection.get("repository_path")),
         "protected_dirty_paths": list(inspection.get("protected_dirty_paths") or []),
+        "transient_paths": list(transient_paths),
         "runtime_root": str(defaults["runtime_root"]),
     }
 
@@ -676,6 +679,9 @@ def _new_task_record(
         "contract_hash": contract_hash,
         "builder_binding": b_binding,
     }
+    if plan.get("transient_paths"):
+        rec["transient_paths"] = list(plan["transient_paths"])
+    return rec
 
 
 def task_requires_frozen_contract_binding(
@@ -983,6 +989,8 @@ def create_task(
             "human_requested_targeted": bool(plan["human_requested_targeted"]),
             "acceptance_instruments": [list(c) for c in plan["checks"]],
         }
+        if plan.get("transient_paths"):
+            draft_kwargs["transient_paths"] = list(plan["transient_paths"])
         if plan["review_mode"] == "TARGETED":
             reviewer_agent = config.agents.get("sos_reviewer")
             if reviewer_agent is None:
@@ -1026,6 +1034,8 @@ def create_task(
         "product_repository": contract["repository_path"],
         "scope": plan["scope"],
     }
+    if "transient_paths" in contract:
+        preview["transient_paths"] = list(contract["transient_paths"])
     try:
         (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except OSError as exc:

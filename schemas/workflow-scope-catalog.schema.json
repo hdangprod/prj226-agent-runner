@@ -76,6 +76,13 @@
               "BEHAVIOR_PRESERVING_REFACTOR"
             ]
           }
+        },
+        "transient_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/relativePath"
+          }
         }
       }
     }
