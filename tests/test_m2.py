@@ -326,9 +326,9 @@ class TestM2(unittest.TestCase):
         for rel in ("contract.json", "packet.json", "gate-a.json"):
             self.assertTrue((wdir / rel).is_file(), rel)
         contract = json.loads((wdir / "contract.json").read_text(encoding="utf-8"))
-        self.assertEqual(contract["contract_version"], "HARN-002.v2")
+        self.assertEqual(contract["contract_version"], "HARN-002.v3")
         packet = json.loads((wdir / "packet.json").read_text(encoding="utf-8"))
-        self.assertEqual(packet["packet_version"], "HARN-001.TASK_PACKET.v2")
+        self.assertEqual(packet["packet_version"], "HARN-001.TASK_PACKET.v3")
         # Real M1 evidence exists.
         run_id = outcome["run_id"]
         self.assertTrue((self.fix.runtime / run_id / "report.json").is_file())

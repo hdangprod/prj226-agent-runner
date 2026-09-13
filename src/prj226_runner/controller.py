@@ -2396,6 +2396,10 @@ def load_design_contract_v3(path: Path | str) -> dict[str, Any]:
     return _normalize_contract_v3(_read_json(path))
 
 
+def load_design_contract(path: Path | str) -> dict[str, Any]:
+    return _contract_value_v2(path)
+
+
 def _contract_value_v2(contract: Mapping[str, Any] | Path | str) -> dict[str, Any]:
     raw = _read_json(contract) if isinstance(contract, (Path, str)) else contract
     if not isinstance(raw, (dict, Mapping)):

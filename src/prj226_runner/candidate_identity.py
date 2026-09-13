@@ -54,7 +54,7 @@ def normalize_label(label: str, fallback: str) -> str:
 
 def validate_candidate_ref(ref: str) -> None:
     """Validate that candidate ref strictly adheres to Git ref rules and candidate invariants.
-    
+
     Rejects:
     - empty / non-string
     - missing 'harn-candidate/' prefix
@@ -108,7 +108,7 @@ def validate_candidate_ref(ref: str) -> None:
 
 def assert_candidate_ref_available(repo: Path | str, ref: str) -> None:
     """Check that the intended candidate ref does not already exist anywhere in the target repository.
-    
+
     If the ref exists, STOP immediately with GovernanceBlockerError.
     Even if it points to the expected commit.
     Automatic adoption, reset, overwrite, deletion, or alternate-naming is prohibited.
@@ -142,7 +142,7 @@ def derive_candidate_ref(
     contract_hash: str | None = None,
 ) -> str:
     """Single semantic authority for deriving candidate refs based on version.
-    
+
     V1: harn-candidate/{safe_task}-{safe_run}
     V2: harn-candidate/{safe_task}-{safe_run}
     V3: harn-candidate/v3-{safe_task}-{safe_run}-{contract_hash}

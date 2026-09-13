@@ -833,7 +833,7 @@ def load_frozen_contract_for_task(
         )
 
     try:
-        contract = C.load_design_contract_v2(expected_contract_path)
+        contract = C.load_design_contract(expected_contract_path)
     except RunnerError as exc:
         raise WorkflowError(f"Contract loading failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_ERROR") from exc
 
@@ -1007,7 +1007,7 @@ def create_task(
             )
         contract_path = wdir / "contract.json"
         try:
-            contract = C.draft_design_contract_v2(manifest, work_item, inspection, output_path=contract_path, **draft_kwargs)
+            contract = C.draft_design_contract_v3(manifest, work_item, inspection, output_path=contract_path, **draft_kwargs)
         except RunnerError as exc:
             record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=None, contract_hash=None)
             record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
@@ -1063,8 +1063,21 @@ def create_task(
     gate_path = wdir / "gate-a.json"
     packet_path = wdir / "packet.json"
     _write_atomic(gate_path, gate_a)
+    contract_ver = contract.get("contract_version")
+    if contract_ver == C.V3_CONTRACT_VERSION:
+        derive_packet = C.derive_task_packet_v3
+        run_packet = R.run_packet_v3
+    elif contract_ver == C.V2_CONTRACT_VERSION:
+        derive_packet = C.derive_task_packet_v2
+        run_packet = R.run_packet_v2
+    else:
+        record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
+        record.update({"error_class": "ARTIFACT_VALIDATION_ERROR", "error": f"Unsupported contract version: {contract_ver}"})
+        save_task_record(rt, record)
+        raise WorkflowError(f"Unsupported contract version: {contract_ver}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_ERROR")
+
     try:
-        packet = C.derive_task_packet_v2(contract, gate_a, output_path=packet_path)
+        packet = derive_packet(contract, gate_a, output_path=packet_path)
     except RunnerError as exc:
         record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
@@ -1073,7 +1086,7 @@ def create_task(
 
     exec_config_path = _create_execution_config_snapshot(wdir, defaults, contract, plan["builder_binding"], config)
     try:
-        result = R.run_packet_v2(packet_path, contract_path, gate_path, exec_config_path, authorize=True)
+        result = run_packet(packet_path, contract_path, gate_path, exec_config_path, authorize=True)
     except RunnerError as exc:
         record = _new_task_record(plan, task_id, "STOPPED", run_id, contract_path=str(contract_path), contract_hash=contract["contract_hash"])
         record.update({"error_class": getattr(getattr(exc, "error_class", None), "value", "ENVIRONMENT_ERROR"), "error": getattr(exc, "message", str(exc))})
@@ -1431,7 +1444,7 @@ def get_acceptance_data(task_id: str, runtime_root: Path | str | None = None) ->
     defaults, _ = load_project_defaults(rt)
     contract_path = _workflow_dir(rt, st["task_id"]) / "contract.json"
     try:
-        contract = C.load_design_contract_v2(contract_path)
+        contract = C.load_design_contract(contract_path)
     except RunnerError as exc:
         raise WorkflowError(f"Contract reload failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_STALE") from exc
     repo = Path(contract["repository_path"])
@@ -1488,7 +1501,7 @@ def perform_accept(task_id: str, approval_text: str | None, runtime_root: Path |
     wdir = _workflow_dir(rt, tid)
     contract_path = wdir / "contract.json"
     try:
-        contract = C.load_design_contract_v2(contract_path)
+        contract = C.load_design_contract(contract_path)
     except RunnerError as exc:
         raise WorkflowError(f"Contract reload failed: {exc}", EXIT_BLOCKER, "WORKFLOW_CONTRACT_STALE") from exc
     run_id = str(acc["run_id"])

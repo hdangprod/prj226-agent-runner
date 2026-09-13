@@ -31,6 +31,7 @@ from prj226_runner import candidate_authority as CA
 from prj226_runner import candidate_identity as CI
 from prj226_runner import controller as C
 from prj226_runner import runner as R
+from prj226_runner import workflow as W
 from prj226_runner.cli import main as cli_main
 from prj226_runner.errors import (
     ArtifactValidationError,
@@ -268,6 +269,27 @@ class NamespaceTestFixture:
             "baseline_tree": contract["baseline_tree"],
             "authorized_protected_dirty_paths": overlap,
         }
+
+    def init_workflow(self) -> dict[str, Any]:
+        scopes_path = self.root / "scopes.json"
+        scopes_dict = {
+            "schema_version": "PRJ226.WORKFLOW_SCOPE_CATALOG.v1",
+            "default_scope": "context-authz",
+            "scopes": {
+                "default": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                    "change_categories": [],
+                },
+                "context-authz": {
+                    "owned_paths": ["src/app.txt"],
+                    "checks": [[sys.executable, "-c", "import sys; sys.exit(0)"]],
+                    "change_categories": [],
+                },
+            },
+        }
+        scopes_path.write_text(json.dumps(scopes_dict, indent=2, sort_keys=True), encoding="utf-8")
+        return W.init_project(self.manifest_path, self.config, scopes_path=scopes_path)
 
 
 class TestM2CandidateNamespace(unittest.TestCase):
@@ -897,6 +919,151 @@ class TestM2CandidateNamespace(unittest.TestCase):
         # Verify candidate ref was created
         expected_ref = CI.derive_candidate_ref_for_contract(contract)
         self.assertTrue(_git(self.fixture.repo, "rev-parse", f"refs/heads/{expected_ref}"))
+
+    # -------------------------------------------------------------------------
+    # Production Workflow Tests
+    # -------------------------------------------------------------------------
+    def test_workflow_v3_normal_task_crosses_collision_point(self) -> None:
+        """Verify normal operator workflow drafts V3 contract, uses V3 candidate ref,
+        and cleanly crosses pre-existing legacy candidate collision point.
+        """
+        self.fixture.init_workflow()
+
+        # Pre-create the legacy collision branch that would have blocked execution under old naming
+        legacy_branch = "harn-candidate/TASK-001-TASK-001-RUN"
+        _git(self.fixture.repo, "branch", legacy_branch)
+        legacy_head_before = _git(self.fixture.repo, "rev-parse", f"refs/heads/{legacy_branch}")
+
+        # 1. High-level workflow preview
+        preview_res = W.create_task("Implement app", scope="context-authz", preview_only=True, runtime_root=self.fixture.runtime)
+        self.assertEqual(preview_res["status"], "PREVIEW")
+        tid = preview_res["task_id"]
+        self.assertEqual(tid, "TASK-001")
+
+        # Verify contract drafted is V3
+        wdir = W._workflow_dir(self.fixture.runtime, tid)
+        contract = C.load_design_contract(wdir / "contract.json")
+        self.assertEqual(contract["contract_version"], "HARN-002.v3")
+        contract_hash = contract["contract_hash"]
+        self.assertEqual(len(contract_hash), 64)
+
+        # 2. Approve and execute task
+        exec_res = W.create_task("Implement app", scope="context-authz", preview_only=False, approval_text="approve", runtime_root=self.fixture.runtime, task_id=tid)
+        self.assertEqual(exec_res["status"], "ACCEPTANCE_READY")
+
+        # Verify derived packet is V3
+        packet = json.loads((wdir / "packet.json").read_text(encoding="utf-8"))
+        self.assertEqual(packet["packet_version"], "HARN-001.TASK_PACKET.v3")
+
+        # Verify candidate ref is namespaced with contract hash
+        expected_candidate_ref = f"harn-candidate/v3-TASK-001-TASK-001-RUN-{contract_hash}"
+        record = W.load_task_record(self.fixture.runtime, tid)
+        self.assertEqual(record["candidate_ref"], expected_candidate_ref)
+        self.assertTrue(_git(self.fixture.repo, "rev-parse", f"refs/heads/{expected_candidate_ref}"))
+
+        # Verify legacy collision branch is completely untouched
+        legacy_head_after = _git(self.fixture.repo, "rev-parse", f"refs/heads/{legacy_branch}")
+        self.assertEqual(legacy_head_before, legacy_head_after)
+
+        # Verify get_acceptance_data works with V3
+        acc_data = W.get_acceptance_data(tid, runtime_root=self.fixture.runtime)
+        self.assertEqual(acc_data["candidate_ref"], expected_candidate_ref)
+        self.assertEqual(acc_data["contract"]["contract_version"], "HARN-002.v3")
+
+        # 3. Perform Gate B acceptance integration
+        accept_res = W.perform_accept(tid, "approve", runtime_root=self.fixture.runtime)
+        self.assertEqual(accept_res["task_id"], tid)
+        head_after_accept = _git(self.fixture.repo, "rev-parse", "HEAD")
+        self.assertEqual(head_after_accept, accept_res["candidate_head"])
+        st = W.get_status(tid, runtime_root=self.fixture.runtime)
+        self.assertEqual(st["status"], "ACCEPTED")
+
+    def test_workflow_historical_v2_preview_preserved(self) -> None:
+        """Verify historical frozen V2 preview awaiting approval remains V2, retains exact
+        original contract hash, derives V2 packet, and uses legacy ref.
+        """
+        self.fixture.init_workflow()
+        tid = "TASK-001"
+        wdir = W._workflow_dir(self.fixture.runtime, tid)
+        wdir.mkdir(parents=True, exist_ok=True)
+
+        # Draft a frozen V2 contract
+        contract_v2 = self.fixture.draft_v2(run_id=f"{tid}-RUN", task_id=tid, targeted=False)
+        self.assertEqual(contract_v2["contract_version"], "HARN-002.v2")
+        contract_hash_v2 = contract_v2["contract_hash"]
+        contract_path = wdir / "contract.json"
+        contract_path.write_text(json.dumps(contract_v2, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        # Builder binding
+        builder_binding = {
+            "tool": "codex",
+            "model": "gpt-5.6-luna",
+            "executable": str(self.fixture.fake_builder),
+            "timeout_seconds": 20,
+        }
+
+        # Stage a frozen V2 preview and task record
+        plan = {
+            "project_id": contract_v2["project_id"],
+            "description": "Historical V2 preview",
+            "scope": "context-authz",
+            "behavior": "Historical V2 behavior",
+            "authorized_paths": list(contract_v2["owned_paths"]),
+            "checks": [list(c) for c in contract_v2["acceptance_instruments"]],
+            "review_mode": contract_v2["review_policy"]["review_mode"],
+            "builder_binding": builder_binding,
+        }
+        record = W._new_task_record(plan, tid, "PREVIEW", None, contract_path=str(contract_path), contract_hash=contract_hash_v2)
+        W.save_task_record(self.fixture.runtime, record)
+
+        preview = {
+            "task_id": tid,
+            "contract_hash": contract_hash_v2,
+            "contract_path": str(contract_path),
+            "request": plan["description"],
+            "behavior": plan["behavior"],
+            "files": list(contract_v2["owned_paths"]),
+            "checks": [list(c) for c in contract_v2["acceptance_instruments"]],
+            "builder_binding": dict(builder_binding),
+            "execution": dict(builder_binding),
+            "review_mode": contract_v2["review_policy"]["review_mode"],
+            "review_reason": "",
+            "reviewer": None,
+            "uncertainties": [],
+            "baseline_head": contract_v2["baseline_head"],
+            "baseline_tree": contract_v2["baseline_tree"],
+            "canonical_branch": contract_v2["canonical_branch"],
+            "product_repository": contract_v2["repository_path"],
+            "scope": plan["scope"],
+        }
+        (wdir / "preview.json").write_text(json.dumps(preview, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        # Approve and execute the historical V2 task
+        exec_res = W.create_task("Historical V2 preview", scope="context-authz", preview_only=False, approval_text="approve", runtime_root=self.fixture.runtime, task_id=tid)
+        self.assertEqual(exec_res["status"], "ACCEPTANCE_READY")
+
+        # Verify packet derived is V2
+        packet = json.loads((wdir / "packet.json").read_text(encoding="utf-8"))
+        self.assertEqual(packet["packet_version"], "HARN-001.TASK_PACKET.v2")
+        self.assertEqual(packet["contract_hash"], contract_hash_v2)
+
+        # Verify candidate ref is the legacy V2 ref, NOT V3
+        expected_legacy_ref = f"harn-candidate/{tid}-{tid}-RUN"
+        record_after = W.load_task_record(self.fixture.runtime, tid)
+        self.assertEqual(record_after["candidate_ref"], expected_legacy_ref)
+        self.assertTrue(_git(self.fixture.repo, "rev-parse", f"refs/heads/{expected_legacy_ref}"))
+
+        # Verify acceptance and integration work for historical V2
+        acc_data = W.get_acceptance_data(tid, runtime_root=self.fixture.runtime)
+        self.assertEqual(acc_data["candidate_ref"], expected_legacy_ref)
+        self.assertEqual(acc_data["contract"]["contract_version"], "HARN-002.v2")
+
+        accept_res = W.perform_accept(tid, "approve", runtime_root=self.fixture.runtime)
+        self.assertEqual(accept_res["task_id"], tid)
+        head_after_accept = _git(self.fixture.repo, "rev-parse", "HEAD")
+        self.assertEqual(head_after_accept, accept_res["candidate_head"])
+        st = W.get_status(tid, runtime_root=self.fixture.runtime)
+        self.assertEqual(st["status"], "ACCEPTED")
 
 
 if __name__ == "__main__":
