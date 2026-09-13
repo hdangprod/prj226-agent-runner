@@ -152,8 +152,9 @@ def build_candidate_authority(
 
 
 def verify_candidate_authority(
-    repo: Path | str,
+    repo: Path,
     authority: Mapping[str, Any],
+    expected_ref: str | None = None,
 ) -> None:
     """Verify candidate authority against current filesystem and Git state.
 
@@ -208,6 +209,11 @@ def verify_candidate_authority(
         raise GovernanceBlockerError(f"Candidate TREE changed after freeze: {curr_tree} != {authority['candidate_tree']}")
 
     cand_ref = authority.get("candidate_ref")
+    if expected_ref is not None:
+        if not cand_ref or cand_ref != expected_ref:
+            raise GovernanceBlockerError(
+                f"Candidate authority ref mismatch: expected {expected_ref}, observed {cand_ref}"
+            )
     if cand_ref:
         ref_head = _git(repo_path, ["rev-parse", cand_ref]).lower()
         if ref_head != curr_head:

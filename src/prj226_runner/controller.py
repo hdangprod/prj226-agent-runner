@@ -39,17 +39,26 @@ from prj226_runner.codex_reviewer import (
 )
 from prj226_runner.models import ControllerPhase, ErrorClass, ReviewMode, ReviewStatus, WorkShape
 from prj226_runner.review_policy import normalize_review_policy, select_review_mode
+from prj226_runner.candidate_identity import (
+    derive_candidate_ref_for_contract,
+    validate_candidate_ref,
+)
 from prj226_runner.runner import (
     TaskPacket,
     TaskPacketV2,
+    TaskPacketV3,
     V2_CONTRACT_VERSION,
     V2_PACKET_VERSION,
+    V3_CONTRACT_VERSION,
+    V3_PACKET_VERSION,
     V2_RUNNER_RESULT_VERSION,
     candidate_branch_name,
     parse_task_packet,
     parse_task_packet_v2,
+    parse_task_packet_v3,
     run_packet,
     run_packet_v2,
+    run_packet_v3,
     task_packet_hash_v2,
     validate_gate_a_v2 as _runner_validate_gate_a_v2,
     validate_task_packet_derivation_v2 as _runner_validate_packet_v2,
@@ -2116,15 +2125,15 @@ def _contract_without_identity_v2(contract: Mapping[str, Any]) -> dict[str, Any]
     return {key: contract[key] for key in sorted(active_keys - {"contract_id", "contract_hash"})}
 
 
-def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_contract_impl(value: Mapping[str, Any], expected_version: str) -> dict[str, Any]:
     if not isinstance(value, (dict, Mapping)):
-        raise ArtifactValidationError("V2 Design Contract must be an object")
+        raise ArtifactValidationError(f"{expected_version} Design Contract must be an object")
     raw_keys = set(value)
     if not (CONTRACT_V2_KEYS <= raw_keys <= (CONTRACT_V2_KEYS | CONTRACT_V2_OPTIONAL_KEYS)):
-        raise ArtifactValidationError("V2 Design Contract must contain exactly the HARN-002 contract fields")
+        raise ArtifactValidationError(f"{expected_version} Design Contract must contain exactly the HARN-002 contract fields")
     data = dict(value)
-    if data["contract_version"] != V2_CONTRACT_VERSION:
-        raise ArtifactValidationError("V2 Design Contract version must be exactly HARN-002.v2")
+    if data["contract_version"] != expected_version:
+        raise ArtifactValidationError(f"Design Contract version must be exactly {expected_version}")
     _non_empty_string(data["project_id"], "project_id")
     _lexical_absolute_path(data["repository_path"], "repository_path")
     _non_empty_string(data["canonical_branch"], "canonical_branch")
@@ -2140,13 +2149,13 @@ def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
         _string_list(data[field], field, allow_empty=False)
     for field in ("non_goals", "assumptions", "risks", "dependencies", "failure_conditions"):
         _string_list(data[field], field, allow_empty=True)
-    readiness = _strict_object(data["readiness"], READINESS_KEYS, "V2 Design Contract readiness")
+    readiness = _strict_object(data["readiness"], READINESS_KEYS, f"{expected_version} Design Contract readiness")
     if readiness["task_packet"] not in {TASK_PACKET_MISSING, TASK_PACKET_PRESENT}:
-        raise ArtifactValidationError("V2 Design Contract readiness.task_packet is invalid")
+        raise ArtifactValidationError(f"{expected_version} Design Contract readiness.task_packet is invalid")
     if readiness["execution"] != EXECUTION_NOT_AUTHORIZED:
-        raise ArtifactValidationError("V2 Design Contract readiness.execution must be NOT AUTHORIZED")
+        raise ArtifactValidationError(f"{expected_version} Design Contract readiness.execution must be NOT AUTHORIZED")
     if readiness["runner"] != RUNNER_NOT_INVOKED:
-        raise ArtifactValidationError("V2 Design Contract readiness.runner must be NOT INVOKED")
+        raise ArtifactValidationError(f"{expected_version} Design Contract readiness.runner must be NOT INVOKED")
     _validate_object_id(data["baseline_head"], "baseline_head")
     _validate_object_id(data["baseline_tree"], "baseline_tree")
     _path_list(data["owned_paths"], "owned_paths", allow_empty=False)
@@ -2155,7 +2164,7 @@ def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
         _path_list(data["transient_paths"], "transient_paths", allow_empty=True)
     _argv_list(data["acceptance_instruments"], "acceptance_instruments")
     if not data["acceptance_instruments"]:
-        raise ArtifactValidationError("V2 acceptance_instruments must contain at least one deterministic command")
+        raise ArtifactValidationError(f"{expected_version} acceptance_instruments must contain at least one deterministic command")
     _string_list(data["discriminating_acceptance_controls"], "discriminating_acceptance_controls", allow_empty=False)
     _lexical_absolute_path(data["runtime_root"], "runtime_root")
     policy = normalize_review_policy(data["review_policy"])
@@ -2164,13 +2173,29 @@ def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
     content = _contract_without_identity_v2({**data, "review_policy": policy})
     expected_hash = _sha(content)
     if data["contract_hash"] != expected_hash or data["contract_id"] != "design-" + expected_hash:
-        raise ArtifactValidationError("V2 Design Contract identity/hash does not match its content")
+        raise ArtifactValidationError(f"{expected_version} Design Contract identity/hash does not match its content")
     normalized = dict(data)
     normalized["review_policy"] = policy
     normalized["runtime_root"] = str(_lexical_absolute_path(data["runtime_root"], "runtime_root"))
     if "transient_paths" in data:
         normalized["transient_paths"] = list(data["transient_paths"])
     return normalized
+
+
+def _normalize_contract_v2(value: Mapping[str, Any]) -> dict[str, Any]:
+    return _normalize_contract_impl(value, V2_CONTRACT_VERSION)
+
+
+def _normalize_contract_v3(value: Mapping[str, Any]) -> dict[str, Any]:
+    return _normalize_contract_impl(value, V3_CONTRACT_VERSION)
+
+
+def load_design_contract_v3(path: Path | str) -> dict[str, Any]:
+    return _normalize_contract_v3(_read_json(path))
+
+
+def _contract_value_v3(contract: Mapping[str, Any] | Path | str) -> dict[str, Any]:
+    return load_design_contract_v3(contract) if isinstance(contract, (Path, str)) else _normalize_contract_v3(contract)
 
 
 def build_reviewer_binding_v2(
@@ -2224,7 +2249,8 @@ def build_reviewer_binding_v2(
     }
 
 
-def draft_design_contract_v2(
+def _draft_design_contract_impl(
+    version: str,
     manifest: ProjectManifest | Mapping[str, Any] | Path | str,
     work_item: Mapping[str, Any],
     inspection: Mapping[str, Any],
@@ -2274,7 +2300,7 @@ def draft_design_contract_v2(
     expected_mode = select_review_mode(categories, bool(human_requested_targeted))
     if expected_mode == ReviewMode.TARGETED.value:
         if reviewer_executable is None or review_brief is None:
-            raise ArtifactValidationError("TARGETED V2 contract requires exact reviewer binding and review_brief")
+            raise ArtifactValidationError(f"TARGETED {version} contract requires exact reviewer binding and review_brief")
         reviewer = build_reviewer_binding_v2(
             executable=reviewer_executable, model=reviewer_model,
             timeout_seconds=reviewer_timeout_seconds, review_brief=review_brief,
@@ -2285,9 +2311,9 @@ def draft_design_contract_v2(
         })
     else:
         if reviewer_executable is not None or review_brief is not None:
-            raise ArtifactValidationError("NONE V2 contract must not include reviewer binding")
+            raise ArtifactValidationError(f"NONE {version} contract must not include reviewer binding")
         if categories != [] or bool(human_requested_targeted) is not False:
-            raise ArtifactValidationError("NONE V2 contract requires empty categories and human_requested_targeted=false")
+            raise ArtifactValidationError(f"NONE {version} contract requires empty categories and human_requested_targeted=false")
         policy = normalize_review_policy({
             "review_mode": "NONE", "change_categories": [], "human_requested_targeted": False, "reviewer": None,
         })
@@ -2297,8 +2323,12 @@ def draft_design_contract_v2(
         "Reject conflicting CURRENT and Engineering Plan frontiers.",
         "Bind baseline, candidate, review, and Gate A identities exactly.",
     ])
+    default_boundary = (
+        f"Human Gate A authorizes only this exact {version} Design Contract and its derived task packet; "
+        "Human Gate B is required before canonical integration."
+    )
     contract: dict[str, Any] = {
-        "contract_version": V2_CONTRACT_VERSION,
+        "contract_version": version,
         "project_id": manifest.project_id,
         "repository_path": str(Path(manifest.repository_path).expanduser().resolve()),
         "canonical_branch": manifest.canonical_branch,
@@ -2320,10 +2350,7 @@ def draft_design_contract_v2(
         "acceptance_instruments": [list(item) for item in (acceptance_instruments or [["git", "diff", "--check", "HEAD^", "HEAD"]])],
         "discriminating_acceptance_controls": controls,
         "failure_conditions": list(failure_conditions or ["Any authority, baseline, candidate, review, or repository drift."]),
-        "exact_authority_boundary": exact_authority_boundary or (
-            "Human Gate A authorizes only this exact V2 Design Contract and its derived HARN-001.TASK_PACKET.v2; "
-            "Human Gate B is required before canonical integration."
-        ),
+        "exact_authority_boundary": exact_authority_boundary or default_boundary,
         "readiness": {
             "task_packet": work_item.get("task_packet_status", TASK_PACKET_MISSING),
             "execution": EXECUTION_NOT_AUTHORIZED,
@@ -2337,17 +2364,45 @@ def draft_design_contract_v2(
     digest = _sha(_contract_without_identity_v2(contract))
     contract["contract_hash"] = digest
     contract["contract_id"] = "design-" + digest
-    normalized = _normalize_contract_v2(contract)
+    normalized = _normalize_contract_impl(contract, version)
     if output_path is not None:
         _write_json(output_path, normalized)
     return normalized
+
+
+def draft_design_contract_v2(
+    manifest: ProjectManifest | Mapping[str, Any] | Path | str,
+    work_item: Mapping[str, Any],
+    inspection: Mapping[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return _draft_design_contract_impl(V2_CONTRACT_VERSION, manifest, work_item, inspection, **kwargs)
+
+
+def draft_design_contract_v3(
+    manifest: ProjectManifest | Mapping[str, Any] | Path | str,
+    work_item: Mapping[str, Any],
+    inspection: Mapping[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return _draft_design_contract_impl(V3_CONTRACT_VERSION, manifest, work_item, inspection, **kwargs)
 
 
 def load_design_contract_v2(path: Path | str) -> dict[str, Any]:
     return _normalize_contract_v2(_read_json(path))
 
 
+def load_design_contract_v3(path: Path | str) -> dict[str, Any]:
+    return _normalize_contract_v3(_read_json(path))
+
+
 def _contract_value_v2(contract: Mapping[str, Any] | Path | str) -> dict[str, Any]:
+    raw = _read_json(contract) if isinstance(contract, (Path, str)) else contract
+    if not isinstance(raw, (dict, Mapping)):
+        raise ArtifactValidationError("Design Contract must be an object")
+    ver = raw.get("contract_version")
+    if ver == V3_CONTRACT_VERSION:
+        return _normalize_contract_v3(raw)
     return load_design_contract_v2(contract) if isinstance(contract, (Path, str)) else _normalize_contract_v2(contract)
 
 
@@ -2365,8 +2420,10 @@ def _packet_prompt_v2(contract: Mapping[str, Any]) -> str:
 
 
 def _packet_mapping_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
+    ver = contract.get("contract_version")
+    packet_ver = V3_PACKET_VERSION if ver == V3_CONTRACT_VERSION else V2_PACKET_VERSION
     packet: dict[str, Any] = {
-        "packet_version": V2_PACKET_VERSION,
+        "packet_version": packet_ver,
         "contract_id": contract["contract_id"],
         "contract_hash": contract["contract_hash"],
         "runtime_root": str(_lexical_absolute_path(str(contract["runtime_root"]), "runtime_root")),
@@ -2388,7 +2445,7 @@ def _packet_mapping_v2(contract: Mapping[str, Any]) -> dict[str, Any]:
     return packet
 
 
-def validate_task_packet_derivation_v2(contract: Mapping[str, Any] | Path | str, packet: Mapping[str, Any] | TaskPacketV2) -> None:
+def validate_task_packet_derivation_v2(contract: Mapping[str, Any] | Path | str, packet: Mapping[str, Any] | TaskPacketV2 | TaskPacketV3) -> None:
     contract_data = _contract_value_v2(contract)
     _runner_validate_packet_v2(contract_data, packet)
 
@@ -2409,6 +2466,22 @@ def derive_task_packet_v2(
     return packet
 
 
+def derive_task_packet_v3(
+    contract: Mapping[str, Any] | Path | str,
+    authorization: Mapping[str, Any],
+    *,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v3(contract)
+    validate_gate_a_v2(contract_data, authorization, inspect=True)
+    packet = _packet_mapping_v2(contract_data)
+    _runner_validate_packet_v2(contract_data, packet)
+    if output_path is not None:
+        _write_json(output_path, packet)
+        parse_task_packet_v3(output_path)
+    return packet
+
+
 def dispatch_runner_v2(
     contract: Mapping[str, Any] | Path | str,
     authorization: Mapping[str, Any],
@@ -2424,6 +2497,22 @@ def dispatch_runner_v2(
     if not isinstance(raw, dict) or raw.get("packet_version") != V2_PACKET_VERSION:
         raise ArtifactValidationError("V2 dispatch requires an exact HARN-001.TASK_PACKET.v2 packet")
     return run_packet_v2(packet_path, contract_path=contract, gate_a_path=_write_temp_gate_a(authorization), config_path=config_path, authorize=True)
+
+
+def dispatch_runner_v3(
+    contract: Mapping[str, Any] | Path | str,
+    authorization: Mapping[str, Any],
+    packet_path: Path | str,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    contract_data = _contract_value_v3(contract)
+    validate_gate_a_v2(contract_data, authorization, inspect=True)
+    packet = parse_task_packet_v3(packet_path)
+    _runner_validate_packet_v2(contract_data, packet)
+    raw = _read_json(packet_path)
+    if not isinstance(raw, dict) or raw.get("packet_version") != V3_PACKET_VERSION:
+        raise ArtifactValidationError("V3 dispatch requires an exact HARN-001.TASK_PACKET.v3 packet")
+    return run_packet_v3(packet_path, contract_path=contract, gate_a_path=_write_temp_gate_a(authorization), config_path=config_path, authorize=True)
 
 
 def _write_temp_gate_a(authorization: Mapping[str, Any]) -> Path:
@@ -2443,6 +2532,11 @@ def dispatch_contract(contract: Mapping[str, Any] | Path | str, authorization: M
     if not isinstance(raw_contract, dict):
         raise ArtifactValidationError("Contract must be a JSON object")
     raw_version = raw_contract.get("contract_version")
+    if raw_version == V3_CONTRACT_VERSION:
+        packet_raw = _read_json(packet_path)
+        if not isinstance(packet_raw, dict) or packet_raw.get("packet_version") != V3_PACKET_VERSION:
+            raise ArtifactValidationError("Mixed V3 contract with non-V3 packet")
+        return dispatch_runner_v3(contract, authorization, packet_path, config_path)
     if raw_version == V2_CONTRACT_VERSION:
         packet_raw = _read_json(packet_path)
         if not isinstance(packet_raw, dict) or packet_raw.get("packet_version") != V2_PACKET_VERSION:
@@ -2568,19 +2662,15 @@ def _validate_runner_acceptance_evidence_v2(
     candidate_tree = _validate_object_id(data.get("candidate_tree"), "candidate_tree")
     candidate_ref = data.get("candidate_ref")
     if not isinstance(candidate_ref, str) or not candidate_ref.strip():
-        raise ArtifactValidationError("Runner V2 evidence is missing candidate_ref")
+        raise ArtifactValidationError("Runner acceptance evidence is missing candidate_ref")
     # Candidate ref must match immutable derivation.
-    expected_ref = candidate_branch_name(TaskPacket(**_packet_mapping(contract_data, {}))) if contract_data.get("contract_version") == "HARN-002.v1" else None
-    # For V2, derive expected ref from owned paths mapping.
-    from prj226_runner.runner import candidate_branch_name_v2 as _branch_v2, TaskPacketV2 as _PacketV2
+    validate_candidate_ref(candidate_ref)
+    expected_ref = derive_candidate_ref_for_contract(contract_data)
+    if candidate_ref != expected_ref:
+        raise ArtifactValidationError(
+            f"Runner candidate_ref mismatch: expected {expected_ref}, observed {candidate_ref}"
+        )
     expected_packet = _packet_mapping_v2(contract_data)
-    expected_ref_v2 = f"harn-candidate/{expected_packet['task_id']}-{expected_packet['run_id']}"
-    import re as _re
-    safe_task = _re.sub(r"[^A-Za-z0-9._-]+", "-", expected_packet["task_id"]).strip(".-")
-    safe_run = _re.sub(r"[^A-Za-z0-9._-]+", "-", expected_packet["run_id"]).strip(".-")
-    expected_ref_v2 = f"harn-candidate/{safe_task}-{safe_run}"
-    if candidate_ref != expected_ref_v2:
-        raise ArtifactValidationError("Runner V2 candidate_ref does not match the immutable Task Packet")
     # Evidence paths: require root-relative locators for core dirs.
     evidence_paths = data.get("evidence_paths")
     if not isinstance(evidence_paths, dict):
@@ -2728,7 +2818,7 @@ def _validate_runner_acceptance_evidence_v2(
         computed_digest = compute_authority_digest(authority_data)
         if computed_digest != candidate_fingerprint:
             raise GovernanceBlockerError("Runner V2 candidate authority digest mismatch")
-        verify_candidate_authority(worktree_path, authority_data)
+        verify_candidate_authority(worktree_path, authority_data, expected_ref=candidate_ref)
     else:
         if fingerprint_worktree(worktree_path) != candidate_fingerprint:
             raise GovernanceBlockerError("Runner V2 candidate worktree fingerprint changed")
@@ -2790,19 +2880,32 @@ def _runner_evidence_root_v2(data: Mapping[str, Any], result_path: Path | None =
 
 def _ingest_runner_result_data_v2(contract_data: Mapping[str, Any], data: Mapping[str, Any], evidence_root: EvidenceRoot | None) -> dict[str, Any]:
     if not isinstance(data, Mapping) or data.get("run_id") != contract_data["run_id"]:
-        raise ArtifactValidationError("Runner V2 result run_id does not match the Design Contract")
+        raise ArtifactValidationError("Runner result run_id does not match the Design Contract")
     if data.get("version") != V2_RUNNER_RESULT_VERSION_LOCAL:
-        raise ArtifactValidationError("Runner V2 result version is unsupported")
+        raise ArtifactValidationError("Runner result version is unsupported")
+    if data.get("contract_id") != contract_data["contract_id"] or data.get("contract_hash") != contract_data["contract_hash"]:
+        raise ArtifactValidationError("Runner result contract binding is not exact")
+    if "task_packet_hash" in data and data["task_packet_hash"] is not None:
+        expected_packet = _packet_mapping_v2(contract_data)
+        if data["task_packet_hash"] != task_packet_hash_v2(expected_packet):
+            raise ArtifactValidationError("Runner result task_packet_hash does not match the Design Contract")
     outcome = data.get("result")
     if outcome not in {"ACCEPTANCE_READY", "STOPPED"}:
-        raise ArtifactValidationError("Runner V2 result has an unsupported deterministic outcome")
+        raise ArtifactValidationError("Runner result has an unsupported deterministic outcome")
     error_class = data.get("error_class")
     if error_class is not None and error_class not in {item.value for item in ErrorClass}:
-        raise ArtifactValidationError("Runner V2 result error_class is invalid")
+        raise ArtifactValidationError("Runner result error_class is invalid")
     # Candidate all-or-none.
     head_raw, tree_raw, ref_raw = data.get("candidate_head"), data.get("candidate_tree"), data.get("candidate_ref")
     if (head_raw is None) != (tree_raw is None) or (head_raw is None) != (ref_raw is None):
-        raise ArtifactValidationError("Runner V2 candidate identity must be all present or all null")
+        raise ArtifactValidationError("Runner candidate identity must be all present or all null")
+    if ref_raw is not None:
+        validate_candidate_ref(ref_raw)
+        expected_ref = derive_candidate_ref_for_contract(contract_data)
+        if ref_raw != expected_ref:
+            raise ArtifactValidationError(
+                f"Runner candidate_ref mismatch: expected {expected_ref}, observed {ref_raw}"
+            )
     if outcome == "ACCEPTANCE_READY":
         if evidence_root is None:
             raise ArtifactValidationError("Accepted Runner V2 result has no bound evidence root")
@@ -3005,6 +3108,13 @@ def prepare_gate_b_v2(
             live_profile = build_codex_reviewer_profile(str(reviewer_binding["executable"]), model=str(reviewer_binding["model"]))
             if live_profile.reviewer_profile_hash != str(profile_hash).lower():
                 raise GovernanceBlockerError("Gate B V2 reviewer profile drift")
+        cand_ref = ingested_result["candidate_ref"]
+        validate_candidate_ref(cand_ref)
+        expected_ref = derive_candidate_ref_for_contract(contract_data)
+        if cand_ref != expected_ref:
+            raise ArtifactValidationError(
+                f"Gate B V2 candidate reference mismatch: expected {expected_ref}, observed {cand_ref}"
+            )
         package_without_hash = {
             "gate": "HUMAN_GATE_B", "decision": "PENDING", "package_version": V2_GATE_B_VERSION,
             "project_id": contract_data["project_id"], "repository_path": contract_data["repository_path"],
@@ -3015,7 +3125,7 @@ def prepare_gate_b_v2(
             "run_id": contract_data["run_id"],
             "baseline_head": contract_data["baseline_head"], "baseline_tree": contract_data["baseline_tree"],
             "candidate_head": candidate_head, "candidate_tree": candidate_tree,
-            "candidate_ref": ingested_result["candidate_ref"],
+            "candidate_ref": cand_ref,
             "expected_changed_paths": actual_changed,
             "design_contract_id": contract_data["contract_id"],
             "design_contract_hash": contract_data["contract_hash"],
@@ -3045,6 +3155,12 @@ def _validate_gate_b_package_v2(package: Mapping[str, Any], contract_data: Mappi
         raise ArtifactValidationError("Gate B V2 package version is unsupported")
     for field in ("project_id", "repository_path", "canonical_branch", "run_id", "candidate_ref"):
         _non_empty_string(data[field], field)
+    validate_candidate_ref(data["candidate_ref"])
+    expected_ref = derive_candidate_ref_for_contract(contract_data)
+    if data["candidate_ref"] != expected_ref:
+        raise ArtifactValidationError(
+            f"Gate B V2 package candidate reference mismatch: expected {expected_ref}, observed {data['candidate_ref']}"
+        )
     _lexical_absolute_path(data["evidence_root"], "Gate B V2 evidence_root")
     _lexical_absolute_path(data["runtime_root"], "Gate B V2 runtime_root")
     for package_field, contract_field in (
@@ -3148,6 +3264,11 @@ def validate_gate_b_v2(contract: Mapping[str, Any] | Path | str, authorization: 
         raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: canonical baseline drift")
     if _dirty_paths(repo) != contract_data["protected_dirty_paths"]:
         raise GovernanceBlockerError("STALE_GATE_B_AUTHORITY: protected canonical worktree changed")
+
+
+ingest_runner_result_v3 = ingest_runner_result_v2
+prepare_gate_b_v3 = prepare_gate_b_v2
+validate_gate_b_v3 = validate_gate_b_v2
 
 
 def _gate_b_evidence_directory_v2(package: Mapping[str, Any]) -> Path:

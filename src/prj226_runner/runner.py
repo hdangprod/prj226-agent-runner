@@ -214,9 +214,8 @@ def _canonical_baseline(packet: TaskPacket) -> Path:
 
 
 def candidate_branch_name(packet: TaskPacket) -> str:
-    safe_task = re.sub(r"[^A-Za-z0-9._-]+", "-", packet.task_id).strip(".-")
-    safe_run = re.sub(r"[^A-Za-z0-9._-]+", "-", packet.run_id).strip(".-")
-    return f"harn-candidate/{safe_task}-{safe_run}"
+    from prj226_runner.candidate_identity import derive_candidate_ref_for_packet
+    return derive_candidate_ref_for_packet(packet)
 
 
 def _paths_for(config: RunnerConfig, packet: TaskPacket) -> dict[str, Path]:
@@ -375,7 +374,7 @@ def _verify_candidate_identity(
         raise GovernanceBlockerError("Candidate reference changed after freeze")
     if expected_authority is not None:
         from prj226_runner.candidate_authority import verify_candidate_authority
-        verify_candidate_authority(repo, expected_authority)
+        verify_candidate_authority(repo, expected_authority, expected_ref=candidate_ref)
         return
     if _git(repo, ["status", "--porcelain"]):
         raise GovernanceBlockerError("Candidate worktree is not clean")
@@ -479,8 +478,11 @@ def _run_tests(
     return results
 
 
-def _create_builder_worktree(repo: Path, packet: TaskPacket, worktree: Path) -> str:
-    branch = candidate_branch_name(packet)
+def _create_builder_worktree(repo: Path, packet: TaskPacket, worktree: Path, *, candidate_branch: str | None = None) -> str:
+    branch = candidate_branch if candidate_branch is not None else candidate_branch_name(packet)
+    from prj226_runner.candidate_identity import validate_candidate_ref, assert_candidate_ref_available
+    validate_candidate_ref(branch)
+    assert_candidate_ref_available(repo, branch)
     if worktree.exists():
         raise GovernanceBlockerError("Planned Builder worktree already exists")
     result = subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), packet.baseline_head],
@@ -681,6 +683,8 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
 
 V2_PACKET_VERSION = "HARN-001.TASK_PACKET.v2"
 V2_CONTRACT_VERSION = "HARN-002.v2"
+V3_PACKET_VERSION = "HARN-001.TASK_PACKET.v3"
+V3_CONTRACT_VERSION = "HARN-002.v3"
 V2_RUNNER_RESULT_VERSION = "HARN-001.RUNNER_RESULT.v2"
 V2_MANIFEST_VERSION = "HARN-001.RUN_MANIFEST.v2"
 V2_STATE_VERSION = "HARN-001.RUN_STATE.v2"
@@ -811,6 +815,121 @@ def parse_task_packet_v2(path: Path | str) -> TaskPacketV2:
     )
 
 
+@dataclass(frozen=True)
+class TaskPacketV3(TaskPacketV2):
+    pass
+
+
+def parse_task_packet_v3(path: Path | str) -> TaskPacketV3:
+    data = _read_json(Path(path))
+    required = {
+        "packet_version", "contract_id", "contract_hash", "runtime_root", "review_policy",
+        "run_id", "task_id", "product_repo", "canonical_branch", "baseline_head",
+        "baseline_tree", "authorized_paths", "builder_prompt", "acceptance_criteria",
+        "test_commands", "commit_message",
+    }
+    allowed = required | {"transient_paths"}
+    if not isinstance(data, dict) or not (required <= set(data) <= allowed):
+        raise ArtifactValidationError("Task packet V3 must contain exactly the HARN-001.TASK_PACKET.v3 fields")
+    if data["packet_version"] != V3_PACKET_VERSION:
+        raise ArtifactValidationError("Task packet V3 version is unsupported")
+    if not isinstance(data["contract_id"], str) or not data["contract_id"].startswith("design-"):
+        raise ArtifactValidationError("Task packet V3 contract_id is invalid")
+    if not isinstance(data["contract_hash"], str) or not SHA256_RE_V2.fullmatch(data["contract_hash"]):
+        raise ArtifactValidationError("Task packet V3 contract_hash must be lowercase SHA-256")
+    _v2_lexical_absolute(data["runtime_root"], "runtime_root")
+    policy = normalize_review_policy(data["review_policy"])
+    try:
+        validate_run_id(data["run_id"])
+    except ValueError as exc:
+        raise ArtifactValidationError(str(exc)) from exc
+    for key in ("task_id", "canonical_branch", "builder_prompt", "commit_message"):
+        if not isinstance(data[key], str) or not data[key].strip():
+            raise ArtifactValidationError(f"{key} must be a non-empty string")
+    repo = Path(data["product_repo"])
+    if not repo.is_absolute():
+        raise ArtifactValidationError("product_repo must be an absolute path")
+    head, tree = data["baseline_head"], data["baseline_tree"]
+    if not SHA_RE.fullmatch(head) or not SHA_RE.fullmatch(tree):
+        raise ArtifactValidationError("baseline_head and baseline_tree must be 40-character hex strings")
+    paths = data["authorized_paths"]
+    if not isinstance(paths, list) or not paths:
+        raise ArtifactValidationError("authorized_paths must be a non-empty list of paths")
+    safe_paths: list[str] = []
+    for item in paths:
+        _safe_relative_path(item, field="authorized_paths")
+        safe_paths.append(item)
+    if len(set(safe_paths)) != len(safe_paths):
+        raise ArtifactValidationError("authorized_paths must not contain duplicates")
+    transient_paths: list[str] = []
+    if "transient_paths" in data:
+        raw_transient = data["transient_paths"]
+        if not isinstance(raw_transient, list):
+            raise ArtifactValidationError("transient_paths must be a list of relative paths")
+        for item in raw_transient:
+            _safe_relative_path(item, field="transient_paths")
+            transient_paths.append(item)
+        if len(set(transient_paths)) != len(transient_paths):
+            raise ArtifactValidationError("transient_paths must not contain duplicates")
+    criteria = data["acceptance_criteria"]
+    if not isinstance(criteria, list) or not criteria or not all(isinstance(x, str) and x.strip() for x in criteria):
+        raise ArtifactValidationError("acceptance_criteria must be a non-empty array of strings")
+    commands = data["test_commands"]
+    if not isinstance(commands, list) or not all(
+        isinstance(cmd, list) and cmd and all(isinstance(arg, str) and arg for arg in cmd)
+        for cmd in commands
+    ):
+        raise ArtifactValidationError("test_commands must be an array of non-empty argv arrays")
+    return TaskPacketV3(
+        packet_version=V3_PACKET_VERSION, contract_id=data["contract_id"],
+        contract_hash=data["contract_hash"].lower(),
+        runtime_root=_v2_lexical_absolute(data["runtime_root"], "runtime_root"),
+        review_policy=policy, run_id=data["run_id"], task_id=data["task_id"],
+        product_repo=str(repo), canonical_branch=data["canonical_branch"],
+        baseline_head=head.lower(), baseline_tree=tree.lower(),
+        authorized_paths=safe_paths, builder_prompt=data["builder_prompt"],
+        acceptance_criteria=list(criteria),
+        test_commands=[list(command) for command in commands],
+        commit_message=data["commit_message"],
+        transient_paths=transient_paths,
+    )
+
+
+def task_packet_hash_v3(packet: TaskPacketV3 | Mapping[str, Any]) -> str:
+    return task_packet_hash_v2(packet)
+
+
+def _load_contract_v3(path: Path | str) -> dict[str, Any]:
+    data = _read_json(Path(path))
+    if not isinstance(data, dict):
+        raise ArtifactValidationError("V3 Design Contract must be a JSON object")
+    if data.get("contract_version") != V3_CONTRACT_VERSION:
+        raise ArtifactValidationError("V3 Design Contract version is unsupported")
+    required_min = {
+        "contract_id", "contract_hash", "contract_version", "project_id", "repository_path",
+        "canonical_branch", "run_id", "work_item_id", "work_item_title", "work_shape",
+        "intent", "success_criteria", "scope", "non_goals", "baseline_head", "baseline_tree",
+        "owned_paths", "protected_dirty_paths", "assumptions", "risks", "dependencies",
+        "acceptance_instruments", "discriminating_acceptance_controls", "failure_conditions",
+        "exact_authority_boundary", "readiness", "runtime_root", "review_policy",
+    }
+    allowed = required_min | {"transient_paths"}
+    if not (required_min <= set(data) <= allowed):
+        raise ArtifactValidationError("V3 Design Contract must contain exactly the HARN-002.v3 fields")
+    policy = normalize_review_policy(data["review_policy"])
+    active_keys = set(required_min)
+    if "transient_paths" in data:
+        active_keys.add("transient_paths")
+    content = {k: data[k] for k in sorted(active_keys - {"contract_id", "contract_hash"})}
+    content["review_policy"] = policy
+    expected_hash = _sha_canonical_v2(content)
+    if data["contract_hash"] != expected_hash or data["contract_id"] != "design-" + expected_hash:
+        raise ArtifactValidationError("V3 Design Contract identity/hash does not match its content")
+    normalized = dict(data)
+    normalized["review_policy"] = policy
+    return normalized
+
+
 def task_packet_hash_v2(packet: TaskPacketV2 | Mapping[str, Any]) -> str:
     if isinstance(packet, TaskPacketV2):
         value = {
@@ -874,8 +993,9 @@ def _v2_packet_prompt(contract: Mapping[str, Any]) -> str:
 
 
 def _v2_expected_packet_mapping(contract: Mapping[str, Any]) -> dict[str, Any]:
+    packet_ver = V3_PACKET_VERSION if contract.get("contract_version") == V3_CONTRACT_VERSION else V2_PACKET_VERSION
     packet = {
-        "packet_version": V2_PACKET_VERSION,
+        "packet_version": packet_ver,
         "contract_id": contract["contract_id"],
         "contract_hash": contract["contract_hash"],
         "runtime_root": os.path.abspath(os.fspath(contract["runtime_root"])),
@@ -895,6 +1015,12 @@ def _v2_expected_packet_mapping(contract: Mapping[str, Any]) -> dict[str, Any]:
     if "transient_paths" in contract:
         packet["transient_paths"] = list(contract["transient_paths"])
     return packet
+
+
+def validate_task_packet_derivation_v3(contract: Mapping[str, Any], packet: TaskPacketV3 | Mapping[str, Any]) -> None:
+    if contract.get("contract_version") != V3_CONTRACT_VERSION:
+        raise GovernanceBlockerError("validate_task_packet_derivation_v3 requires a HARN-002.v3 Design Contract")
+    validate_task_packet_derivation_v2(contract, packet)
 
 
 def validate_task_packet_derivation_v2(contract: Mapping[str, Any], packet: TaskPacketV2 | Mapping[str, Any]) -> None:
@@ -1087,22 +1213,26 @@ class _RunEvidenceV2:
         _write_json(self.paths["state"], {"state_version": V2_STATE_VERSION, **state_doc})
 
 
-def _inspect_v2(packet: TaskPacketV2, config: RunnerConfig, contract: Mapping[str, Any]) -> dict[str, Any]:
+def _inspect_v2(packet: TaskPacketV2 | TaskPacketV3, config: RunnerConfig, contract: Mapping[str, Any]) -> dict[str, Any]:
     repo = _canonical_baseline_v2(packet)
     paths = _paths_for_v2(config, packet)
     if paths["root"].exists():
         raise GovernanceBlockerError(f"Run ID collision: immutable runtime evidence already exists at {paths['root']}")
+    branch = candidate_branch_name_v2(packet)
+    from prj226_runner.candidate_identity import validate_candidate_ref, assert_candidate_ref_available
+    validate_candidate_ref(branch)
+    assert_candidate_ref_available(repo, branch)
     # NOTE: V2 NONE must not resolve/inspect any reviewer executable here.
     # TARGETED reviewer binding is validated only after deterministic PASS.
     return {
         "result": "READY_FOR_HUMAN_AUTHORIZATION", "run_id": packet.run_id, "task_id": packet.task_id,
         "product_repo": str(repo), "baseline_head": packet.baseline_head, "baseline_tree": packet.baseline_tree,
-        "candidate_branch": candidate_branch_name_v2(packet), "candidate_worktree": str(paths["worktree"]),
+        "candidate_branch": branch, "candidate_worktree": str(paths["worktree"]),
         "review_mode": packet.review_policy["review_mode"],
     }
 
 
-def _canonical_baseline_v2(packet: TaskPacketV2) -> Path:
+def _canonical_baseline_v2(packet: TaskPacketV2 | TaskPacketV3) -> Path:
     repo = Path(packet.product_repo).resolve()
     if not repo.is_dir() or not (repo / ".git").exists():
         raise RunnerEnvironmentError("product_repo is not an existing Git worktree")
@@ -1120,18 +1250,20 @@ def _canonical_baseline_v2(packet: TaskPacketV2) -> Path:
     return repo
 
 
-def candidate_branch_name_v2(packet: TaskPacketV2) -> str:
-    safe_task = re.sub(r"[^A-Za-z0-9._-]+", "-", packet.task_id).strip(".-")
-    safe_run = re.sub(r"[^A-Za-z0-9._-]+", "-", packet.run_id).strip(".-")
-    return f"harn-candidate/{safe_task}-{safe_run}"
+def candidate_branch_name_v2(packet: TaskPacketV2 | TaskPacketV3 | Mapping[str, Any]) -> str:
+    from prj226_runner.candidate_identity import derive_candidate_ref_for_packet
+    return derive_candidate_ref_for_packet(packet)
 
 
-def inspect_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None) -> dict[str, Any]:
-    packet = parse_task_packet_v2(packet_path)
-    contract = _load_contract_v2(contract_path)
+def candidate_branch_name_v3(packet: TaskPacketV3 | Mapping[str, Any]) -> str:
+    from prj226_runner.candidate_identity import derive_candidate_ref_for_packet
+    return derive_candidate_ref_for_packet(packet)
+
+
+def _inspect_packet_impl(packet: TaskPacketV2 | TaskPacketV3, contract: Mapping[str, Any], gate_a_path: Path | str, config_path: Path | str | None = None) -> dict[str, Any]:
     gate_a = _read_json(Path(gate_a_path))
     if not isinstance(gate_a, dict):
-        raise GovernanceBlockerError("V2 Gate A authorization is missing or not exact")
+        raise GovernanceBlockerError("Gate A authorization is missing or not exact")
     validate_gate_a_v2(contract, gate_a, inspect_live=True)
     validate_task_packet_derivation_v2(contract, packet)
     config = load_config(config_path)
@@ -1141,21 +1273,34 @@ def inspect_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a
     contract_root = os.path.realpath(os.fspath(contract["runtime_root"]))
     packet_root = os.path.realpath(os.fspath(packet.runtime_root))
     if packet_root != contract_root:
-        raise GovernanceBlockerError("V2 packet runtime_root widens the approved contract")
+        raise GovernanceBlockerError("Packet runtime_root widens the approved contract")
     if config_root != packet_root:
-        raise GovernanceBlockerError("V2 runtime_root mismatch between approved contract and runner config")
+        raise GovernanceBlockerError("Runtime_root mismatch between approved contract and runner config")
     return _inspect_v2(packet, config, contract)
+
+
+def inspect_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None) -> dict[str, Any]:
+    packet = parse_task_packet_v2(packet_path)
+    contract = _load_contract_v2(contract_path)
+    return _inspect_packet_impl(packet, contract, gate_a_path, config_path)
+
+
+def inspect_packet_v3(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None) -> dict[str, Any]:
+    packet = parse_task_packet_v3(packet_path)
+    contract = _load_contract_v3(contract_path)
+    return _inspect_packet_impl(packet, contract, gate_a_path, config_path)
 
 
 def _run_tests_v2(
     repo: Path,
-    packet: TaskPacketV2,
+    packet: TaskPacketV2 | TaskPacketV3,
     evidence: _RunEvidenceV2,
     candidate: str,
     tree: str,
     changes: list[str],
     expected_fingerprint: str,
     expected_authority: Mapping[str, Any] | None = None,
+    expected_ref: str | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, argv in enumerate(packet.test_commands, start=1):
@@ -1170,6 +1315,7 @@ def _run_tests_v2(
         if result["exit_code"] != 0:
             raise ImplementationFailureError(f"Deterministic test {index} failed")
         _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes,
+                                   candidate_ref=expected_ref,
                                    expected_fingerprint=expected_fingerprint,
                                    expected_authority=expected_authority)
     check = subprocess.run(["git", "-C", str(repo), "diff", "--check", f"{packet.baseline_head}..{candidate}"],
@@ -1177,6 +1323,7 @@ def _run_tests_v2(
     if check.returncode != 0:
         raise ImplementationFailureError("Frozen candidate fails git diff --check")
     _verify_candidate_identity(repo, packet.baseline_head, candidate, tree, changes,
+                               candidate_ref=expected_ref,
                                expected_fingerprint=expected_fingerprint,
                                expected_authority=expected_authority)
     return results
@@ -1221,15 +1368,19 @@ def _runner_acceptance_identity_v2(data: Mapping[str, Any]) -> str:
     return _sha_canonical_v2(identity)
 
 
-def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None, *, authorize: bool = False) -> dict[str, Any]:
-    """Execute one V2 run. --authorize alone is insufficient; exact Gate A context is required."""
+def _run_packet_impl(
+    packet: TaskPacketV2 | TaskPacketV3,
+    contract: Mapping[str, Any],
+    gate_a_path: Path | str,
+    config_path: Path | str | None = None,
+    *,
+    authorize: bool = False,
+) -> dict[str, Any]:
     if not authorize:
         raise GovernanceBlockerError("run requires explicit --authorize; no provider or worktree was created")
-    packet = parse_task_packet_v2(packet_path)
-    contract = _load_contract_v2(contract_path)
     gate_a_raw = _read_json(Path(gate_a_path))
     if not isinstance(gate_a_raw, dict):
-        raise GovernanceBlockerError("V2 Gate A authorization is missing or not exact")
+        raise GovernanceBlockerError("Gate A authorization is missing or not exact")
     validate_gate_a_v2(contract, gate_a_raw, inspect_live=True)
     validate_task_packet_derivation_v2(contract, packet)
     config = load_config(config_path)
@@ -1237,9 +1388,9 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
     contract_root = os.path.realpath(os.fspath(contract["runtime_root"]))
     packet_root = os.path.realpath(os.fspath(packet.runtime_root))
     if packet_root != contract_root:
-        raise GovernanceBlockerError("V2 packet runtime_root widens the approved contract")
+        raise GovernanceBlockerError("Packet runtime_root widens the approved contract")
     if config_root != packet_root:
-        raise GovernanceBlockerError("V2 runtime_root mismatch between approved contract and runner config")
+        raise GovernanceBlockerError("Runtime_root mismatch between approved contract and runner config")
     preflight = _inspect_v2(packet, config, contract)
     repo, paths = Path(preflight["product_repo"]), _paths_for_v2(config, packet)
     evidence = _RunEvidenceV2(paths, packet, config, contract)
@@ -1291,7 +1442,7 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
     try:
         evidence.transition(RunState.PREFLIGHT, "preflight_passed", {"baseline": packet.baseline_head, "review_mode": mode})
         evidence.transition(RunState.HUMAN_AUTHORIZED, "human_authorized", {"contract_id": packet.contract_id})
-        branch = _create_builder_worktree(repo, _adapt_packet_v1(packet), paths["worktree"])
+        branch = _create_builder_worktree(repo, _adapt_packet_v1(packet), paths["worktree"], candidate_branch=preflight["candidate_branch"])
         evidence.transition(RunState.BUILDER_RUNNING, "builder_started", {"worktree": str(paths["worktree"]), "branch": branch})
         _run_process(build_builder_invocation(config.agents["builder"], paths["worktree"], _adapt_packet_v1(packet)),
                      paths["worktree"], paths["builder"], config.agents["builder"].timeout_seconds)
@@ -1328,7 +1479,7 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
                             {"review_attempted": False, "review_status": summary["review_status"],
                              "candidate_head": candidate, "candidate_tree": tree, "candidate_ref": branch})
         try:
-            tests = _run_tests_v2(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint, expected_authority=authority)
+            tests = _run_tests_v2(paths["worktree"], packet, evidence, candidate, tree, changes, candidate_fingerprint, expected_authority=authority, expected_ref=branch)
         except ImplementationFailureError as exc:
             # Deterministic failure blocks any semantic-review setup/invocation.
             evidence.stop(exc.message, exc.error_class.value,
@@ -1515,7 +1666,19 @@ def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_pat
         return _finalize_stopped(wrapped.error_class.value, wrapped.message)
 
 
-def _adapt_packet_v1(packet: TaskPacketV2) -> TaskPacket:
+def run_packet_v2(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None, *, authorize: bool = False) -> dict[str, Any]:
+    packet = parse_task_packet_v2(packet_path)
+    contract = _load_contract_v2(contract_path)
+    return _run_packet_impl(packet, contract, gate_a_path, config_path, authorize=authorize)
+
+
+def run_packet_v3(packet_path: Path | str, contract_path: Path | str, gate_a_path: Path | str, config_path: Path | str | None = None, *, authorize: bool = False) -> dict[str, Any]:
+    packet = parse_task_packet_v3(packet_path)
+    contract = _load_contract_v3(contract_path)
+    return _run_packet_impl(packet, contract, gate_a_path, config_path, authorize=authorize)
+
+
+def _adapt_packet_v1(packet: TaskPacketV2 | TaskPacketV3) -> TaskPacket:
     return TaskPacket(run_id=packet.run_id, task_id=packet.task_id, product_repo=packet.product_repo,
                       canonical_branch=packet.canonical_branch, baseline_head=packet.baseline_head,
                       baseline_tree=packet.baseline_tree, authorized_paths=list(packet.authorized_paths),
@@ -1574,6 +1737,8 @@ def dispatch_packet(path: Path | str) -> str:
     if "packet_version" in data:
         if data["packet_version"] == V2_PACKET_VERSION:
             return "v2"
+        if data["packet_version"] == V3_PACKET_VERSION:
+            return "v3"
         raise ArtifactValidationError("Unsupported packet version")
     # Legacy V1 has exactly the HARN-001 contract fields with no version.
     legacy_required = {"run_id", "task_id", "product_repo", "canonical_branch", "baseline_head",
