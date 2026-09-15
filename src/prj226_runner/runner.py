@@ -317,6 +317,120 @@ def build_builder_invocation(role: RoleConfig, workspace: Path, packet: TaskPack
     return [role.executable, "--model", role.model, prompt]
 
 
+
+def _run_openhands_builder(
+    role: RoleConfig,
+    worktree: Path,
+    packet: Any,
+    log_dir: Path,
+    runtime_root: Path,
+    *,
+    candidate_branch: str | None = None,
+    base_head: str | None = None,
+) -> dict[str, Any]:
+    from prj226_runner.openhands import (
+        ExpectedCandidateAuthority,
+        OpenHandsExecutionAdapter,
+        OpenHandsExecutionRequest,
+    )
+    from prj226_runner.errors import GovernanceBlockerError
+
+    if hasattr(packet, "builder_prompt") and packet.builder_prompt:
+        prompt = packet.builder_prompt
+    elif isinstance(packet, Mapping) and packet.get("builder_prompt"):
+        prompt = packet["builder_prompt"]
+    else:
+        raise ArtifactValidationError("Task packet missing builder_prompt for OpenHands execution")
+
+    run_id = getattr(packet, "run_id", None) or (packet.get("run_id") if isinstance(packet, Mapping) else None)
+    if not run_id:
+        raise ArtifactValidationError("Task packet missing run_id for OpenHands execution")
+
+    task_id = getattr(packet, "task_id", None) or (packet.get("task_id") if isinstance(packet, Mapping) else None)
+    if not task_id:
+        raise ArtifactValidationError("Task packet missing task_id for OpenHands execution")
+
+    contract_hash = getattr(packet, "contract_hash", None) or (packet.get("contract_hash") if isinstance(packet, Mapping) else None)
+    if not contract_hash or len(contract_hash) != 64:
+        raise GovernanceBlockerError(
+            "BLOCK_OPENHANDS_CONTRACT_AUTHORITY_MISSING: OpenHands execution requires authoritative 64-character cryptographic contract hash"
+        )
+
+    if not candidate_branch or not base_head:
+        raise GovernanceBlockerError(
+            "BLOCK_OPENHANDS_CONTRACT_AUTHORITY_MISSING: candidate_branch and base_head are mandatory for OpenHands execution"
+        )
+
+    repo_val = getattr(packet, "product_repo", None) or (packet.get("product_repo") if isinstance(packet, Mapping) else ".")
+    repo_path = Path(repo_val).resolve()
+    expected_authority = ExpectedCandidateAuthority(
+        expected_worktree_path=worktree.resolve(),
+        expected_candidate_ref=candidate_branch,
+        expected_common_dir=(repo_path / ".git").resolve(),
+        expected_base_head=base_head,
+        expected_contract_hash=contract_hash,
+    )
+
+    # Resolve qualified ACP command
+    acp_exec = os.environ.get("PRJ226_CODEX_ACP_SHIM")
+    if not acp_exec and role.executable and role.executable != "none" and os.path.exists(role.executable):
+        acp_exec = role.executable
+
+    if not acp_exec or not os.path.exists(acp_exec):
+        raise GovernanceBlockerError(
+            f"Qualified Codex ACP command is missing or not found: {acp_exec}. "
+            "Set PRJ226_CODEX_ACP_SHIM or configure agent executable with qualified wrapper."
+        )
+
+    server_exec = os.environ.get("PRJ226_OPENHANDS_SERVER_BOOTSTRAP")
+    if not server_exec:
+        raise GovernanceBlockerError(
+            "BLOCK_OPENHANDS_RUNTIME_AUTHORITY_MISSING: PRJ226_OPENHANDS_SERVER_BOOTSTRAP is required"
+        )
+
+    from prj226_runner.openhands.types import (
+        QUALIFIED_CODEX_ACP_SHA256,
+        QUALIFIED_BOOTSTRAP_SERVER_SHA256,
+    )
+    expected_acp_sha = os.environ.get("PRJ226_CODEX_ACP_SHA256", QUALIFIED_CODEX_ACP_SHA256)
+    expected_srv_sha = os.environ.get("PRJ226_OPENHANDS_SERVER_SHA256", QUALIFIED_BOOTSTRAP_SERVER_SHA256)
+
+    req = OpenHandsExecutionRequest(
+        run_id=run_id,
+        task_id=task_id,
+        candidate_worktree=worktree,
+        requested_model=role.model,
+        prompt=prompt,
+        timeout_seconds=float(role.timeout_seconds),
+        isolated_home=runtime_root / "openhands_home",
+        isolated_codex_home=runtime_root / "openhands_codex_home",
+        contract_digest=contract_hash,
+        acp_command=[str(Path(acp_exec).resolve())],
+        server_executable=server_exec,
+        expected_authority=expected_authority,
+        expected_acp_sha256=expected_acp_sha,
+        expected_server_sha256=expected_srv_sha,
+    )
+    adapter = OpenHandsExecutionAdapter(default_timeout=float(role.timeout_seconds))
+    result = adapter.execute_turn(req)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    inv_data = {
+        "tool": role.tool,
+        "model": role.model,
+        "configured_model": result.configured_model,
+        "effective_model": result.observable_effective_model,
+        "effective_provider": result.remote_effective_provider,
+        "terminal_execution_state": result.terminal_execution_state,
+        "quiescence_passed": result.quiescence_passed,
+        "passed": result.passed,
+    }
+    _write_json(log_dir / "invocation.json", inv_data)
+    if not result.passed:
+        raise AgentExecutionError(f"OpenHands builder execution failed: {result.terminal_execution_state} (error: {result.error})")
+    return inv_data
+
+
 def build_reviewer_invocation(role: RoleConfig, prompt: str) -> list[str]:
     """Build a provider invocation kept separate from lifecycle semantics."""
     if role.tool == "codex":
@@ -553,8 +667,11 @@ def run_packet(packet_path: Path | str, config_path: Path | str | None = None, *
         evidence.transition(RunState.HUMAN_AUTHORIZED, "human_authorized")
         branch = _create_builder_worktree(repo, packet, paths["worktree"])
         evidence.transition(RunState.BUILDER_RUNNING, "builder_started", {"worktree": str(paths["worktree"]), "branch": branch})
-        _run_process(build_builder_invocation(config.agents["builder"], paths["worktree"], packet), paths["worktree"],
-                     paths["builder"], config.agents["builder"].timeout_seconds)
+        if config.agents["builder"].tool == "openhands":
+            _run_openhands_builder(config.agents["builder"], paths["worktree"], packet, paths["builder"], paths["root"], candidate_branch=branch, base_head=packet.baseline_head)
+        else:
+            _run_process(build_builder_invocation(config.agents["builder"], paths["worktree"], packet), paths["worktree"],
+                         paths["builder"], config.agents["builder"].timeout_seconds)
         if _git(paths["worktree"], ["rev-parse", "HEAD"]).lower() != packet.baseline_head:
             raise GovernanceBlockerError("Builder created an unexpected commit")
         changes = _changed_paths(paths["worktree"], packet.baseline_head)
@@ -1444,8 +1561,11 @@ def _run_packet_impl(
         evidence.transition(RunState.HUMAN_AUTHORIZED, "human_authorized", {"contract_id": packet.contract_id})
         branch = _create_builder_worktree(repo, _adapt_packet_v1(packet), paths["worktree"], candidate_branch=preflight["candidate_branch"])
         evidence.transition(RunState.BUILDER_RUNNING, "builder_started", {"worktree": str(paths["worktree"]), "branch": branch})
-        _run_process(build_builder_invocation(config.agents["builder"], paths["worktree"], _adapt_packet_v1(packet)),
-                     paths["worktree"], paths["builder"], config.agents["builder"].timeout_seconds)
+        if config.agents["builder"].tool == "openhands":
+            _run_openhands_builder(config.agents["builder"], paths["worktree"], packet, paths["builder"], paths["root"], candidate_branch=branch, base_head=packet.baseline_head)
+        else:
+            _run_process(build_builder_invocation(config.agents["builder"], paths["worktree"], _adapt_packet_v1(packet)),
+                         paths["worktree"], paths["builder"], config.agents["builder"].timeout_seconds)
         if _git(paths["worktree"], ["rev-parse", "HEAD"]).lower() != packet.baseline_head:
             raise GovernanceBlockerError("Builder created an unexpected commit")
         changes = _changed_paths(paths["worktree"], packet.baseline_head)
