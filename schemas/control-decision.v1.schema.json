@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CTRL-R001 planner decision",
+  "description": "Provider-neutral proposal. Runtime validation also binds phase, identity, revision and context digest. No authorization or executable instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "controller_id", "task_id", "revision", "context_digest", "action", "reason"],
+  "properties": {
+    "schema_version": {"const": "PRJ226.CONTROL_DECISION.v1"},
+    "controller_id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._-]+$"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._-]+$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "context_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "action": {"type": "string", "enum": ["PROPOSE_TASK", "PREPARE_GATE_B", "BLOCK"]},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 2048}
+  }
+}

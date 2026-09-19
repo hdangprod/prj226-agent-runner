@@ -48,6 +48,8 @@ def _json_artifact(path: Path) -> object:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="prj226-runner")
     sub = parser.add_subparsers(dest="command", required=True)
+    from prj226_runner.control import add_cli
+    add_cli(sub)
     # M2 primary workflow commands (exactly five).
     item = sub.add_parser("init")
     item.add_argument("--manifest", type=Path, required=True)
@@ -375,6 +377,9 @@ def _cmd_accept(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "control":
+        from prj226_runner.control import run_cli
+        return run_cli(args)
     # M2 primary commands.
     if args.command == "init":
         return _cmd_init(args)
