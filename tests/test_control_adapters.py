@@ -232,7 +232,39 @@ class ControlAdapterTests(unittest.TestCase):
                         "arguments": {"script": "echo unsafe"},
                     },
                 ])
-                with self.assertRaisesRegex(GovernanceBlockerError, "UNRECOGNIZED_MUTATION_EVENT"):
+                expected = f"{role_name.upper()}_CAPABILITY_BREACH"
+                with self.assertRaisesRegex(GovernanceBlockerError, expected):
+                    self.execute(role_name, supervisor)
+
+    def test_envelope_command_without_item_type_blocks_planner_and_reviewer(self):
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    {"type": "item.completed", "item": {"command": "touch candidate.py"}},
+                ])
+                expected = f"{role_name.upper()}_CAPABILITY_BREACH"
+                with self.assertRaisesRegex(GovernanceBlockerError, expected):
+                    self.execute(role_name, supervisor)
+
+    def test_safe_response_envelope_nested_function_call_blocks_planner_and_reviewer(self):
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "output": [{
+                                "type": "function_call",
+                                "name": "execute",
+                                "arguments": "{}",
+                            }],
+                        },
+                    },
+                ])
+                expected = f"{role_name.upper()}_CAPABILITY_BREACH"
+                with self.assertRaisesRegex(GovernanceBlockerError, expected):
                     self.execute(role_name, supervisor)
 
     def test_planner_modifying_file_is_blocked(self):
@@ -325,6 +357,33 @@ class ControlAdapterTests(unittest.TestCase):
                     self.execute(role_name, FakeSupervisor(), context_bytes=b"x" * (limit - len(suffix)))
                     with self.assertRaisesRegex(ArtifactValidationError, "context exceeds role limit"):
                         self.execute(role_name, FakeSupervisor(), context_bytes=b"x" * (limit - len(suffix) + 1))
+
+    def test_unrecognized_context_policy_is_rejected(self):
+        invalid_profile = profile("planner")
+        invalid_profile["policy"]["context_policy"] = "unbounded"
+        invalid_profile["profile_ref"] = derived_profile_ref(invalid_profile)
+        with self.assertRaisesRegex(ArtifactValidationError, "unsupported context policy: unbounded"):
+            self.execute("planner", FakeSupervisor(), profile=invalid_profile)
+
+    def test_timeout_override_must_be_finite_positive_and_within_profile_limit(self):
+        for timeout in (float("nan"), float("inf"), profile("planner")["policy"]["timeout_seconds"] + 10):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ArtifactValidationError):
+                    self.execute("planner", FakeSupervisor(), timeout=timeout)
+
+    def test_exception_supervision_evidence_is_persisted(self):
+        supervision = SupervisionEvidence(1, 1, kill_event=True, final_group_quiescent=False)
+        supervisor = FakeSupervisor(
+            error=AgentExecutionError("supervisor failed", {"supervision": supervision}),
+        )
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        with self.assertRaises(AgentExecutionError):
+            self.execute("builder", supervisor, evidence_dir=evidence_dir)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertTrue(failure_record["supervision"]["kill_event"])
 
     def test_builder_valid_completion_succeeds(self):
         supervisor = FakeSupervisor(completion=self.completion())
@@ -462,6 +521,24 @@ class ControlAdapterTests(unittest.TestCase):
                 mock.patch("prj226_runner.control_environment.IsolatedRoleEnvironment.sanitized", side_effect=lambda value: value):
             receipt = self.execute("planner", FakeSupervisor())
         self.assertNotIn(secret, json.dumps(receipt.record, sort_keys=True))
+
+    def test_receipt_attestation_text_is_sanitized(self):
+        secret = "receipt-cli-secret"
+        attestation = SessionAttestationResult(
+            session_id=SESSION_ID,
+            configured_model=MODEL,
+            session_model=MODEL,
+            cli_version=secret,
+            tokens_used=5,
+            model_attestation_level="RUNTIME_SESSION_BOUND",
+            provider_effective_model=None,
+            attestation_passed=True,
+            rollout_events_count=3,
+        )
+        with mock.patch("prj226_runner.control_adapters.attest_session", return_value=attestation):
+            receipt = self.execute("planner", FakeSupervisor(), auth_source=EphemeralApiKeyAuth(secret))
+        self.assertNotEqual(receipt.attestation_result.cli_version, secret)
+        self.assertNotIn(secret, receipt.attestation_result.cli_version)
 
     def test_completion_secret_is_blocked_when_sanitizer_is_bypassed(self):
         secret = "raw-summary-secret"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import stat
 from dataclasses import dataclass
@@ -222,10 +223,9 @@ def attest_session(
     if len(rows) != 1:
         _fail("session identity must match exactly one SQLite row", {"row_count": len(rows)})
     sqlite_row = dict(zip(columns, rows[0]))
-    if "cli_version" in sqlite_row and (
-        not isinstance(sqlite_row["cli_version"], str) or not sqlite_row["cli_version"]
-    ):
-        _fail("SQLite CLI version is invalid")
+    cli_version = sqlite_row["cli_version"]
+    if not isinstance(cli_version, str) or re.fullmatch(r"[a-zA-Z0-9._ -]{1,100}", cli_version) is None:
+        _fail("invalid cli_version format")
     if sqlite_row["id"] != session_id:
         _fail("SQLite session identity mismatch")
     if sqlite_row["model"] != configured_model:
@@ -289,7 +289,7 @@ def attest_session(
         session_id=session_id,
         configured_model=configured_model,
         session_model=configured_model,
-        cli_version=sqlite_row["cli_version"],
+        cli_version=cli_version,
         tokens_used=rollout_tokens_used if rollout_tokens_used is not None else sqlite_tokens_used,
         model_attestation_level="RUNTIME_SESSION_BOUND",
         provider_effective_model=None,

@@ -21,6 +21,9 @@
     "summary": {"type": "string", "minLength": 1},
     "blockers": {"type": "array", "items": {"type": "string"}},
     "changed_paths": {"type": "array", "items": {"type": "string"}},
-    "provider_output_declaration": {"type": ["string", "null"]}
+    "provider_output_declaration": {
+      "type": ["string", "null"],
+      "description": "Unverified provider-supplied output summary; the adapter does not recompute it."
+    }
   }
 }

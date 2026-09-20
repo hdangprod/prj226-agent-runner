@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import shlex
@@ -282,12 +283,12 @@ def _validate_profile(role_name: str, profile: Mapping[str, Any]) -> None:
         raise ArtifactValidationError("role profile is invalid") from exc
 
 
-def _context_limit(role_name: str, profile: Mapping[str, Any]) -> int | None:
+def _context_limit(role_name: str, profile: Mapping[str, Any]) -> int:
     policy = profile.get("policy")
     context_policy = policy.get("context_policy") if isinstance(policy, Mapping) else None
-    if context_policy == "frozen-task-context":
-        return ROLE_CONTEXT_LIMITS[role_name]
-    return None
+    if context_policy != "frozen-task-context":
+        raise ArtifactValidationError(f"unsupported context policy: {context_policy}")
+    return ROLE_CONTEXT_LIMITS[role_name]
 
 
 def _jsonl_events(raw: bytes | str) -> list[dict[str, Any]]:
@@ -337,6 +338,65 @@ def _event_types(event: dict[str, Any]) -> set[str]:
         if isinstance(value, str):
             result.add(value)
     return result
+
+
+_AUTHORITY_COMMAND_KEYS = {"command", "cmd", "argv", "args"}
+_TOOL_INVOCATION_NAME_HINTS = frozenset({
+    "apply_patch",
+    "bash",
+    "command",
+    "delete",
+    "edit",
+    "exec",
+    "execute",
+    "grep",
+    "mkdir",
+    "move",
+    "patch",
+    "python",
+    "read_file",
+    "remove",
+    "rename",
+    "rmdir",
+    "run",
+    "search",
+    "shell",
+    "sh",
+    "touch",
+    "write_file",
+})
+
+
+def _non_empty_string_or_list(value: Any) -> bool:
+    return (isinstance(value, str) and bool(value)) or (isinstance(value, list) and bool(value))
+
+
+def _name_indicates_tool_invocation(node: Mapping[str, Any], value: Any) -> bool:
+    if not _non_empty_string_or_list(value):
+        return False
+    if any(str(key).lower() in _AUTHORITY_COMMAND_KEYS | {
+        "arguments",
+        "function",
+        "function_call",
+        "parameters",
+        "tool",
+        "tool_call",
+    } for key in node):
+        return True
+    return isinstance(value, str) and value.strip().lower() in _TOOL_INVOCATION_NAME_HINTS
+
+
+def _event_has_authority_indicator(event: dict[str, Any]) -> bool:
+    for node in _iter_dicts(event):
+        for key, value in node.items():
+            normalized_key = str(key).lower()
+            if normalized_key in _AUTHORITY_COMMAND_KEYS and _non_empty_string_or_list(value):
+                return True
+            if normalized_key in {"tool", "function"} and _non_empty_string_or_list(value):
+                return True
+            if normalized_key == "name" and _name_indicates_tool_invocation(node, value):
+                return True
+    return False
 
 
 def _event_has_authority_structure(event: dict[str, Any]) -> bool:
@@ -483,6 +543,12 @@ def _observe_builder_command_confinement(command: str, workspace: Path, executab
 def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Path, executable: str) -> None:
     workspace = cwd.resolve()
     for event in events:
+        types = _event_types(event)
+        authority_types = _authority_types(types)
+        if authority_types or _event_has_authority_indicator(event):
+            _validate_authority_event(role_name, event, authority_types, workspace, executable)
+            continue
+
         top_level_type = event.get("type")
         if isinstance(top_level_type, str):
             top_level_type = top_level_type.lower()
@@ -510,11 +576,6 @@ def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Pa
             _validate_authority_event(role_name, event, {top_level_type}, workspace, executable)
             continue
 
-        types = _event_types(event)
-        nested_authority_types = _authority_types(types)
-        if nested_authority_types:
-            _validate_authority_event(role_name, event, nested_authority_types, workspace, executable)
-            continue
         if _unknown_mutation_event(event, types):
             raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
 
@@ -535,8 +596,11 @@ def _validate_authority_event(
 
     event_mapping = event if isinstance(event, dict) else {"items": event}
     mutations = _mutation_types(authority_types)
-    command_texts = [text for command in _commands(event_mapping) for text in _command_texts(command)]
+    command_values = list(_commands(event_mapping))
+    command_texts = [text for command in command_values for text in _command_texts(command)]
     if "command_execution" in mutations and not command_texts:
+        raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+    if any(_non_empty_string_or_list(command) and not list(_command_texts(command)) for command in command_values):
         raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
     explicit_paths = list(_explicit_paths(event_mapping))
     if mutations - {"command_execution"} and not explicit_paths:
@@ -569,6 +633,36 @@ def _object_value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _exception_supervision(exc: BaseException) -> dict[str, Any] | None:
+    """Extract only schema-supported supervision facts from an exception chain."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        evidence = getattr(current, "supervision", None)
+        if evidence is None:
+            details = getattr(current, "details", None)
+            if isinstance(details, dict):
+                evidence = details.get("supervision")
+        if evidence is not None:
+            values: dict[str, Any] = {}
+            exit_code = _object_value(evidence, "returncode", _object_value(evidence, "exit_code"))
+            if type(exit_code) is int:
+                values["exit_code"] = exit_code
+            quiescent = _object_value(evidence, "final_group_quiescent")
+            if quiescent is None:
+                quiescent = _object_value(evidence, "quiescent")
+            if quiescent is not None:
+                values["quiescent"] = bool(quiescent)
+            for key in ("timeout_event", "term_event", "kill_event", "output_flood"):
+                observed = _object_value(evidence, key)
+                if observed is not None:
+                    values[key] = bool(observed)
+            return values
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _supervision_record(result: Any) -> tuple[int, SupervisionEvidence, dict[str, Any]]:
@@ -916,6 +1010,20 @@ def _failure_record(
     return record
 
 
+def _sanitized_attestation_result(env: Any, attestation: SessionAttestationResult) -> SessionAttestationResult:
+    return SessionAttestationResult(
+        session_id=env.sanitized(attestation.session_id),
+        configured_model=env.sanitized(attestation.configured_model),
+        session_model=env.sanitized(attestation.session_model),
+        cli_version=env.sanitized(attestation.cli_version),
+        tokens_used=attestation.tokens_used,
+        model_attestation_level=env.sanitized(attestation.model_attestation_level),
+        provider_effective_model=env.sanitized(attestation.provider_effective_model),
+        attestation_passed=attestation.attestation_passed,
+        rollout_events_count=attestation.rollout_events_count,
+    )
+
+
 class CodexExecutionAdapter:
     def __init__(self, *, supervisor: SupervisedProcessRunner | None = None) -> None:
         self.supervisor = supervisor or SupervisedProcessRunner()
@@ -947,8 +1055,14 @@ class CodexExecutionAdapter:
             raise ArtifactValidationError("planner role must use read-only sandbox")
         if role_name == "reviewer" and profile["policy"]["sandbox"] != "read-only":
             raise ArtifactValidationError("reviewer role must use read-only sandbox")
-        if timeout is not None and (type(timeout) not in (int, float) or timeout < 0):
-            raise ArtifactValidationError("timeout must be non-negative")
+        if timeout is not None:
+            if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+                raise ArtifactValidationError("timeout must be a finite positive number")
+            profile_timeout = profile["policy"]["timeout_seconds"]
+            if timeout > profile_timeout:
+                raise ArtifactValidationError(
+                    f"timeout override ({timeout}) cannot exceed profile limit ({profile_timeout})"
+                )
         evidence_path = _validate_evidence_dir(evidence_dir) if evidence_dir is not None else None
         invocation_id = str(uuid.uuid4())
         context_with_instructions = context_bytes + (
@@ -1119,22 +1233,29 @@ class CodexExecutionAdapter:
                 if evidence_path is not None:
                     _persist_evidence(evidence_path, invocation_id, record)
 
+                sanitized_record = env.sanitized(record)
+                sanitized_completion_data = env.sanitized(completion_data)
+                sanitized_attestation = _sanitized_attestation_result(env, attestation)
                 return InvocationReceipt(
-                    invocation_id=invocation_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    role=role_name.upper(),
-                    disposition=disposition,
+                    invocation_id=env.sanitized(invocation_id),
+                    session_id=env.sanitized(session_id),
+                    task_id=env.sanitized(task_id),
+                    role=env.sanitized(role_name.upper()),
+                    disposition=env.sanitized(disposition),
                     exit_code=exit_code,
                     supervision_evidence=supervision_evidence,
-                    attestation_result=attestation,
-                    completion_data=completion_data,
-                    evidence_digest=digest,
-                    record=record,
+                    attestation_result=sanitized_attestation,
+                    completion_data=sanitized_completion_data,
+                    evidence_digest=env.sanitized(digest),
+                    record=sanitized_record,
                     invocation_id_in_context=invocation_id_in_context,
                 )
             except Exception as exc:
                 if evidence_path is not None:
+                    failure_supervision = dict(supervision or {})
+                    observed_supervision = _exception_supervision(exc)
+                    if observed_supervision is not None:
+                        failure_supervision.update(observed_supervision)
                     _persist_evidence(
                         evidence_path,
                         invocation_id,
@@ -1147,7 +1268,7 @@ class CodexExecutionAdapter:
                             started_at=started_at,
                             started_monotonic=started_monotonic,
                             exc=exc,
-                            supervision=supervision,
+                            supervision=failure_supervision or None,
                             session_id=session_id,
                             attestation=attestation,
                             env=env,

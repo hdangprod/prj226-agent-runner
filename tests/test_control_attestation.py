@@ -216,7 +216,14 @@ class ControlAttestationTests(unittest.TestCase):
         for cli_version in ("", None):
             with self.subTest(cli_version=cli_version):
                 self._write_sqlite(cli_version=cli_version)
-                with self.assertRaisesRegex(ArtifactValidationError, "CLI version"):
+                with self.assertRaisesRegex(ArtifactValidationError, "invalid cli_version format"):
+                    attest_session(self.home, SESSION_ID, MODEL)
+
+    def test_unsafe_or_oversized_cli_version_fails_closed(self):
+        for cli_version in ("test-cli;secret", "x" * 101, "test-cli\nsecret"):
+            with self.subTest(cli_version=cli_version):
+                self._write_sqlite(cli_version=cli_version)
+                with self.assertRaisesRegex(ArtifactValidationError, "invalid cli_version format"):
                     attest_session(self.home, SESSION_ID, MODEL)
 
     def test_provider_effective_model_is_always_null(self):
