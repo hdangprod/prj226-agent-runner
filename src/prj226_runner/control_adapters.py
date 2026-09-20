@@ -20,7 +20,7 @@ from typing import Any, Mapping
 
 from prj226_runner.control_attestation import SessionAttestationResult, attest_session
 from prj226_runner.control_environment import AuthSource, create_role_environment
-from prj226_runner.control_runtime import derived_profile_ref
+import prj226_runner.control_runtime as control_runtime
 from prj226_runner.errors import (
     AgentExecutionError,
     ArtifactValidationError,
@@ -45,11 +45,12 @@ class InvocationReceipt:
     invocation_id_in_context: bool = True
 
 
-# The runtime schema is intentionally frozen, but adapters only need the
-# fields below to formulate and bind an invocation.  Additional immutable
-# profile fields are still included in derived_profile_ref().
-_REQUIRED_PROFILE_KEYS = {"role", "provider", "model", "executable", "profile_ref", "policy"}
 _ROLE_NAMES = {"planner", "builder", "reviewer"}
+ROLE_CONTEXT_LIMITS: dict[str, int] = {
+    "planner": 256 * 1024,
+    "builder": 1024 * 1024,
+    "reviewer": 512 * 1024,
+}
 
 _MUTATION_TYPES = frozenset({
     "command_execution",
@@ -66,14 +67,18 @@ _MUTATION_TYPES = frozenset({
     "mkdir",
     "rmdir",
 })
-_FILE_MUTATION_TYPES = _MUTATION_TYPES - {"command_execution"}
-KNOWN_SAFE = frozenset({
-    "thread.started",
-    "thread.completed",
+ENVELOPE_TYPES = {
+    "item.started",
+    "item.completed",
+    "item.updated",
     "turn.started",
     "turn.completed",
+    "thread.started",
+    "thread.completed",
     "turn_context",
     "event_msg",
+}
+SAFE_ITEM_TYPES = {
     "token_count",
     "agent_message",
     "assistant",
@@ -96,8 +101,8 @@ KNOWN_SAFE = frozenset({
     "content_block_start",
     "content_block_delta",
     "content_block_stop",
-})
-KNOWN_AUTHORITY = frozenset({
+}
+AUTHORITY_ITEM_TYPES = {
     "command_execution",
     "file_change",
     "file_write",
@@ -115,10 +120,9 @@ KNOWN_AUTHORITY = frozenset({
     "mcp_tool_call",
     "function_call",
     "function_call_output",
-    "item.started",
-    "item.completed",
-    "item.updated",
-})
+}
+KNOWN_SAFE = frozenset(ENVELOPE_TYPES | SAFE_ITEM_TYPES)
+KNOWN_AUTHORITY = frozenset(AUTHORITY_ITEM_TYPES)
 _PATH_KEYS = {
     "path",
     "file_path",
@@ -270,68 +274,19 @@ def _manual_schema_check(value: Any, schema: Mapping[str, Any], label: str) -> N
 def _validate_profile(role_name: str, profile: Mapping[str, Any]) -> None:
     if not isinstance(profile, Mapping):
         raise ArtifactValidationError("role profile must be a mapping")
-    missing = _REQUIRED_PROFILE_KEYS - set(profile)
-    if missing:
-        raise ArtifactValidationError("role profile is missing required keys", {"missing": sorted(missing)})
-    if profile["role"] != role_name.upper():
-        raise ArtifactValidationError("role profile identity does not match role_name")
-    for key in ("provider", "model", "executable", "profile_ref"):
-        if not isinstance(profile[key], str) or not profile[key]:
-            raise ArtifactValidationError(f"role profile {key} must be a non-empty string")
     try:
-        expected_ref = derived_profile_ref(profile)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ArtifactValidationError("role profile cannot be canonically hashed") from exc
-    if profile["profile_ref"] != expected_ref:
-        raise ArtifactValidationError("role profile reference does not match canonical profile digest")
-    policy = profile["policy"]
-    if not isinstance(policy, Mapping):
-        raise ArtifactValidationError("role profile policy must be a mapping")
-    if policy.get("sandbox") not in {"read-only", "workspace-write"}:
-        raise ArtifactValidationError("role profile sandbox policy is invalid")
-    timeout = policy.get("timeout_seconds")
-    if type(timeout) not in (int, float) or timeout <= 0:
-        raise ArtifactValidationError("role profile timeout policy is invalid")
+        control_runtime._validate_profile(role_name, profile, verify_executable=False)
+    except ArtifactValidationError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ArtifactValidationError("role profile is invalid") from exc
 
 
 def _context_limit(role_name: str, profile: Mapping[str, Any]) -> int | None:
-    generic_names = (
-        "context_limit_bytes",
-        "max_context_bytes",
-        "context_max_bytes",
-        "max_context_size",
-        "context_limit",
-        "max_bytes",
-        "limit_bytes",
-        "max_size",
-    )
-    role_name_key = f"{role_name}_context_bytes"
     policy = profile.get("policy")
     context_policy = policy.get("context_policy") if isinstance(policy, Mapping) else None
-    role_sources: list[Mapping[str, Any]] = [profile]
-    if isinstance(policy, Mapping):
-        role_sources.append(policy)
-    if isinstance(context_policy, Mapping):
-        role_sources.append(context_policy)
-    for source in role_sources:
-        if role_name_key in source:
-            value = source[role_name_key]
-            if type(value) is not int or value < 0:
-                raise ArtifactValidationError("configured context limit is invalid")
-            return value
-
-    generic_sources: list[Mapping[str, Any]] = []
-    if isinstance(context_policy, Mapping):
-        generic_sources.append(context_policy)
-    elif "context_limit_bytes" in profile:
-        generic_sources.append(profile)
-    for source in generic_sources:
-        for name in generic_names:
-            if name in source:
-                value = source[name]
-                if type(value) is not int or value < 0:
-                    raise ArtifactValidationError("configured context limit is invalid")
-                return value
+    if context_policy == "frozen-task-context":
+        return ROLE_CONTEXT_LIMITS[role_name]
     return None
 
 
@@ -392,7 +347,16 @@ def _event_has_authority_structure(event: dict[str, Any]) -> bool:
 
 
 def _event_has_only_primitive_values(event: dict[str, Any]) -> bool:
-    return all(type(value) in (str, int, float, bool) for value in event.values())
+    def primitive(value: Any) -> bool:
+        if type(value) in (str, int, float, bool) or value is None:
+            return True
+        if isinstance(value, dict):
+            return all(primitive(child) for child in value.values())
+        if isinstance(value, list):
+            return all(primitive(child) for child in value)
+        return False
+
+    return primitive(event)
 
 
 def _unknown_mutation_event(event: dict[str, Any], types: set[str]) -> bool:
@@ -412,7 +376,7 @@ def _mutation_types(types: set[str]) -> set[str]:
 
 
 def _authority_types(types: set[str]) -> set[str]:
-    return {value.lower() for value in types if value.lower() in KNOWN_AUTHORITY}
+    return {value.lower() for value in types if value.lower() in AUTHORITY_ITEM_TYPES}
 
 
 def _path_inside(value: Any, workspace: Path) -> bool:
@@ -519,31 +483,70 @@ def _observe_builder_command_confinement(command: str, workspace: Path, executab
 def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Path, executable: str) -> None:
     workspace = cwd.resolve()
     for event in events:
+        top_level_type = event.get("type")
+        if isinstance(top_level_type, str):
+            top_level_type = top_level_type.lower()
+
+        if top_level_type in SAFE_ITEM_TYPES:
+            continue
+
+        if top_level_type in ENVELOPE_TYPES:
+            inspected = event.get("item") if isinstance(event.get("item"), (dict, list)) else event
+            types = _event_types(inspected)
+            authority_types = _authority_types(types)
+            if authority_types:
+                _validate_authority_event(role_name, inspected, authority_types, workspace, executable)
+                continue
+            unknown_types = {
+                value.lower()
+                for value in types
+                if value.lower() not in ENVELOPE_TYPES | SAFE_ITEM_TYPES
+            }
+            if unknown_types and (_event_has_authority_structure(inspected) or not _event_has_only_primitive_values(inspected)):
+                raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
+            continue
+
+        if top_level_type in AUTHORITY_ITEM_TYPES:
+            _validate_authority_event(role_name, event, {top_level_type}, workspace, executable)
+            continue
+
         types = _event_types(event)
-        mutations = _mutation_types(types)
-        authority_types = _authority_types(types)
+        nested_authority_types = _authority_types(types)
+        if nested_authority_types:
+            _validate_authority_event(role_name, event, nested_authority_types, workspace, executable)
+            continue
         if _unknown_mutation_event(event, types):
             raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
-        if role_name == "planner" and authority_types:
-            raise GovernanceBlockerError("PLANNER_CAPABILITY_BREACH")
-        if role_name == "reviewer":
-            if authority_types & _FILE_MUTATION_TYPES:
-                raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
-            if "command_execution" in authority_types:
-                raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
-        if role_name == "builder":
-            command_texts = [text for command in _commands(event) for text in _command_texts(command)]
-            if "command_execution" in mutations and not command_texts:
-                raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
-            explicit_paths = list(_explicit_paths(event))
-            if mutations - {"command_execution"} and not explicit_paths:
-                raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
-            for value in explicit_paths:
-                if not _path_inside(value, workspace):
-                    raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
-            for text in command_texts:
-                if not _observe_builder_command_confinement(text, workspace, executable):
-                    raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+
+
+def _validate_authority_event(
+    role_name: str,
+    event: dict[str, Any] | list[Any],
+    authority_types: set[str],
+    workspace: Path,
+    executable: str,
+) -> None:
+    if role_name == "planner":
+        raise GovernanceBlockerError("PLANNER_CAPABILITY_BREACH")
+    if role_name == "reviewer":
+        raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
+    if role_name != "builder":
+        return
+
+    event_mapping = event if isinstance(event, dict) else {"items": event}
+    mutations = _mutation_types(authority_types)
+    command_texts = [text for command in _commands(event_mapping) for text in _command_texts(command)]
+    if "command_execution" in mutations and not command_texts:
+        raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+    explicit_paths = list(_explicit_paths(event_mapping))
+    if mutations - {"command_execution"} and not explicit_paths:
+        raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+    for value in explicit_paths:
+        if not _path_inside(value, workspace):
+            raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+    for text in command_texts:
+        if not _observe_builder_command_confinement(text, workspace, executable):
+            raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
 
 
 def _session_id_from_events(events: list[dict[str, Any]]) -> str:
@@ -631,19 +634,86 @@ def _safe_completion_file(path: Path) -> None:
         raise ArtifactValidationError("builder completion file must have exactly one hard link")
 
 
-def _governed_completion_path(codex_home: Path, invocation_id: str) -> Path:
-    completion_dir = codex_home / "completion"
+def _verify_completion_directories(cwd: Path, directory: Path) -> None:
+    cwd_path = Path(cwd)
     try:
-        completion_dir.mkdir(exist_ok=True)
-        metadata = completion_dir.lstat()
+        cwd_metadata = cwd_path.lstat()
+    except (FileNotFoundError, OSError) as exc:
+        raise ArtifactValidationError("candidate cwd is unavailable") from exc
+    if cwd_path.is_symlink() or not stat.S_ISDIR(cwd_metadata.st_mode):
+        raise ArtifactValidationError("candidate cwd must be a regular non-symlink directory")
+    try:
+        relative = directory.relative_to(cwd_path)
+    except ValueError as exc:
+        raise ArtifactValidationError("builder completion directory escapes candidate cwd") from exc
+    current = cwd_path
+    for component in relative.parts:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except (FileNotFoundError, OSError) as exc:
+            raise ArtifactValidationError("builder completion directory is missing") from exc
+        if current.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise ArtifactValidationError("builder completion directory must be a regular non-symlink directory")
+
+
+def _verify_completion_location(path: Path, cwd: Path) -> Path:
+    try:
+        root = Path(cwd).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError("candidate cwd cannot be resolved") from exc
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError("builder completion path cannot be resolved") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ArtifactValidationError("builder completion path escapes candidate cwd") from exc
+    _verify_completion_directories(Path(cwd), path.parent)
+    return resolved
+
+
+def _governed_completion_path(cwd: Path, invocation_id: str) -> Path:
+    completion_dir = Path(cwd) / ".prj226-control"
+    _verify_completion_directories(Path(cwd), Path(cwd))
+    try:
+        try:
+            completion_dir.lstat()
+        except FileNotFoundError:
+            completion_dir.mkdir()
     except (OSError, RuntimeError) as exc:
         raise ArtifactValidationError("builder completion directory is unavailable") from exc
-    if completion_dir.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-        raise ArtifactValidationError("builder completion directory must be a regular non-symlink directory")
+    _verify_completion_directories(Path(cwd), completion_dir)
     return completion_dir / f"{invocation_id}.completion.json"
 
 
-def _load_completion(path: Path, invocation_id: str, task_id: str) -> dict[str, Any]:
+def _cleanup_completion_path(path: Path, cwd: Path) -> None:
+    try:
+        _verify_completion_directories(Path(cwd), path.parent)
+    except (ArtifactValidationError, OSError):
+        return
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    except OSError:
+        return
+    if metadata is not None:
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return
+        try:
+            path.unlink()
+        except OSError:
+            return
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _load_completion(path: Path, invocation_id: str, task_id: str, cwd: Path) -> dict[str, Any]:
+    _verify_completion_location(path, cwd)
     _safe_completion_file(path)
     try:
         value = json.loads(
@@ -663,16 +733,27 @@ def _load_completion(path: Path, invocation_id: str, task_id: str) -> dict[str, 
 
 def _completion_data_for_receipt(env: Any, value: Mapping[str, Any]) -> dict[str, Any]:
     summary = env.sanitized(value["summary"])
-    if not isinstance(summary, str):
-        raise ArtifactValidationError("builder completion summary must be a string")
+    provider_output_declaration = env.sanitized(value["provider_output_declaration"])
+    if not isinstance(summary, str) or not isinstance(provider_output_declaration, (str, type(None))):
+        raise ArtifactValidationError("builder completion output has invalid types")
     sensitive = getattr(env, "_sensitive", ())
-    if any(isinstance(secret, str) and secret and secret in summary for secret in sensitive):
-        raise ArtifactValidationError("builder completion summary contains credential material")
+    if _contains_sensitive(summary, sensitive) or _contains_sensitive(provider_output_declaration, sensitive):
+        raise ArtifactValidationError("builder completion output contains credential material")
     return {
         "status": value["status"],
         "summary": summary,
-        "provider_output_declaration": value["provider_output_declaration"],
+        "provider_output_declaration": provider_output_declaration,
     }
+
+
+def _contains_sensitive(value: Any, sensitive: Any) -> bool:
+    if isinstance(value, str):
+        return any(isinstance(secret, str) and secret and secret in value for secret in sensitive)
+    if isinstance(value, dict):
+        return any(_contains_sensitive(key, sensitive) or _contains_sensitive(item, sensitive) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_sensitive(item, sensitive) for item in value)
+    return False
 
 
 def _validate_evidence_dir(value: Path | str) -> Path:
@@ -743,43 +824,96 @@ def _assert_disposition_invariants(
 ) -> None:
     if disposition != "SUCCESS":
         return
-    if not supervision.get("quiescent"):
+    if supervision.get("quiescent") is not True:
         raise ArtifactValidationError("SUCCESS requires quiescent")
-    if supervision.get("timeout_event", True):
+    if supervision.get("timeout_event") is not False:
         raise ArtifactValidationError("SUCCESS requires no timeout")
-    if supervision.get("kill_event", True):
+    if supervision.get("kill_event") is not False:
         raise ArtifactValidationError("SUCCESS requires no kill")
-    if supervision.get("output_flood", True):
+    if supervision.get("output_flood") is not False:
         raise ArtifactValidationError("SUCCESS requires no output flood")
-    if attestation is None or not attestation.attestation_passed:
+    if attestation is None or attestation.attestation_passed is not True:
         raise ArtifactValidationError("SUCCESS requires attestation passed")
     if completion_record.get("status") != "COMPLETED":
         raise ArtifactValidationError("SUCCESS requires non-blocked completion")
 
 
 def _tokens_used(attestation: SessionAttestationResult) -> int | None:
-    def find(value: Any) -> int | None:
-        if isinstance(value, dict):
-            for key in ("total_tokens", "tokens_used", "total"):
-                observed = value.get(key)
-                if type(observed) is int and observed >= 0:
-                    return observed
-            for key in ("total_token_usage", "usage", "info"):
-                nested = value.get(key)
-                result = find(nested)
-                if result is not None:
-                    return result
-        return None
-
-    observed = find(attestation.token_usage)
-    if observed is not None:
-        return observed
-    row_value = attestation.sqlite_row.get("tokens_used")
-    return row_value if type(row_value) is int and row_value >= 0 else None
+    return attestation.tokens_used
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _failure_record(
+    *,
+    role_name: str,
+    invocation_id: str,
+    task_id: str,
+    profile: Mapping[str, Any],
+    context_digest: str,
+    started_at: str,
+    started_monotonic: float,
+    exc: Exception,
+    supervision: Mapping[str, Any] | None = None,
+    session_id: str | None = None,
+    attestation: SessionAttestationResult | None = None,
+    env: Any = None,
+) -> dict[str, Any]:
+    default_supervision = {
+        "exit_code": -1,
+        "quiescent": False,
+        "timeout_event": False,
+        "term_event": False,
+        "kill_event": False,
+        "output_flood": False,
+    }
+    if supervision is not None:
+        default_supervision.update({key: supervision.get(key, value) for key, value in default_supervision.items()})
+    observed_session_id = session_id or (attestation.session_id if attestation is not None else "unobserved")
+    completion_failure = role_name == "builder" and "completion" in str(exc).lower()
+    disposition = "BLOCKED" if isinstance(exc, GovernanceBlockerError) or completion_failure else "FAILED"
+    record_without_digest: dict[str, Any] = {
+        "schema_version": "PRJ226.CONTROL_INVOCATION.v1",
+        "invocation_id": invocation_id,
+        "session_id": observed_session_id,
+        "task_id": task_id,
+        "role": role_name.upper(),
+        "runtime_profile_ref": profile["profile_ref"],
+        "configured_model": profile["model"],
+        "session_model": attestation.session_model if attestation is not None else profile["model"],
+        "model_attestation_level": (
+            attestation.model_attestation_level if attestation is not None else "RUNTIME_SESSION_BOUND"
+        ),
+        "provider_effective_model": None,
+        "context_digest": context_digest,
+        "started_at": started_at,
+        "completed_at": _utc_now(),
+        "duration_seconds": max(0.0, time.monotonic() - started_monotonic),
+        "supervision": default_supervision,
+        "attestation": {
+            "attestation_passed": False,
+            "sqlite_verified": False,
+            "rollout_verified": False,
+            "tokens_used": None,
+        },
+        "completion": {
+            "status": "BLOCKED",
+            "summary": str(exc),
+            "provider_output_declaration": None,
+        },
+        "disposition": disposition,
+    }
+    if env is not None:
+        record_without_digest = env.sanitized(record_without_digest)
+    if not isinstance(record_without_digest, dict):
+        raise ArtifactValidationError("failure evidence record must be an object")
+    digest = evidence_digest_for_record(record_without_digest)
+    record = dict(record_without_digest)
+    record["evidence_digest"] = digest
+    _validate_with_schema(record, "control-invocation.v1.schema.json", "failure invocation record")
+    return record
 
 
 class CodexExecutionAdapter:
@@ -816,154 +950,210 @@ class CodexExecutionAdapter:
         if timeout is not None and (type(timeout) not in (int, float) or timeout < 0):
             raise ArtifactValidationError("timeout must be non-negative")
         evidence_path = _validate_evidence_dir(evidence_dir) if evidence_dir is not None else None
-        limit = _context_limit(role_name, profile)
-        if limit is not None and len(context_bytes) > limit:
-            raise ArtifactValidationError("context exceeds configured limit")
-
         invocation_id = str(uuid.uuid4())
-        context_with_invocation = context_bytes + f"\n\nPRJ226 invocation_id: {invocation_id}\n".encode("utf-8")
-        invocation_id_in_context = invocation_id.encode("utf-8") in context_with_invocation
-        context_digest = hashlib.sha256(context_bytes).hexdigest()
+        context_with_instructions = context_bytes + (
+            f"\n\nPRJ226 TASK_ID: {task_id}\n"
+            f"PRJ226 INVOCATION_ID: {invocation_id}\n"
+            f"PRJ226 COMPLETION_PATH: .prj226-control/{invocation_id}.completion.json\n"
+        ).encode("utf-8")
+        invocation_id_in_context = invocation_id.encode("utf-8") in context_with_instructions
+        context_digest = hashlib.sha256(context_with_instructions).hexdigest()
         started_at = _utc_now()
         started_monotonic = time.monotonic()
-        command = [
-            profile["executable"],
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--sandbox",
-            profile["policy"]["sandbox"],
-            "--model",
-            profile["model"],
-            "-C",
-            str(cwd),
-            "--json",
-            "-",
-        ]
-        effective_timeout = timeout if timeout is not None else profile["policy"]["timeout_seconds"]
+        try:
+            limit = _context_limit(role_name, profile)
+            if limit is not None and len(context_with_instructions) > limit:
+                raise ArtifactValidationError("context exceeds role limit")
+            command = [
+                profile["executable"],
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--sandbox",
+                profile["policy"]["sandbox"],
+                "--model",
+                profile["model"],
+                "-C",
+                str(cwd),
+                "--json",
+                "-",
+            ]
+            effective_timeout = timeout if timeout is not None else profile["policy"]["timeout_seconds"]
+        except Exception as exc:
+            if evidence_path is not None:
+                _persist_evidence(
+                    evidence_path,
+                    invocation_id,
+                    _failure_record(
+                        role_name=role_name,
+                        invocation_id=invocation_id,
+                        task_id=task_id,
+                        profile=profile,
+                        context_digest=context_digest,
+                        started_at=started_at,
+                        started_monotonic=started_monotonic,
+                        exc=exc,
+                    ),
+                )
+            raise
 
         with create_role_environment(auth_source=auth_source) as env:
-            if env.codex_home is None:
-                raise AgentExecutionError("isolated environment did not provide CODEX_HOME")
-            completion_path = _governed_completion_path(Path(env.codex_home), invocation_id) if role_name == "builder" else None
+            completion_path = (
+                Path(cwd) / ".prj226-control" / f"{invocation_id}.completion.json"
+                if role_name == "builder"
+                else None
+            )
+            session_id: str | None = None
+            attestation: SessionAttestationResult | None = None
+            supervision: dict[str, Any] | None = None
+            supervision_evidence: SupervisionEvidence | None = None
+            exit_code = -1
             try:
-                result = _run_with_context(
-                    self.supervisor,
-                    command,
-                    context_bytes=context_with_invocation,
-                    timeout=effective_timeout,
-                    env=env.environment,
-                    cwd=str(cwd),
-                )
-            except (AgentExecutionError, GovernanceBlockerError, ArtifactValidationError):
-                raise
-            except Exception as exc:
-                raise AgentExecutionError("controlled role execution failed") from exc
-
-            exit_code, supervision_evidence, supervision = _supervision_record(result)
-            stdout = _object_value(result, "stdout")
-            events = _jsonl_events(stdout)
-            _validate_capabilities(role_name, events, Path(cwd), profile["executable"])
-            session_id = _session_id_from_events(events)
-            attestation = attest_session(env.codex_home, session_id, profile["model"], profile["provider"])
-
-            process_ok = (
-                exit_code == 0
-                and supervision["quiescent"]
-                and not supervision["timeout_event"]
-                and not supervision["kill_event"]
-                and not supervision["output_flood"]
-            )
-            completion_data: dict[str, Any] | None = None
-            if role_name == "builder" and process_ok:
+                if env.codex_home is None:
+                    raise AgentExecutionError("isolated environment did not provide CODEX_HOME")
+                if role_name == "builder":
+                    completion_path = _governed_completion_path(Path(cwd), invocation_id)
                 try:
-                    completion_data = _completion_data_for_receipt(
-                        env,
-                        _load_completion(completion_path, invocation_id, task_id),
+                    result = _run_with_context(
+                        self.supervisor,
+                        command,
+                        context_bytes=context_with_instructions,
+                        timeout=effective_timeout,
+                        env=env.environment,
+                        cwd=str(cwd),
                     )
-                except ArtifactValidationError:
-                    completion_data = None
+                except (AgentExecutionError, GovernanceBlockerError, ArtifactValidationError):
+                    raise
+                except Exception as exc:
+                    raise AgentExecutionError("controlled role execution failed") from exc
+                exit_code, supervision_evidence, supervision = _supervision_record(result)
+                stdout = _object_value(result, "stdout")
+                events = _jsonl_events(stdout)
+                _validate_capabilities(role_name, events, Path(cwd), profile["executable"])
+                session_id = _session_id_from_events(events)
+                attestation = attest_session(env.codex_home, session_id, profile["model"], profile["provider"])
 
-            if not process_ok:
-                disposition = "FAILED"
-                completion_record = {
-                    "status": "BLOCKED",
-                    "summary": f"{role_name} execution did not complete successfully",
-                    "provider_output_declaration": None,
-                }
-            elif role_name == "builder" and completion_data is None:
-                disposition = "BLOCKED"
-                completion_record = {
-                    "status": "BLOCKED",
-                    "summary": "builder completion artifact is missing or invalid",
-                    "provider_output_declaration": None,
-                }
-            elif role_name == "builder":
-                completion_record = {
-                    "status": completion_data["status"],
-                    "summary": completion_data["summary"],
-                    "provider_output_declaration": completion_data["provider_output_declaration"],
-                }
-                disposition = "BLOCKED" if completion_data["status"] == "BLOCKED" else "SUCCESS"
-            else:
-                completion_record = {
-                    "status": "COMPLETED",
-                    "summary": f"{role_name} execution completed",
-                    "provider_output_declaration": None,
-                }
-                disposition = "SUCCESS" if process_ok else "FAILED"
+                process_ok = (
+                    exit_code == 0
+                    and supervision["quiescent"]
+                    and not supervision["timeout_event"]
+                    and not supervision["kill_event"]
+                    and not supervision["output_flood"]
+                )
+                completion_data: dict[str, Any] | None = None
+                if role_name == "builder" and process_ok:
+                    try:
+                        completion_data = _completion_data_for_receipt(
+                            env,
+                            _load_completion(completion_path, invocation_id, task_id, Path(cwd)),
+                        )
+                    except ArtifactValidationError:
+                        completion_data = None
 
-            completed_at = _utc_now()
-            duration_seconds = max(0.0, time.monotonic() - started_monotonic)
-            _assert_disposition_invariants(disposition, supervision, attestation, completion_record)
-            record_without_digest: dict[str, Any] = {
-                "schema_version": "PRJ226.CONTROL_INVOCATION.v1",
-                "invocation_id": invocation_id,
-                "session_id": attestation.session_id,
-                "task_id": task_id,
-                "role": role_name.upper(),
-                "runtime_profile_ref": profile["profile_ref"],
-                "configured_model": profile["model"],
-                "session_model": attestation.session_model,
-                "model_attestation_level": attestation.model_attestation_level,
-                "provider_effective_model": None,
-                "context_digest": context_digest,
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "duration_seconds": duration_seconds,
-                "supervision": supervision,
-                "attestation": {
-                    "attestation_passed": attestation.attestation_passed,
-                    "sqlite_verified": True,
-                    "rollout_verified": True,
-                    "tokens_used": _tokens_used(attestation),
-                },
-                "completion": completion_record,
-                "disposition": disposition,
-            }
-            record_without_digest = env.sanitized(record_without_digest)
-            if not isinstance(record_without_digest, dict):
-                raise ArtifactValidationError("evidence record must be an object")
-            digest = evidence_digest_for_record(record_without_digest)
-            record = dict(record_without_digest)
-            record["evidence_digest"] = digest
-            _validate_with_schema(record, "control-invocation.v1.schema.json", "invocation record")
-            if evidence_path is not None:
-                _persist_evidence(evidence_path, invocation_id, record)
+                if not process_ok:
+                    disposition = "FAILED"
+                    completion_record = {
+                        "status": "BLOCKED",
+                        "summary": f"{role_name} execution did not complete successfully",
+                        "provider_output_declaration": None,
+                    }
+                elif role_name == "builder" and completion_data is None:
+                    disposition = "BLOCKED"
+                    completion_record = {
+                        "status": "BLOCKED",
+                        "summary": "builder completion artifact is missing or invalid",
+                        "provider_output_declaration": None,
+                    }
+                elif role_name == "builder":
+                    completion_record = {
+                        "status": completion_data["status"],
+                        "summary": completion_data["summary"],
+                        "provider_output_declaration": completion_data["provider_output_declaration"],
+                    }
+                    disposition = "BLOCKED" if completion_data["status"] == "BLOCKED" else "SUCCESS"
+                else:
+                    completion_record = {
+                        "status": "COMPLETED",
+                        "summary": f"{role_name} execution completed",
+                        "provider_output_declaration": None,
+                    }
+                    disposition = "SUCCESS" if process_ok else "FAILED"
 
-            return InvocationReceipt(
-                invocation_id=invocation_id,
-                session_id=session_id,
-                task_id=task_id,
-                role=role_name.upper(),
-                disposition=disposition,
-                exit_code=exit_code,
-                supervision_evidence=supervision_evidence,
-                attestation_result=attestation,
-                completion_data=completion_data,
-                evidence_digest=digest,
-                record=record,
-                invocation_id_in_context=invocation_id_in_context,
-            )
+                completed_at = _utc_now()
+                duration_seconds = max(0.0, time.monotonic() - started_monotonic)
+                _assert_disposition_invariants(disposition, supervision, attestation, completion_record)
+                record_without_digest: dict[str, Any] = {
+                    "schema_version": "PRJ226.CONTROL_INVOCATION.v1",
+                    "invocation_id": invocation_id,
+                    "session_id": attestation.session_id,
+                    "task_id": task_id,
+                    "role": role_name.upper(),
+                    "runtime_profile_ref": profile["profile_ref"],
+                    "configured_model": profile["model"],
+                    "session_model": attestation.session_model,
+                    "model_attestation_level": attestation.model_attestation_level,
+                    "provider_effective_model": None,
+                    "context_digest": context_digest,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_seconds": duration_seconds,
+                    "supervision": supervision,
+                    "attestation": {
+                        "attestation_passed": attestation.attestation_passed,
+                        "sqlite_verified": True,
+                        "rollout_verified": True,
+                        "tokens_used": _tokens_used(attestation),
+                    },
+                    "completion": completion_record,
+                    "disposition": disposition,
+                }
+                record_without_digest = env.sanitized(record_without_digest)
+                if not isinstance(record_without_digest, dict):
+                    raise ArtifactValidationError("evidence record must be an object")
+                digest = evidence_digest_for_record(record_without_digest)
+                record = dict(record_without_digest)
+                record["evidence_digest"] = digest
+                _validate_with_schema(record, "control-invocation.v1.schema.json", "invocation record")
+                if evidence_path is not None:
+                    _persist_evidence(evidence_path, invocation_id, record)
+
+                return InvocationReceipt(
+                    invocation_id=invocation_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    role=role_name.upper(),
+                    disposition=disposition,
+                    exit_code=exit_code,
+                    supervision_evidence=supervision_evidence,
+                    attestation_result=attestation,
+                    completion_data=completion_data,
+                    evidence_digest=digest,
+                    record=record,
+                    invocation_id_in_context=invocation_id_in_context,
+                )
+            except Exception as exc:
+                if evidence_path is not None:
+                    _persist_evidence(
+                        evidence_path,
+                        invocation_id,
+                        _failure_record(
+                            role_name=role_name,
+                            invocation_id=invocation_id,
+                            task_id=task_id,
+                            profile=profile,
+                            context_digest=context_digest,
+                            started_at=started_at,
+                            started_monotonic=started_monotonic,
+                            exc=exc,
+                            supervision=supervision,
+                            session_id=session_id,
+                            attestation=attestation,
+                            env=env,
+                        ),
+                    )
+                raise
+            finally:
+                if completion_path is not None:
+                    _cleanup_completion_path(completion_path, Path(cwd))

@@ -64,9 +64,11 @@ class ControlAttestationTests(unittest.TestCase):
         result = attest_session(self.home, SESSION_ID, MODEL)
         self.assertTrue(result.attestation_passed)
         self.assertEqual(result.session_model, MODEL)
-        self.assertEqual(result.sqlite_row["cli_version"], "test-cli")
+        self.assertEqual(result.cli_version, "test-cli")
         self.assertEqual(result.rollout_events_count, 3)
-        self.assertEqual(result.token_usage["total_tokens"], 12)
+        self.assertEqual(result.tokens_used, 12)
+        self.assertFalse(hasattr(result, "sqlite_row"))
+        self.assertFalse(hasattr(result, "token_usage"))
 
     def test_missing_sqlite_fails_closed(self):
         self.sqlite_path.unlink()
@@ -136,8 +138,14 @@ class ControlAttestationTests(unittest.TestCase):
         with self.assertRaises(ArtifactValidationError):
             attest_session(self.home, SESSION_ID, MODEL)
 
+    def test_missing_affirmative_session_observation_in_rollout_fails_closed(self):
+        self._write_rollout([{"type": "turn_context", "payload": {"model": MODEL}}])
+        with self.assertRaisesRegex(ArtifactValidationError, "missing affirmative session observation in rollout"):
+            attest_session(self.home, SESSION_ID, MODEL)
+
     def test_conflicting_model_observation_in_rollout_fails_closed(self):
         self._write_rollout([
+            {"type": "thread.started", "thread_id": SESSION_ID},
             {"type": "turn_context", "payload": {"model": "other-model"}},
         ])
         with self.assertRaisesRegex(ArtifactValidationError, "conflicting model observation"):
@@ -187,7 +195,7 @@ class ControlAttestationTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactValidationError, "conflicting session ID"):
             attest_session(self.home, SESSION_ID, MODEL)
 
-    def test_session_meta_without_payload_id_passes(self):
+    def test_session_meta_without_payload_id_fails_closed(self):
         self._write_rollout([
             {
                 "type": "session_meta",
@@ -201,8 +209,8 @@ class ControlAttestationTests(unittest.TestCase):
             },
             {"type": "turn_context", "payload": {"model": MODEL}},
         ])
-        result = attest_session(self.home, SESSION_ID, MODEL)
-        self.assertTrue(result.attestation_passed)
+        with self.assertRaisesRegex(ArtifactValidationError, "missing affirmative session observation in rollout"):
+            attest_session(self.home, SESSION_ID, MODEL)
 
     def test_empty_or_missing_cli_version_fails_closed(self):
         for cli_version in ("", None):

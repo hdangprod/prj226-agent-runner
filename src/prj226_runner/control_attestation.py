@@ -17,12 +17,12 @@ class SessionAttestationResult:
     session_id: str
     configured_model: str
     session_model: str
+    cli_version: str
+    tokens_used: int | None
     model_attestation_level: str
     provider_effective_model: None
     attestation_passed: bool
-    sqlite_row: dict[str, Any]
     rollout_events_count: int
-    token_usage: dict[str, Any] | None
 
 
 def _fail(message: str, details: dict[str, Any] | None = None) -> None:
@@ -87,8 +87,8 @@ def _parse_rollout_line(line: str, line_number: int) -> dict[str, Any]:
     return parsed
 
 
-def _check_session_observation(record: dict[str, Any], session_id: str) -> None:
-    """Reject every explicit session identity that disagrees with the target."""
+def _check_session_observation(record: dict[str, Any], session_id: str) -> tuple[int, int]:
+    """Return affirmative and contradictory session observations in one record."""
     def candidates(value: Any):
         if isinstance(value, dict):
             yield value
@@ -98,30 +98,41 @@ def _check_session_observation(record: dict[str, Any], session_id: str) -> None:
             for child in value:
                 yield from candidates(child)
 
+    affirmative = 0
+    contradictory = 0
     for candidate in candidates(record):
         for key in ("thread_id", "session_id"):
-            if key in candidate and candidate[key] != session_id:
-                _fail("conflicting session ID")
+            if key not in candidate:
+                continue
+            if candidate[key] == session_id:
+                affirmative += 1
+            else:
+                contradictory += 1
         if candidate.get("type") == "session_meta":
             payload = candidate.get("payload")
-            for payload_candidate in candidates(payload):
-                if "id" in payload_candidate and payload_candidate["id"] != session_id:
-                    _fail("conflicting session ID")
+            if isinstance(payload, dict) and "id" in payload:
+                if payload["id"] == session_id:
+                    affirmative += 1
+                else:
+                    contradictory += 1
+    if contradictory:
+        _fail("conflicting session ID")
+    return affirmative, contradictory
 
 
-def _token_usage_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Return a detached token usage object from common rollout shapes."""
+def _token_count_from_payload(payload: dict[str, Any]) -> int | None:
+    """Extract only a non-negative scalar token count from common rollout shapes."""
+    for key in ("total_tokens", "tokens_used", "total"):
+        value = payload.get(key)
+        if type(value) is int and value >= 0:
+            return value
     for key in ("info", "token_usage", "tokens", "usage"):
         value = payload.get(key)
-        if isinstance(value, dict) and value:
-            return dict(value)
-
-    token_fields = {
-        key: value
-        for key, value in payload.items()
-        if key != "type" and ("token" in key.lower() or key in {"input", "output", "total"})
-    }
-    return token_fields or None
+        if isinstance(value, dict):
+            observed = _token_count_from_payload(value)
+            if observed is not None:
+                return observed
+    return None
 
 
 def _rollout_path(codex_home: Path, raw_path: Any) -> Path:
@@ -226,8 +237,11 @@ def attest_session(
     rollout = _require_unique_regular_file(rollout_candidate, "rollout", home / "sessions")
 
     rollout_events_count = 0
+    session_observations = 0
+    contradictory_session_observations = 0
     model_observations = 0
-    token_usage: dict[str, Any] | None = None
+    contradictory_model_observations = 0
+    rollout_tokens_used: int | None = None
     try:
         with rollout.open("r", encoding="utf-8", newline="") as handle:
             for line_number, line in enumerate(handle, 1):
@@ -235,36 +249,50 @@ def attest_session(
                     raise ArtifactValidationError(f"malformed rollout JSONL at line {line_number}")
                 record = _parse_rollout_line(line, line_number)
                 rollout_events_count += 1
-                _check_session_observation(record, session_id)
+                affirmative, contradictory = _check_session_observation(record, session_id)
+                session_observations += affirmative
+                contradictory_session_observations += contradictory
 
                 if record.get("type") == "turn_context":
                     payload = record.get("payload")
-                    if not isinstance(payload, dict) or payload.get("model") != configured_model:
-                        _fail("conflicting model observation")
-                    model_observations += 1
+                    if isinstance(payload, dict) and "model" in payload:
+                        if payload["model"] == configured_model:
+                            model_observations += 1
+                        else:
+                            contradictory_model_observations += 1
 
                 if record.get("type") == "event_msg":
                     payload = record.get("payload")
                     if isinstance(payload, dict) and payload.get("type") == "token_count":
-                        observed_tokens = _token_usage_from_payload(payload)
+                        observed_tokens = _token_count_from_payload(payload)
                         if observed_tokens is not None:
-                            token_usage = observed_tokens
+                            rollout_tokens_used = observed_tokens
     except ArtifactValidationError:
         raise
     except (OSError, UnicodeError) as exc:
         raise ArtifactValidationError("rollout cannot be read") from exc
 
+    if contradictory_session_observations:
+        _fail("conflicting session ID")
+    if session_observations < 1:
+        _fail("missing affirmative session observation in rollout")
+    if contradictory_model_observations:
+        _fail("conflicting model observation")
     if model_observations < 1:
         _fail("missing affirmative model observation in rollout")
+
+    sqlite_tokens_used = sqlite_row["tokens_used"]
+    if type(sqlite_tokens_used) is not int or sqlite_tokens_used < 0:
+        sqlite_tokens_used = None
 
     return SessionAttestationResult(
         session_id=session_id,
         configured_model=configured_model,
         session_model=configured_model,
+        cli_version=sqlite_row["cli_version"],
+        tokens_used=rollout_tokens_used if rollout_tokens_used is not None else sqlite_tokens_used,
         model_attestation_level="RUNTIME_SESSION_BOUND",
         provider_effective_model=None,
         attestation_passed=True,
-        sqlite_row=sqlite_row,
         rollout_events_count=rollout_events_count,
-        token_usage=token_usage,
     )

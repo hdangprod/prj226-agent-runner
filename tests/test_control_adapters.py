@@ -8,6 +8,7 @@ from unittest import mock
 
 from prj226_runner.control_adapters import (
     CodexExecutionAdapter,
+    ROLE_CONTEXT_LIMITS,
     _validate_with_schema,
     canonical_json,
     evidence_digest_for_record,
@@ -25,7 +26,7 @@ TASK_ID = "task-001"
 FIXED_INVOCATION_ID = "00000000-0000-4000-8000-000000000001"
 
 
-def profile(role_name="builder", *, context_limit=None):
+def profile(role_name="builder"):
     value = {
         "role": role_name.upper(),
         "backend": "codex",
@@ -50,22 +51,34 @@ def profile(role_name="builder", *, context_limit=None):
             "environment_policy": "closed-allowlist-only",
             "authentication_policy": "no-auth-required",
             "timeout_seconds": 5,
-            "context_policy": "test",
+            "context_policy": "frozen-task-context",
             "feature_disables": [],
         },
     }
-    if context_limit is not None:
-        value["context_limit_bytes"] = context_limit
     value["profile_ref"] = derived_profile_ref(value)
     return value
 
 
 class FakeSupervisor:
-    def __init__(self, events=None, *, error=None, completion=None, completion_raw=None):
-        self.events = events or [{"type": "thread.started", "thread_id": SESSION_ID}]
+    def __init__(
+        self,
+        events=None,
+        *,
+        error=None,
+        completion=None,
+        completion_raw=None,
+        completion_symlink_target=None,
+        completion_ancestor_symlink_target=None,
+    ):
+        self.events = events if events is not None else [
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        ]
         self.error = error
         self.completion = completion
         self.completion_raw = completion_raw
+        self.completion_symlink_target = completion_symlink_target
+        self.completion_ancestor_symlink_target = completion_ancestor_symlink_target
         self.calls = 0
         self.last = None
         self.codex_home = None
@@ -98,14 +111,31 @@ class FakeSupervisor:
         )
         connection.commit()
         connection.close()
-        marker = b"PRJ226 invocation_id: "
+        marker = b"PRJ226 INVOCATION_ID: "
         invocation_id = input.split(marker, 1)[1].splitlines()[0].decode("utf-8")
-        if self.completion is not None or self.completion_raw is not None:
-            completion_path = self.codex_home / "completion" / f"{invocation_id}.completion.json"
-            if self.completion_raw is not None:
-                completion_path.write_text(self.completion_raw, encoding="utf-8")
+        if (
+            self.completion is not None
+            or self.completion_raw is not None
+            or self.completion_symlink_target is not None
+            or self.completion_ancestor_symlink_target is not None
+        ):
+            completion_path = Path(cwd) / ".prj226-control" / f"{invocation_id}.completion.json"
+            if self.completion_ancestor_symlink_target is not None:
+                outside_dir = Path(self.completion_ancestor_symlink_target)
+                outside_dir.mkdir(parents=True, exist_ok=True)
+                completion_path.parent.rmdir()
+                completion_path.parent.symlink_to(outside_dir, target_is_directory=True)
+                output_path = outside_dir / completion_path.name
+            elif self.completion_symlink_target is not None:
+                output_path = Path(self.completion_symlink_target)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                completion_path.symlink_to(output_path)
             else:
-                completion_path.write_text(json.dumps(self.completion), encoding="utf-8")
+                output_path = completion_path
+            if self.completion_raw is not None:
+                output_path.write_text(self.completion_raw, encoding="utf-8")
+            elif self.completion is not None:
+                output_path.write_text(json.dumps(self.completion), encoding="utf-8")
         stdout = "".join(json.dumps(item) + "\n" for item in self.events).encode("utf-8")
         return ProcessResult(
             returncode=0,
@@ -175,6 +205,14 @@ class ControlAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(GovernanceBlockerError, "PLANNER_CAPABILITY_BREACH"):
             self.execute("planner", supervisor)
 
+    def test_planner_nested_agent_message_is_informational(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        ])
+        receipt = self.execute("planner", supervisor)
+        self.assertEqual(receipt.disposition, "SUCCESS")
+
     def test_unknown_primitive_event_is_informational(self):
         supervisor = FakeSupervisor(events=[
             {"type": "thread.started", "thread_id": SESSION_ID},
@@ -212,6 +250,24 @@ class ControlAdapterTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(GovernanceBlockerError, "REVIEWER_CAPABILITY_BREACH"):
             self.execute("reviewer", supervisor)
+
+    def test_reviewer_nested_mcp_tool_call_is_blocked(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "execute"}},
+        ])
+        with self.assertRaisesRegex(GovernanceBlockerError, "REVIEWER_CAPABILITY_BREACH"):
+            self.execute("reviewer", supervisor)
+
+    def test_reviewer_nested_tool_and_function_calls_are_blocked(self):
+        for item_type in ("tool_call", "function_call"):
+            with self.subTest(item_type=item_type):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    {"type": "item.completed", "item": {"type": item_type, "name": "execute"}},
+                ])
+                with self.assertRaisesRegex(GovernanceBlockerError, "REVIEWER_CAPABILITY_BREACH"):
+                    self.execute("reviewer", supervisor)
 
     def test_reviewer_workspace_write_profile_is_rejected_after_profile_validation(self):
         reviewer_profile = profile("reviewer")
@@ -254,29 +310,21 @@ class ControlAdapterTests(unittest.TestCase):
                 self.assertEqual(normalized_receipt.role, canonical_name.upper())
                 self.assertEqual(normalized_receipt.disposition, receipt.disposition)
 
-    def test_role_specific_planner_context_limit_is_selected_first(self):
-        planner_profile = profile("planner")
-        planner_profile["planner_context_bytes"] = 100
-        planner_profile["context_limit_bytes"] = 1
-        planner_profile["profile_ref"] = derived_profile_ref(planner_profile)
-        self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"x" * 100)
-        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
-            self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"x" * 101)
-
-    def test_role_specific_builder_context_limit_is_selected_first(self):
-        builder_profile = profile("builder")
-        builder_profile["builder_context_bytes"] = 200
-        builder_profile["context_limit_bytes"] = 1
-        builder_profile["profile_ref"] = derived_profile_ref(builder_profile)
-        self.execute("builder", FakeSupervisor(), profile=builder_profile, context_bytes=b"x" * 200)
-        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
-            self.execute("builder", FakeSupervisor(), profile=builder_profile, context_bytes=b"x" * 201)
-
-    def test_generic_context_limit_remains_supported_without_role_specific_key(self):
-        planner_profile = profile("planner", context_limit=4)
-        self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"1234")
-        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
-            self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"12345")
+    def test_role_context_limits_bind_to_submitted_context_payload(self):
+        for role_name, limit in ROLE_CONTEXT_LIMITS.items():
+            with self.subTest(role_name=role_name):
+                with mock.patch(
+                    "prj226_runner.control_adapters.uuid.uuid4",
+                    return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID),
+                ):
+                    suffix = (
+                        f"\n\nPRJ226 TASK_ID: {TASK_ID}\n"
+                        f"PRJ226 INVOCATION_ID: {FIXED_INVOCATION_ID}\n"
+                        f"PRJ226 COMPLETION_PATH: .prj226-control/{FIXED_INVOCATION_ID}.completion.json\n"
+                    ).encode("utf-8")
+                    self.execute(role_name, FakeSupervisor(), context_bytes=b"x" * (limit - len(suffix)))
+                    with self.assertRaisesRegex(ArtifactValidationError, "context exceeds role limit"):
+                        self.execute(role_name, FakeSupervisor(), context_bytes=b"x" * (limit - len(suffix) + 1))
 
     def test_builder_valid_completion_succeeds(self):
         supervisor = FakeSupervisor(completion=self.completion())
@@ -287,10 +335,12 @@ class ControlAdapterTests(unittest.TestCase):
         self.assertTrue(receipt.invocation_id_in_context)
         self.assertIn(FIXED_INVOCATION_ID.encode("utf-8"), supervisor.last["input"])
         self.assertEqual(supervisor.last["argv"][-1], "-")
+        self.assertFalse((self.cwd / ".prj226-control").exists())
 
     def test_builder_missing_completion_file_is_blocked(self):
         receipt = self.execute("builder", FakeSupervisor())
         self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertFalse((self.cwd / ".prj226-control").exists())
 
     def test_builder_malformed_completion_is_blocked(self):
         supervisor = FakeSupervisor(completion_raw="not-json")
@@ -310,6 +360,28 @@ class ControlAdapterTests(unittest.TestCase):
             receipt = self.execute("builder", FakeSupervisor(completion=value))
         self.assertEqual(receipt.disposition, "BLOCKED")
 
+    def test_builder_completion_containment_is_checked_at_consumption(self):
+        outside = Path(self.temp.name) / "outside-completion.json"
+        supervisor = FakeSupervisor(
+            completion=self.completion(),
+            completion_symlink_target=outside,
+        )
+        with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+            receipt = self.execute("builder", supervisor)
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertTrue(outside.exists())
+
+    def test_builder_completion_ancestor_symlink_is_rejected(self):
+        outside_dir = Path(self.temp.name) / "outside-completion-dir"
+        supervisor = FakeSupervisor(
+            completion=self.completion(),
+            completion_ancestor_symlink_target=outside_dir,
+        )
+        with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+            receipt = self.execute("builder", supervisor)
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertTrue((self.cwd / ".prj226-control").is_symlink())
+
     def test_builder_blocked_status_yields_blocked_disposition(self):
         value = self.completion(status="BLOCKED", summary="blocked by policy")
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
@@ -323,9 +395,30 @@ class ControlAdapterTests(unittest.TestCase):
 
     def test_adapter_zero_retry_and_zero_fallback_on_error(self):
         supervisor = FakeSupervisor(error=AgentExecutionError("one failure"))
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
         with self.assertRaises(AgentExecutionError):
-            self.execute("builder", supervisor)
+            self.execute("builder", supervisor, evidence_dir=evidence_dir)
         self.assertEqual(supervisor.calls, 1)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(failure_record["disposition"], "FAILED")
+        self.assertFalse(failure_record["attestation"]["attestation_passed"])
+
+    def test_governance_failure_persists_blocked_evidence_before_reraising(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "execute"}},
+        ])
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        with self.assertRaises(GovernanceBlockerError):
+            self.execute("reviewer", supervisor, evidence_dir=evidence_dir)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(failure_record["disposition"], "BLOCKED")
 
     def test_evidence_written_to_evidence_dir_before_cleanup(self):
         supervisor = FakeSupervisor()
@@ -358,12 +451,12 @@ class ControlAdapterTests(unittest.TestCase):
             session_id=SESSION_ID,
             configured_model=MODEL,
             session_model=MODEL,
+            cli_version="fake",
+            tokens_used=5,
             model_attestation_level="RUNTIME_SESSION_BOUND",
             provider_effective_model=None,
             attestation_passed=True,
-            sqlite_row={"credential": secret, "tokens_used": 5},
             rollout_events_count=3,
-            token_usage={"credential": secret, "total_tokens": 5},
         )
         with mock.patch("prj226_runner.control_adapters.attest_session", return_value=attestation), \
                 mock.patch("prj226_runner.control_environment.IsolatedRoleEnvironment.sanitized", side_effect=lambda value: value):
@@ -394,12 +487,12 @@ class ControlAdapterTests(unittest.TestCase):
             session_id=SESSION_ID,
             configured_model=MODEL,
             session_model=MODEL,
+            cli_version="fake",
+            tokens_used=5,
             model_attestation_level="RUNTIME_SESSION_BOUND",
             provider_effective_model=None,
             attestation_passed=False,
-            sqlite_row={},
             rollout_events_count=3,
-            token_usage={"total_tokens": 5},
         )
         with mock.patch("prj226_runner.control_adapters.attest_session", return_value=attestation):
             with self.assertRaisesRegex(ArtifactValidationError, "SUCCESS requires attestation passed"):
