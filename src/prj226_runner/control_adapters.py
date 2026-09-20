@@ -42,6 +42,7 @@ class InvocationReceipt:
     completion_data: dict[str, Any] | None
     evidence_digest: str
     record: dict[str, Any]
+    invocation_id_in_context: bool = True
 
 
 # The runtime schema is intentionally frozen, but adapters only need the
@@ -630,7 +631,19 @@ def _safe_completion_file(path: Path) -> None:
         raise ArtifactValidationError("builder completion file must have exactly one hard link")
 
 
-def _load_completion(path: Path, invocation_id: str, session_id: str, task_id: str) -> dict[str, Any]:
+def _governed_completion_path(codex_home: Path, invocation_id: str) -> Path:
+    completion_dir = codex_home / "completion"
+    try:
+        completion_dir.mkdir(exist_ok=True)
+        metadata = completion_dir.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError("builder completion directory is unavailable") from exc
+    if completion_dir.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ArtifactValidationError("builder completion directory must be a regular non-symlink directory")
+    return completion_dir / f"{invocation_id}.completion.json"
+
+
+def _load_completion(path: Path, invocation_id: str, task_id: str) -> dict[str, Any]:
     _safe_completion_file(path)
     try:
         value = json.loads(
@@ -643,9 +656,105 @@ def _load_completion(path: Path, invocation_id: str, session_id: str, task_id: s
     if not isinstance(value, dict):
         raise ArtifactValidationError("builder completion must be a JSON object")
     _validate_with_schema(value, "control-builder-completion.v1.schema.json", "builder completion")
-    if value["invocation_id"] != invocation_id or value["session_id"] != session_id or value["task_id"] != task_id:
+    if value["invocation_id"] != invocation_id or value["task_id"] != task_id:
         raise ArtifactValidationError("builder completion identity mismatch")
     return value
+
+
+def _completion_data_for_receipt(env: Any, value: Mapping[str, Any]) -> dict[str, Any]:
+    summary = env.sanitized(value["summary"])
+    if not isinstance(summary, str):
+        raise ArtifactValidationError("builder completion summary must be a string")
+    sensitive = getattr(env, "_sensitive", ())
+    if any(isinstance(secret, str) and secret and secret in summary for secret in sensitive):
+        raise ArtifactValidationError("builder completion summary contains credential material")
+    return {
+        "status": value["status"],
+        "summary": summary,
+        "provider_output_declaration": value["provider_output_declaration"],
+    }
+
+
+def _validate_evidence_dir(value: Path | str) -> Path:
+    try:
+        path = Path(value)
+    except (TypeError, ValueError, OSError) as exc:
+        raise ArtifactValidationError("evidence_dir must be an explicit existing directory") from exc
+    if not path.is_absolute() or ".." in path.parts:
+        raise ArtifactValidationError("evidence_dir must not use a relative or traversal path")
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, OSError) as exc:
+        raise ArtifactValidationError("evidence_dir must be an existing directory") from exc
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ArtifactValidationError("evidence_dir must be a regular non-symlink directory")
+    try:
+        path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError("evidence_dir cannot be resolved") from exc
+    return path
+
+
+def _persist_evidence(evidence_dir: Path, invocation_id: str, record: Mapping[str, Any]) -> None:
+    target = evidence_dir / f"{invocation_id}.evidence.json"
+    temporary: Path | None = None
+    try:
+        serialized = canonical_json(record)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{invocation_id}.",
+            suffix=".tmp",
+            dir=str(evidence_dir),
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        _safe_completion_file(target)
+        loaded = json.loads(
+            target.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+        if loaded != dict(record):
+            raise ArtifactValidationError("persisted evidence did not round-trip")
+        _validate_with_schema(loaded, "control-invocation.v1.schema.json", "persisted invocation record")
+    except ArtifactValidationError:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError, TypeError) as exc:
+        raise ArtifactValidationError("evidence persistence failed") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _assert_disposition_invariants(
+    disposition: str,
+    supervision: Mapping[str, Any],
+    attestation: SessionAttestationResult | None,
+    completion_record: Mapping[str, Any],
+) -> None:
+    if disposition != "SUCCESS":
+        return
+    if not supervision.get("quiescent"):
+        raise ArtifactValidationError("SUCCESS requires quiescent")
+    if supervision.get("timeout_event", True):
+        raise ArtifactValidationError("SUCCESS requires no timeout")
+    if supervision.get("kill_event", True):
+        raise ArtifactValidationError("SUCCESS requires no kill")
+    if supervision.get("output_flood", True):
+        raise ArtifactValidationError("SUCCESS requires no output flood")
+    if attestation is None or not attestation.attestation_passed:
+        raise ArtifactValidationError("SUCCESS requires attestation passed")
+    if completion_record.get("status") != "COMPLETED":
+        raise ArtifactValidationError("SUCCESS requires non-blocked completion")
 
 
 def _tokens_used(attestation: SessionAttestationResult) -> int | None:
@@ -686,7 +795,7 @@ class CodexExecutionAdapter:
         context_bytes: bytes,
         cwd: Path | str,
         auth_source: AuthSource | None = None,
-        completion_output_path: Path | str | None = None,
+        evidence_dir: Path | str | None = None,
         timeout: float | None = None,
     ) -> InvocationReceipt:
         try:
@@ -704,13 +813,16 @@ class CodexExecutionAdapter:
             raise ArtifactValidationError("planner role must use read-only sandbox")
         if role_name == "reviewer" and profile["policy"]["sandbox"] != "read-only":
             raise ArtifactValidationError("reviewer role must use read-only sandbox")
+        if timeout is not None and (type(timeout) not in (int, float) or timeout < 0):
+            raise ArtifactValidationError("timeout must be non-negative")
+        evidence_path = _validate_evidence_dir(evidence_dir) if evidence_dir is not None else None
         limit = _context_limit(role_name, profile)
         if limit is not None and len(context_bytes) > limit:
             raise ArtifactValidationError("context exceeds configured limit")
-        if timeout is not None and (type(timeout) not in (int, float) or timeout < 0):
-            raise ArtifactValidationError("timeout must be non-negative")
 
         invocation_id = str(uuid.uuid4())
+        context_with_invocation = context_bytes + f"\n\nPRJ226 invocation_id: {invocation_id}\n".encode("utf-8")
+        invocation_id_in_context = invocation_id.encode("utf-8") in context_with_invocation
         context_digest = hashlib.sha256(context_bytes).hexdigest()
         started_at = _utc_now()
         started_monotonic = time.monotonic()
@@ -735,11 +847,12 @@ class CodexExecutionAdapter:
         with create_role_environment(auth_source=auth_source) as env:
             if env.codex_home is None:
                 raise AgentExecutionError("isolated environment did not provide CODEX_HOME")
+            completion_path = _governed_completion_path(Path(env.codex_home), invocation_id) if role_name == "builder" else None
             try:
                 result = _run_with_context(
                     self.supervisor,
                     command,
-                    context_bytes=context_bytes,
+                    context_bytes=context_with_invocation,
                     timeout=effective_timeout,
                     env=env.environment,
                     cwd=str(cwd),
@@ -764,9 +877,12 @@ class CodexExecutionAdapter:
                 and not supervision["output_flood"]
             )
             completion_data: dict[str, Any] | None = None
-            if role_name == "builder" and completion_output_path is not None and process_ok:
+            if role_name == "builder" and process_ok:
                 try:
-                    completion_data = _load_completion(Path(completion_output_path), invocation_id, session_id, task_id)
+                    completion_data = _completion_data_for_receipt(
+                        env,
+                        _load_completion(completion_path, invocation_id, task_id),
+                    )
                 except ArtifactValidationError:
                     completion_data = None
 
@@ -775,37 +891,37 @@ class CodexExecutionAdapter:
                 completion_record = {
                     "status": "BLOCKED",
                     "summary": f"{role_name} execution did not complete successfully",
-                    "output_digest": None,
+                    "provider_output_declaration": None,
                 }
             elif role_name == "builder" and completion_data is None:
                 disposition = "BLOCKED"
                 completion_record = {
                     "status": "BLOCKED",
                     "summary": "builder completion artifact is missing or invalid",
-                    "output_digest": None,
+                    "provider_output_declaration": None,
                 }
             elif role_name == "builder":
-                completion_data = env.sanitized(completion_data)
                 completion_record = {
                     "status": completion_data["status"],
                     "summary": completion_data["summary"],
-                    "output_digest": completion_data["output_digest"],
+                    "provider_output_declaration": completion_data["provider_output_declaration"],
                 }
                 disposition = "BLOCKED" if completion_data["status"] == "BLOCKED" else "SUCCESS"
             else:
                 completion_record = {
                     "status": "COMPLETED",
                     "summary": f"{role_name} execution completed",
-                    "output_digest": None,
+                    "provider_output_declaration": None,
                 }
                 disposition = "SUCCESS" if process_ok else "FAILED"
 
             completed_at = _utc_now()
             duration_seconds = max(0.0, time.monotonic() - started_monotonic)
+            _assert_disposition_invariants(disposition, supervision, attestation, completion_record)
             record_without_digest: dict[str, Any] = {
                 "schema_version": "PRJ226.CONTROL_INVOCATION.v1",
                 "invocation_id": invocation_id,
-                "session_id": session_id,
+                "session_id": attestation.session_id,
                 "task_id": task_id,
                 "role": role_name.upper(),
                 "runtime_profile_ref": profile["profile_ref"],
@@ -828,10 +944,14 @@ class CodexExecutionAdapter:
                 "disposition": disposition,
             }
             record_without_digest = env.sanitized(record_without_digest)
+            if not isinstance(record_without_digest, dict):
+                raise ArtifactValidationError("evidence record must be an object")
             digest = evidence_digest_for_record(record_without_digest)
             record = dict(record_without_digest)
             record["evidence_digest"] = digest
             _validate_with_schema(record, "control-invocation.v1.schema.json", "invocation record")
+            if evidence_path is not None:
+                _persist_evidence(evidence_path, invocation_id, record)
 
             return InvocationReceipt(
                 invocation_id=invocation_id,
@@ -845,4 +965,5 @@ class CodexExecutionAdapter:
                 completion_data=completion_data,
                 evidence_digest=digest,
                 record=record,
+                invocation_id_in_context=invocation_id_in_context,
             )

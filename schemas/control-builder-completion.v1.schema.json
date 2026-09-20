@@ -6,23 +6,21 @@
   "required": [
     "schema_version",
     "invocation_id",
-    "session_id",
     "task_id",
     "status",
     "summary",
     "blockers",
     "changed_paths",
-    "output_digest"
+    "provider_output_declaration"
   ],
   "properties": {
     "schema_version": {"const": "PRJ226.CONTROL_BUILDER_COMPLETION.v1"},
     "invocation_id": {"type": "string", "minLength": 1},
-    "session_id": {"type": "string", "minLength": 1},
     "task_id": {"type": "string", "minLength": 1},
     "status": {"enum": ["COMPLETED", "BLOCKED"]},
     "summary": {"type": "string", "minLength": 1},
     "blockers": {"type": "array", "items": {"type": "string"}},
     "changed_paths": {"type": "array", "items": {"type": "string"}},
-    "output_digest": {"type": ["string", "null"]}
+    "provider_output_declaration": {"type": ["string", "null"]}
   }
 }

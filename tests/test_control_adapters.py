@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ from prj226_runner.control_adapters import (
     canonical_json,
     evidence_digest_for_record,
 )
+from prj226_runner.control_attestation import SessionAttestationResult
 from prj226_runner.control_environment import EphemeralApiKeyAuth
 from prj226_runner.control_runtime import derived_profile_ref
 from prj226_runner.errors import AgentExecutionError, ArtifactValidationError, GovernanceBlockerError
@@ -59,10 +61,11 @@ def profile(role_name="builder", *, context_limit=None):
 
 
 class FakeSupervisor:
-    def __init__(self, events=None, *, error=None, completion_secret=None):
+    def __init__(self, events=None, *, error=None, completion=None, completion_raw=None):
         self.events = events or [{"type": "thread.started", "thread_id": SESSION_ID}]
         self.error = error
-        self.completion_secret = completion_secret
+        self.completion = completion
+        self.completion_raw = completion_raw
         self.calls = 0
         self.last = None
         self.codex_home = None
@@ -95,6 +98,14 @@ class FakeSupervisor:
         )
         connection.commit()
         connection.close()
+        marker = b"PRJ226 invocation_id: "
+        invocation_id = input.split(marker, 1)[1].splitlines()[0].decode("utf-8")
+        if self.completion is not None or self.completion_raw is not None:
+            completion_path = self.codex_home / "completion" / f"{invocation_id}.completion.json"
+            if self.completion_raw is not None:
+                completion_path.write_text(self.completion_raw, encoding="utf-8")
+            else:
+                completion_path.write_text(json.dumps(self.completion), encoding="utf-8")
         stdout = "".join(json.dumps(item) + "\n" for item in self.events).encode("utf-8")
         return ProcessResult(
             returncode=0,
@@ -126,23 +137,17 @@ class ControlAdapterTests(unittest.TestCase):
             **kwargs,
         )
 
-    def completion(self, *, status="COMPLETED", invocation_id=FIXED_INVOCATION_ID, session_id=SESSION_ID, summary="done", output_digest=None):
+    def completion(self, *, status="COMPLETED", invocation_id=FIXED_INVOCATION_ID, task_id=TASK_ID, summary="done", provider_output_declaration=None):
         return {
             "schema_version": "PRJ226.CONTROL_BUILDER_COMPLETION.v1",
             "invocation_id": invocation_id,
-            "session_id": session_id,
-            "task_id": TASK_ID,
+            "task_id": task_id,
             "status": status,
             "summary": summary,
             "blockers": [],
             "changed_paths": [],
-            "output_digest": output_digest,
+            "provider_output_declaration": provider_output_declaration,
         }
-
-    def completion_path(self, value):
-        path = self.cwd / "completion.json"
-        path.write_text(json.dumps(value), encoding="utf-8")
-        return path
 
     def test_planner_executing_command_is_blocked(self):
         supervisor = FakeSupervisor(events=[
@@ -274,40 +279,47 @@ class ControlAdapterTests(unittest.TestCase):
             self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"12345")
 
     def test_builder_valid_completion_succeeds(self):
-        supervisor = FakeSupervisor()
-        completion_path = self.completion_path(self.completion())
+        supervisor = FakeSupervisor(completion=self.completion())
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
-            receipt = self.execute("builder", supervisor, completion_output_path=completion_path)
+            receipt = self.execute("builder", supervisor)
         self.assertEqual(receipt.disposition, "SUCCESS")
         self.assertEqual(receipt.completion_data["status"], "COMPLETED")
-        self.assertEqual(supervisor.last["input"], self.context)
+        self.assertTrue(receipt.invocation_id_in_context)
+        self.assertIn(FIXED_INVOCATION_ID.encode("utf-8"), supervisor.last["input"])
         self.assertEqual(supervisor.last["argv"][-1], "-")
 
     def test_builder_missing_completion_file_is_blocked(self):
-        receipt = self.execute("builder", FakeSupervisor(), completion_output_path=self.cwd / "missing.json")
+        receipt = self.execute("builder", FakeSupervisor())
         self.assertEqual(receipt.disposition, "BLOCKED")
 
     def test_builder_malformed_completion_is_blocked(self):
-        path = self.cwd / "completion.json"
-        path.write_text("not-json", encoding="utf-8")
+        supervisor = FakeSupervisor(completion_raw="not-json")
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
-            receipt = self.execute("builder", FakeSupervisor(), completion_output_path=path)
+            receipt = self.execute("builder", supervisor)
         self.assertEqual(receipt.disposition, "BLOCKED")
 
     def test_builder_completion_id_mismatch_is_blocked(self):
-        value = self.completion(session_id="different-session")
-        path = self.completion_path(value)
+        value = self.completion(invocation_id="different-invocation")
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
-            receipt = self.execute("builder", FakeSupervisor(), completion_output_path=path)
+            receipt = self.execute("builder", FakeSupervisor(completion=value))
+        self.assertEqual(receipt.disposition, "BLOCKED")
+
+    def test_builder_completion_task_id_mismatch_is_blocked(self):
+        value = self.completion(task_id="different-task")
+        with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+            receipt = self.execute("builder", FakeSupervisor(completion=value))
         self.assertEqual(receipt.disposition, "BLOCKED")
 
     def test_builder_blocked_status_yields_blocked_disposition(self):
         value = self.completion(status="BLOCKED", summary="blocked by policy")
-        path = self.completion_path(value)
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
-            receipt = self.execute("builder", FakeSupervisor(), completion_output_path=path)
+            receipt = self.execute("builder", FakeSupervisor(completion=value))
         self.assertEqual(receipt.disposition, "BLOCKED")
         self.assertEqual(receipt.record["completion"]["summary"], "blocked by policy")
+
+    def test_builder_does_not_accept_caller_completion_path(self):
+        with self.assertRaises(TypeError):
+            self.execute("builder", FakeSupervisor(), completion_output_path=self.cwd / "arbitrary.json")
 
     def test_adapter_zero_retry_and_zero_fallback_on_error(self):
         supervisor = FakeSupervisor(error=AgentExecutionError("one failure"))
@@ -315,21 +327,83 @@ class ControlAdapterTests(unittest.TestCase):
             self.execute("builder", supervisor)
         self.assertEqual(supervisor.calls, 1)
 
-    def test_durable_evidence_finalized_before_environment_cleanup(self):
+    def test_evidence_written_to_evidence_dir_before_cleanup(self):
         supervisor = FakeSupervisor()
-        receipt = self.execute("planner", supervisor)
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        receipt = self.execute("planner", supervisor, evidence_dir=evidence_dir)
+        evidence_path = evidence_dir / f"{receipt.invocation_id}.evidence.json"
         self.assertTrue(receipt.record["evidence_digest"])
         self.assertFalse(supervisor.codex_home.exists())
         self.assertEqual(receipt.evidence_digest, receipt.record["evidence_digest"])
+        self.assertEqual(json.loads(evidence_path.read_text(encoding="utf-8")), receipt.record)
+
+    def test_evidence_dir_none_means_no_disk_write(self):
+        evidence_dir = Path(self.temp.name) / "evidence"
+        receipt = self.execute("planner", FakeSupervisor())
+        self.assertIsNotNone(receipt.record)
+        self.assertFalse(evidence_dir.exists())
 
     def test_durable_evidence_contains_zero_auth_secrets(self):
         secret = "test-api-secret-123"
-        supervisor = FakeSupervisor()
-        path = self.completion_path(self.completion(summary=secret))
+        supervisor = FakeSupervisor(completion=self.completion(summary=secret))
         with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
-            receipt = self.execute("builder", supervisor, auth_source=EphemeralApiKeyAuth(secret), completion_output_path=path)
+            receipt = self.execute("builder", supervisor, auth_source=EphemeralApiKeyAuth(secret))
         self.assertNotIn(secret, json.dumps(receipt.record, sort_keys=True))
         self.assertNotIn(secret, json.dumps(receipt.completion_data, sort_keys=True))
+
+    def test_evidence_excludes_raw_attestation_data_when_sanitizer_is_bypassed(self):
+        secret = "raw-auth-secret"
+        attestation = SessionAttestationResult(
+            session_id=SESSION_ID,
+            configured_model=MODEL,
+            session_model=MODEL,
+            model_attestation_level="RUNTIME_SESSION_BOUND",
+            provider_effective_model=None,
+            attestation_passed=True,
+            sqlite_row={"credential": secret, "tokens_used": 5},
+            rollout_events_count=3,
+            token_usage={"credential": secret, "total_tokens": 5},
+        )
+        with mock.patch("prj226_runner.control_adapters.attest_session", return_value=attestation), \
+                mock.patch("prj226_runner.control_environment.IsolatedRoleEnvironment.sanitized", side_effect=lambda value: value):
+            receipt = self.execute("planner", FakeSupervisor())
+        self.assertNotIn(secret, json.dumps(receipt.record, sort_keys=True))
+
+    def test_completion_secret_is_blocked_when_sanitizer_is_bypassed(self):
+        secret = "raw-summary-secret"
+        supervisor = FakeSupervisor(completion=self.completion(summary=secret))
+        with mock.patch("prj226_runner.control_environment.IsolatedRoleEnvironment.sanitized", side_effect=lambda value: value):
+            with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+                receipt = self.execute("builder", supervisor, auth_source=EphemeralApiKeyAuth(secret))
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertNotIn(secret, json.dumps(receipt.record, sort_keys=True))
+
+    def test_evidence_digest_is_independently_recomputable(self):
+        receipt = self.execute("planner", FakeSupervisor())
+        record_without_digest = dict(receipt.record)
+        record_without_digest.pop("evidence_digest")
+        expected = hashlib.sha256(
+            canonical_json(record_without_digest).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt.evidence_digest, expected)
+        self.assertEqual(receipt.record["evidence_digest"], expected)
+
+    def test_attestation_failure_cannot_produce_success(self):
+        attestation = SessionAttestationResult(
+            session_id=SESSION_ID,
+            configured_model=MODEL,
+            session_model=MODEL,
+            model_attestation_level="RUNTIME_SESSION_BOUND",
+            provider_effective_model=None,
+            attestation_passed=False,
+            sqlite_row={},
+            rollout_events_count=3,
+            token_usage={"total_tokens": 5},
+        )
+        with mock.patch("prj226_runner.control_adapters.attest_session", return_value=attestation):
+            with self.assertRaisesRegex(ArtifactValidationError, "SUCCESS requires attestation passed"):
+                self.execute("planner", FakeSupervisor())
 
     def test_durable_evidence_schema_validity(self):
         receipt = self.execute("planner", FakeSupervisor())

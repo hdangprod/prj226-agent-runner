@@ -66,11 +66,14 @@
     "completion": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "summary", "output_digest"],
+      "required": ["status", "summary", "provider_output_declaration"],
       "properties": {
         "status": {"enum": ["COMPLETED", "BLOCKED"]},
         "summary": {"type": "string"},
-        "output_digest": {"type": ["string", "null"]}
+        "provider_output_declaration": {
+          "type": ["string", "null"],
+          "description": "Unverified provider-supplied output summary; the adapter does not recompute it."
+        }
       }
     },
     "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
