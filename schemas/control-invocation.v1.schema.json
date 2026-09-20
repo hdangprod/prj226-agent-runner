@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PRJ226 control invocation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "invocation_id",
+    "session_id",
+    "task_id",
+    "role",
+    "runtime_profile_ref",
+    "configured_model",
+    "session_model",
+    "model_attestation_level",
+    "provider_effective_model",
+    "context_digest",
+    "started_at",
+    "completed_at",
+    "duration_seconds",
+    "supervision",
+    "attestation",
+    "completion",
+    "evidence_digest",
+    "disposition"
+  ],
+  "properties": {
+    "schema_version": {"const": "PRJ226.CONTROL_INVOCATION.v1"},
+    "invocation_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "role": {"enum": ["PLANNER", "BUILDER", "REVIEWER"]},
+    "runtime_profile_ref": {"type": "string", "pattern": "^role-[0-9a-f]{64}$"},
+    "configured_model": {"type": "string", "minLength": 1},
+    "session_model": {"type": "string", "minLength": 1},
+    "model_attestation_level": {"const": "RUNTIME_SESSION_BOUND"},
+    "provider_effective_model": {"type": "null"},
+    "context_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "started_at": {"type": "string", "minLength": 1},
+    "completed_at": {"type": "string", "minLength": 1},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "supervision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_code", "quiescent", "timeout_event", "term_event", "kill_event", "output_flood"],
+      "properties": {
+        "exit_code": {"type": "integer"},
+        "quiescent": {"type": "boolean"},
+        "timeout_event": {"type": "boolean"},
+        "term_event": {"type": "boolean"},
+        "kill_event": {"type": "boolean"},
+        "output_flood": {"type": "boolean"}
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attestation_passed", "sqlite_verified", "rollout_verified", "tokens_used"],
+      "properties": {
+        "attestation_passed": {"type": "boolean"},
+        "sqlite_verified": {"type": "boolean"},
+        "rollout_verified": {"type": "boolean"},
+        "tokens_used": {"type": ["integer", "null"]}
+      }
+    },
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary", "output_digest"],
+      "properties": {
+        "status": {"enum": ["COMPLETED", "BLOCKED"]},
+        "summary": {"type": "string"},
+        "output_digest": {"type": ["string", "null"]}
+      }
+    },
+    "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "disposition": {"enum": ["SUCCESS", "BLOCKED", "FAILED"]}
+  }
+}
