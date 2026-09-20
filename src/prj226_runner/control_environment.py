@@ -51,9 +51,30 @@ class DesignatedFileAuth(AuthSource):
     def provision(self, codex_home: Path) -> list[str]:
         if self.source_path.is_symlink() or not self.source_path.is_file():
             raise ValueError("designated auth source must be a regular file")
-        self._contents = self.source_path.read_text(encoding="utf-8")
+        destination_name = Path(self.destination_name)
+        if (destination_name.is_absolute() or ".." in destination_name.parts or
+                len(destination_name.parts) != 1):
+            raise ValueError("designated auth destination must be a single filename")
+        codex_home_resolved = codex_home.resolve()
         destination = codex_home / self.destination_name
-        destination.write_text(self._contents, encoding="utf-8")
+        if destination.resolve().parent != codex_home_resolved:
+            raise ValueError("designated auth destination escapes CODEX_HOME")
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_file():
+                raise ValueError("designated auth destination must be a regular file")
+            raise ValueError("designated auth destination already exists")
+        self._contents = self.source_path.read_text(encoding="utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(destination, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(self._contents)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         os.chmod(destination, 0o600)
         return [self._contents]
 

@@ -2,8 +2,10 @@ import signal
 import sys
 import time
 import unittest
+from unittest import mock
 
-from prj226_runner.errors import AgentExecutionError
+from prj226_runner.errors import AgentExecutionError, GovernanceBlockerError
+from prj226_runner.process_supervisor import SupervisionEvidence
 from prj226_runner.process_supervisor import SupervisedProcessRunner
 
 
@@ -24,11 +26,26 @@ class ProcessSupervisorTests(unittest.TestCase):
         self.assertTrue(result.supervision.term_event)
 
     def test_child_ignores_sigterm(self):
-        result = SupervisedProcessRunner(term_grace=.2, kill_grace=.2).run(
-            ["/bin/sh", "-c", "trap '' TERM; sleep 100"], timeout=.1)
-        self.assertTrue(result.supervision.final_group_quiescent)
-        self.assertTrue(result.supervision.kill_event)
-        self.assertTrue(result.supervision.survivors_after_term)
+        try:
+            result = SupervisedProcessRunner(term_grace=.2, kill_grace=.2).run(
+                ["/bin/sh", "-c", "trap '' TERM; sleep 100"], timeout=.1)
+        except GovernanceBlockerError as exc:
+            # Restricted runners without either approved inspection source must
+            # fail closed when a killed descendant remains unreaped.
+            evidence = exc.details["supervision"]
+            self.assertTrue(evidence.kill_event)
+            self.assertFalse(evidence.final_group_quiescent)
+        else:
+            self.assertTrue(result.supervision.final_group_quiescent)
+            self.assertTrue(result.supervision.kill_event)
+            self.assertTrue(result.supervision.survivors_after_term)
+
+    def test_permission_error_does_not_prove_quiescence(self):
+        evidence = SupervisionEvidence(123, 123)
+        with mock.patch("prj226_runner.process_supervisor._inspect_group", return_value=(False, [], [])), \
+                mock.patch("prj226_runner.process_supervisor.os.killpg", side_effect=PermissionError):
+            with self.assertRaises(GovernanceBlockerError):
+                SupervisedProcessRunner(term_grace=.01, kill_grace=.01)._quiesce(evidence)
 
     def test_output_flood_enforced_while_streaming(self):
         with self.assertRaisesRegex(AgentExecutionError, "Process log limit exceeded"):

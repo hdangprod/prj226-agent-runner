@@ -14,7 +14,7 @@ class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.executable = Path(self.temp.name) / "fake-runtime"
-        self.executable.write_text("#!/bin/sh\nprintf '0.148.0\\n'\n")
+        self.executable.write_text("#!/bin/sh\nprintf 'codex-cli 0.148.0\\n'\n")
         self.executable.chmod(0o700)
 
     def tearDown(self):
@@ -24,7 +24,7 @@ class RuntimeTests(unittest.TestCase):
         digest = hashlib.sha256(self.executable.read_bytes()).hexdigest()
         roles = {}
         for name, capability in (("planner", "none"), ("builder", "candidate-write-only"), ("reviewer", "none")):
-            role = {"role": name.upper(), "backend": "codex", "provider": "OpenAI", "model": "test-model", "adapter": "test-adapter", "executable": str(self.executable), "executable_sha256": digest, "version": "0.148.0", "policy": {"sandbox": "workspace-write", "approval": "never", "tool_capability": capability, "shell_capability": "workspace-only", "repository_write_capability": "candidate-worktree-owned-paths", "network_capability": "provider-api-only", "retry_count": 0, "fallback_count": 0, "fresh_home": True, "fresh_codex_home": True, "session_persistence": "ephemeral-isolated", "environment_policy": "closed-allowlist-only", "authentication_policy": "no-auth-required", "timeout_seconds": 5, "context_policy": "test", "feature_disables": []}}
+            role = {"role": name.upper(), "backend": "codex", "provider": "openai", "model": "test-model", "adapter": "test-adapter", "executable": str(self.executable), "executable_sha256": digest, "version": "codex-cli 0.148.0", "policy": {"sandbox": "workspace-write", "approval": "never", "tool_capability": capability, "shell_capability": "workspace-only", "repository_write_capability": "candidate-worktree-owned-paths", "network_capability": "provider-api-only", "retry_count": 0, "fallback_count": 0, "fresh_home": True, "fresh_codex_home": True, "session_persistence": "ephemeral-isolated", "environment_policy": "closed-allowlist-only", "authentication_policy": "no-auth-required", "timeout_seconds": 5, "context_policy": "test", "feature_disables": []}}
             role["profile_ref"] = derived_profile_ref(role)
             roles[name] = role
         return {"schema_version": "PRJ226.CONTROL_RUNTIME.v1", "roles": roles}
@@ -61,6 +61,11 @@ class RuntimeTests(unittest.TestCase):
 
     def test_version_mismatch_is_observed_and_rejected(self):
         bundle = self.bundle(); bundle["roles"]["reviewer"]["version"] = "expected-but-false"; bundle["roles"]["reviewer"]["profile_ref"] = derived_profile_ref(bundle["roles"]["reviewer"])
+        with self.assertRaises(ArtifactValidationError): validate_runtime(bundle)
+
+    def test_display_provider_name_is_rejected(self):
+        bundle = self.bundle(); bundle["roles"]["planner"]["provider"] = "OpenAI"
+        bundle["roles"]["planner"]["profile_ref"] = derived_profile_ref(bundle["roles"]["planner"])
         with self.assertRaises(ArtifactValidationError): validate_runtime(bundle)
 
 

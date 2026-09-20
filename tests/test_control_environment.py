@@ -28,6 +28,24 @@ class ControlEnvironmentTests(unittest.TestCase):
                 self.assertEqual(destination.read_text(), "test-dummy-api-key")
                 self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
 
+    def test_unsafe_designated_destinations_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "credential"
+            source.write_text("zero-real-credentials")
+            for name in ("/tmp/escape", "../escape", "a/../../escape"):
+                with self.assertRaises(ValueError):
+                    with create_role_environment(DesignatedFileAuth(source, name)):
+                        pass
+
+    def test_symlink_designated_destination_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "credential"
+            source.write_text("zero-real-credentials")
+            with create_role_environment() as isolated:
+                (isolated.codex_home / "designated-credential").symlink_to(source)
+                with self.assertRaises(ValueError):
+                    DesignatedFileAuth(source).provision(isolated.codex_home)
+
     def test_auth_contents_redacted_from_evidence(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "credential"

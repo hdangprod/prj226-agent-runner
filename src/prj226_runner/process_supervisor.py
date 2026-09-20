@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import selectors
 import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
 from prj226_runner.errors import AgentExecutionError, GovernanceBlockerError
@@ -35,24 +37,60 @@ class ProcessResult:
     output_flood: bool = False
 
 
-def _group_members(pgid: int) -> list[int]:
-    members = []
-    proc = "/proc"
+def _proc_group_members(pgid: int) -> tuple[list[int], list[int]] | None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    members, zombies = [], []
     try:
         entries = os.listdir(proc)
     except OSError:
-        return members
+        return None
     for entry in entries:
         if not entry.isdigit():
             continue
         try:
-            with open(os.path.join(proc, entry, "stat"), encoding="utf-8") as handle:
-                fields = handle.read().split()
-            if len(fields) > 4 and int(fields[4]) == pgid and fields[2] != "Z":
-                members.append(int(entry))
+            fields = Path(proc / entry / "stat").read_text(encoding="utf-8")
+            match = re.match(r"^(\d+) \(.*\) (\S) \d+ (\d+)", fields)
+            if match and int(match.group(3)) == pgid:
+                pid = int(entry)
+                (zombies if match.group(2) == "Z" else members).append(pid)
         except (OSError, ValueError):
             continue
-    return sorted(members)
+    return sorted(members), sorted(zombies)
+
+
+def _inspect_group(pgid: int) -> tuple[bool, list[int], list[int]]:
+    """Return (available, running members, zombie members)."""
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-A", "-o", "pid,pgid,state"],
+            capture_output=True, text=True, timeout=2.0, check=False,
+        )
+        if completed.returncode == 0:
+            members, zombies = [], []
+            for line in completed.stdout.splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                try:
+                    pid, member_pgid = int(fields[0]), int(fields[1])
+                except ValueError:
+                    continue
+                if member_pgid == pgid:
+                    (zombies if fields[2].startswith("Z") else members).append(pid)
+            return True, sorted(members), sorted(zombies)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    fallback = _proc_group_members(pgid)
+    if fallback is None:
+        return False, [], []
+    return True, *fallback
+
+
+def _group_members(pgid: int) -> list[int]:
+    available, members, zombies = _inspect_group(pgid)
+    return sorted(members + zombies) if available else []
 
 
 class SupervisedProcessRunner:
@@ -61,22 +99,41 @@ class SupervisedProcessRunner:
         self.stdout_limit, self.stderr_limit = stdout_limit, stderr_limit
         self.term_grace, self.kill_grace = term_grace, kill_grace
 
-    def _quiesce(self, evidence: SupervisionEvidence) -> None:
-        evidence.observed_group_members = _group_members(evidence.pgid)
+    def _reap_leader(self, proc: subprocess.Popen[bytes] | None) -> None:
+        if proc is None or proc.poll() is None:
+            return
+        try:
+            proc.wait(timeout=min(max(self.kill_grace, 0.05), 1.0))
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _quiesce(self, evidence: SupervisionEvidence, proc: subprocess.Popen[bytes] | None = None) -> None:
+        available, members, zombies = _inspect_group(evidence.pgid)
+        evidence.observed_group_members = sorted(members + zombies) if available else []
+        if available and not members and not zombies:
+            evidence.final_group_quiescent = True
+            return
         try:
             os.killpg(evidence.pgid, 0)
         except ProcessLookupError:
+            # ESRCH is direct proof that the tracked group is empty.
             evidence.final_group_quiescent = True
             return
         except PermissionError:
+            # EPERM proves only that a group-related permission check failed.
+            # It is never evidence that the group is empty.
             pass
         evidence.term_event = True
         try:
             os.killpg(evidence.pgid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         deadline = time.monotonic() + self.term_grace
         while time.monotonic() < deadline:
+            available, members, zombies = _inspect_group(evidence.pgid)
+            if available and not members and not zombies:
+                evidence.final_group_quiescent = True
+                return
             try:
                 os.killpg(evidence.pgid, 0)
             except ProcessLookupError:
@@ -85,7 +142,9 @@ class SupervisedProcessRunner:
             except PermissionError:
                 pass
             time.sleep(0.05)
-        evidence.survivors_after_term = _group_members(evidence.pgid) or [evidence.pgid]
+        self._reap_leader(proc)
+        available, members, zombies = _inspect_group(evidence.pgid)
+        evidence.survivors_after_term = sorted(members + zombies) if available else [evidence.pgid]
         evidence.kill_event = True
         try:
             os.killpg(evidence.pgid, signal.SIGKILL)
@@ -93,19 +152,21 @@ class SupervisedProcessRunner:
             pass
         deadline = time.monotonic() + self.kill_grace
         while time.monotonic() < deadline:
+            available, members, zombies = _inspect_group(evidence.pgid)
+            if available and not members and not zombies:
+                evidence.final_group_quiescent = True
+                return
             try:
                 os.killpg(evidence.pgid, 0)
             except ProcessLookupError:
                 evidence.final_group_quiescent = True
                 return
             except PermissionError:
-                # macOS may report EPERM for an otherwise existing private
-                # group; the post-KILL member scan remains authoritative there.
-                if not _group_members(evidence.pgid):
-                    evidence.final_group_quiescent = True
-                    return
+                pass
             time.sleep(0.05)
-        evidence.survivors_after_kill = _group_members(evidence.pgid) or [evidence.pgid]
+        self._reap_leader(proc)
+        available, members, zombies = _inspect_group(evidence.pgid)
+        evidence.survivors_after_kill = sorted(members + zombies) if available else [evidence.pgid]
         evidence.final_group_quiescent = False
         raise GovernanceBlockerError("BLOCK_PROCESS_SURVIVORS_DETECTED", {"supervision": evidence})
 
@@ -146,16 +207,16 @@ class SupervisedProcessRunner:
                 if proc.poll() is not None:
                     break
             if timed_out or flood:
-                self._quiesce(evidence)
+                self._quiesce(evidence, proc)
                 if proc.poll() is None:
                     try:
                         proc.wait(timeout=1)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                        proc.wait()
+                        proc.wait(timeout=1)
             else:
                 proc.wait()
-                self._quiesce(evidence)
+                self._quiesce(evidence, proc)
         finally:
             selector.close()
             if proc.poll() is None:
@@ -163,7 +224,11 @@ class SupervisedProcessRunner:
                     proc.kill()
                 except OSError:
                     pass
-            proc.wait()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
             if proc.stdout:
                 proc.stdout.close()
             if proc.stderr:

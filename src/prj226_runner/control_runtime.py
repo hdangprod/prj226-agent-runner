@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -54,6 +55,8 @@ def _validate_profile(name: str, profile: Mapping[str, Any], verify_executable: 
     for key in ("backend", "provider", "model", "adapter", "version", "profile_ref"):
         if not isinstance(profile[key], str) or not profile[key]:
             _fail(f"role {name}.{key} must be a non-empty string")
+    if not re.fullmatch(r"[a-z0-9_-]+", profile["provider"]):
+        _fail(f"role {name}.provider must be a lowercase machine-safe identifier")
     executable = profile["executable"]
     if not isinstance(executable, str) or not executable.startswith("/"):
         _fail(f"role {name}.executable must be absolute")
