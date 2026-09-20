@@ -102,6 +102,11 @@ def _check_session_observation(record: dict[str, Any], session_id: str) -> None:
         for key in ("thread_id", "session_id"):
             if key in candidate and candidate[key] != session_id:
                 _fail("conflicting session ID")
+        if candidate.get("type") == "session_meta":
+            payload = candidate.get("payload")
+            for payload_candidate in candidates(payload):
+                if "id" in payload_candidate and payload_candidate["id"] != session_id:
+                    _fail("conflicting session ID")
 
 
 def _token_usage_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -206,6 +211,10 @@ def attest_session(
     if len(rows) != 1:
         _fail("session identity must match exactly one SQLite row", {"row_count": len(rows)})
     sqlite_row = dict(zip(columns, rows[0]))
+    if "cli_version" in sqlite_row and (
+        not isinstance(sqlite_row["cli_version"], str) or not sqlite_row["cli_version"]
+    ):
+        _fail("SQLite CLI version is invalid")
     if sqlite_row["id"] != session_id:
         _fail("SQLite session identity mismatch")
     if sqlite_row["model"] != configured_model:

@@ -28,7 +28,16 @@ class ControlAttestationTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _write_sqlite(self, *, session_id=SESSION_ID, model=MODEL, provider=PROVIDER, rollout_path=None, rows=None):
+    def _write_sqlite(
+        self,
+        *,
+        session_id=SESSION_ID,
+        model=MODEL,
+        provider=PROVIDER,
+        cli_version="test-cli",
+        rollout_path=None,
+        rows=None,
+    ):
         if self.sqlite_path.exists() or self.sqlite_path.is_symlink():
             self.sqlite_path.unlink()
         connection = sqlite3.connect(self.sqlite_path)
@@ -37,7 +46,7 @@ class ControlAttestationTests(unittest.TestCase):
             "rollout_path TEXT, tokens_used INTEGER, created_at TEXT)"
         )
         if rows is None:
-            rows = [(session_id, model, provider, "test-cli", str(rollout_path or self.rollout), 12, "now")]
+            rows = [(session_id, model, provider, cli_version, str(rollout_path or self.rollout), 12, "now")]
         connection.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
         connection.commit()
         connection.close()
@@ -55,6 +64,7 @@ class ControlAttestationTests(unittest.TestCase):
         result = attest_session(self.home, SESSION_ID, MODEL)
         self.assertTrue(result.attestation_passed)
         self.assertEqual(result.session_model, MODEL)
+        self.assertEqual(result.sqlite_row["cli_version"], "test-cli")
         self.assertEqual(result.rollout_events_count, 3)
         self.assertEqual(result.token_usage["total_tokens"], 12)
 
@@ -140,6 +150,66 @@ class ControlAttestationTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(ArtifactValidationError, "conflicting session ID"):
             attest_session(self.home, SESSION_ID, MODEL)
+
+    def test_matching_real_session_meta_observation_passes(self):
+        self._write_rollout([
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": SESSION_ID,
+                    "timestamp": "2026-09-20T00:00:00Z",
+                    "cwd": str(self.home),
+                    "cli_version": "test-cli",
+                    "model_provider": PROVIDER,
+                    "model": MODEL,
+                },
+            },
+            {"type": "turn_context", "payload": {"model": MODEL}},
+        ])
+        result = attest_session(self.home, SESSION_ID, MODEL)
+        self.assertTrue(result.attestation_passed)
+
+    def test_contradictory_real_session_meta_observation_fails_closed(self):
+        self._write_rollout([
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "other-session",
+                    "timestamp": "2026-09-20T00:00:00Z",
+                    "cwd": str(self.home),
+                    "cli_version": "test-cli",
+                    "model_provider": PROVIDER,
+                    "model": MODEL,
+                },
+            },
+            {"type": "turn_context", "payload": {"model": MODEL}},
+        ])
+        with self.assertRaisesRegex(ArtifactValidationError, "conflicting session ID"):
+            attest_session(self.home, SESSION_ID, MODEL)
+
+    def test_session_meta_without_payload_id_passes(self):
+        self._write_rollout([
+            {
+                "type": "session_meta",
+                "payload": {
+                    "timestamp": "2026-09-20T00:00:00Z",
+                    "cwd": str(self.home),
+                    "cli_version": "test-cli",
+                    "model_provider": PROVIDER,
+                    "model": MODEL,
+                },
+            },
+            {"type": "turn_context", "payload": {"model": MODEL}},
+        ])
+        result = attest_session(self.home, SESSION_ID, MODEL)
+        self.assertTrue(result.attestation_passed)
+
+    def test_empty_or_missing_cli_version_fails_closed(self):
+        for cli_version in ("", None):
+            with self.subTest(cli_version=cli_version):
+                self._write_sqlite(cli_version=cli_version)
+                with self.assertRaisesRegex(ArtifactValidationError, "CLI version"):
+                    attest_session(self.home, SESSION_ID, MODEL)
 
     def test_provider_effective_model_is_always_null(self):
         result = attest_session(self.home, SESSION_ID, MODEL, expected_provider=PROVIDER)

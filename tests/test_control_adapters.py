@@ -13,7 +13,7 @@ from prj226_runner.control_adapters import (
 )
 from prj226_runner.control_environment import EphemeralApiKeyAuth
 from prj226_runner.control_runtime import derived_profile_ref
-from prj226_runner.errors import AgentExecutionError, GovernanceBlockerError
+from prj226_runner.errors import AgentExecutionError, ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.process_supervisor import ProcessResult, SupervisionEvidence
 
 
@@ -115,11 +115,13 @@ class ControlAdapterTests(unittest.TestCase):
         self.temp.cleanup()
 
     def execute(self, role_name, supervisor, **kwargs):
+        selected_profile = kwargs.pop("profile", profile(role_name))
+        selected_context = kwargs.pop("context_bytes", self.context)
         return CodexExecutionAdapter(supervisor=supervisor).execute_role(
             role_name=role_name,
-            profile=profile(role_name),
+            profile=selected_profile,
             task_id=TASK_ID,
-            context_bytes=self.context,
+            context_bytes=selected_context,
             cwd=self.cwd,
             **kwargs,
         )
@@ -152,6 +154,44 @@ class ControlAdapterTests(unittest.TestCase):
                 self.execute("planner", supervisor)
         self.assertEqual(supervisor.calls, 1)
 
+    def test_planner_mcp_execute_tool_call_is_blocked(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "mcp_tool_call", "tool": "execute", "arguments": {"script": "echo unsafe"}},
+        ])
+        with self.assertRaisesRegex(GovernanceBlockerError, "PLANNER_CAPABILITY_BREACH"):
+            self.execute("planner", supervisor)
+
+    def test_planner_nested_item_command_execution_is_blocked(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "echo unsafe"}},
+        ])
+        with self.assertRaisesRegex(GovernanceBlockerError, "PLANNER_CAPABILITY_BREACH"):
+            self.execute("planner", supervisor)
+
+    def test_unknown_primitive_event_is_informational(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "future_informational_event", "message": "status", "count": 1, "ok": True},
+        ])
+        receipt = self.execute("planner", supervisor)
+        self.assertEqual(receipt.disposition, "SUCCESS")
+
+    def test_unknown_command_or_tool_structure_is_blocked_for_planner_and_reviewer(self):
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    {
+                        "type": "future_event",
+                        "tool": "execute",
+                        "arguments": {"script": "echo unsafe"},
+                    },
+                ])
+                with self.assertRaisesRegex(GovernanceBlockerError, "UNRECOGNIZED_MUTATION_EVENT"):
+                    self.execute(role_name, supervisor)
+
     def test_planner_modifying_file_is_blocked(self):
         supervisor = FakeSupervisor(events=[
             {"type": "thread.started", "thread_id": SESSION_ID},
@@ -167,6 +207,71 @@ class ControlAdapterTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(GovernanceBlockerError, "REVIEWER_CAPABILITY_BREACH"):
             self.execute("reviewer", supervisor)
+
+    def test_reviewer_workspace_write_profile_is_rejected_after_profile_validation(self):
+        reviewer_profile = profile("reviewer")
+        reviewer_profile["policy"]["sandbox"] = "workspace-write"
+        reviewer_profile["profile_ref"] = derived_profile_ref(reviewer_profile)
+        with self.assertRaisesRegex(ArtifactValidationError, "reviewer role must use read-only sandbox"):
+            CodexExecutionAdapter(supervisor=FakeSupervisor()).execute_role(
+                role_name="reviewer",
+                profile=reviewer_profile,
+                task_id=TASK_ID,
+                context_bytes=self.context,
+                cwd=self.cwd,
+            )
+
+    def test_planner_workspace_write_profile_is_rejected_after_profile_validation(self):
+        planner_profile = profile("planner")
+        planner_profile["policy"]["sandbox"] = "workspace-write"
+        planner_profile["profile_ref"] = derived_profile_ref(planner_profile)
+        with self.assertRaisesRegex(ArtifactValidationError, "planner role must use read-only sandbox"):
+            CodexExecutionAdapter(supervisor=FakeSupervisor()).execute_role(
+                role_name="planner",
+                profile=planner_profile,
+                task_id=TASK_ID,
+                context_bytes=self.context,
+                cwd=self.cwd,
+            )
+
+    def test_mixed_case_role_names_are_normalized(self):
+        for supplied_name in ("BUILDER", "Builder", "PLANNER", "Reviewer"):
+            with self.subTest(role_name=supplied_name):
+                canonical_name = supplied_name.lower()
+                receipt = self.execute(canonical_name, FakeSupervisor())
+                normalized_receipt = CodexExecutionAdapter(supervisor=FakeSupervisor()).execute_role(
+                    role_name=supplied_name,
+                    profile=profile(canonical_name),
+                    task_id=TASK_ID,
+                    context_bytes=self.context,
+                    cwd=self.cwd,
+                )
+                self.assertEqual(normalized_receipt.role, canonical_name.upper())
+                self.assertEqual(normalized_receipt.disposition, receipt.disposition)
+
+    def test_role_specific_planner_context_limit_is_selected_first(self):
+        planner_profile = profile("planner")
+        planner_profile["planner_context_bytes"] = 100
+        planner_profile["context_limit_bytes"] = 1
+        planner_profile["profile_ref"] = derived_profile_ref(planner_profile)
+        self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"x" * 100)
+        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
+            self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"x" * 101)
+
+    def test_role_specific_builder_context_limit_is_selected_first(self):
+        builder_profile = profile("builder")
+        builder_profile["builder_context_bytes"] = 200
+        builder_profile["context_limit_bytes"] = 1
+        builder_profile["profile_ref"] = derived_profile_ref(builder_profile)
+        self.execute("builder", FakeSupervisor(), profile=builder_profile, context_bytes=b"x" * 200)
+        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
+            self.execute("builder", FakeSupervisor(), profile=builder_profile, context_bytes=b"x" * 201)
+
+    def test_generic_context_limit_remains_supported_without_role_specific_key(self):
+        planner_profile = profile("planner", context_limit=4)
+        self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"1234")
+        with self.assertRaisesRegex(ArtifactValidationError, "context exceeds configured limit"):
+            self.execute("planner", FakeSupervisor(), profile=planner_profile, context_bytes=b"12345")
 
     def test_builder_valid_completion_succeeds(self):
         supervisor = FakeSupervisor()

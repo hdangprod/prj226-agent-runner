@@ -50,7 +50,7 @@ class InvocationReceipt:
 _REQUIRED_PROFILE_KEYS = {"role", "provider", "model", "executable", "profile_ref", "policy"}
 _ROLE_NAMES = {"planner", "builder", "reviewer"}
 
-_MUTATION_TYPES = {
+_MUTATION_TYPES = frozenset({
     "command_execution",
     "file_change",
     "file_write",
@@ -64,8 +64,9 @@ _MUTATION_TYPES = {
     "rename",
     "mkdir",
     "rmdir",
-}
-_SAFE_EVENT_TYPES = {
+})
+_FILE_MUTATION_TYPES = _MUTATION_TYPES - {"command_execution"}
+KNOWN_SAFE = frozenset({
     "thread.started",
     "thread.completed",
     "turn.started",
@@ -73,9 +74,6 @@ _SAFE_EVENT_TYPES = {
     "turn_context",
     "event_msg",
     "token_count",
-    "item.started",
-    "item.completed",
-    "item.updated",
     "agent_message",
     "assistant",
     "user",
@@ -97,23 +95,29 @@ _SAFE_EVENT_TYPES = {
     "content_block_start",
     "content_block_delta",
     "content_block_stop",
-    "tool_call",
-    "mcp_tool_call",
-    "function_call",
-    "function_call_output",
-}
-_MUTATION_KEY_WORDS = (
-    "file",
-    "write",
-    "change",
+})
+KNOWN_AUTHORITY = frozenset({
+    "command_execution",
+    "file_change",
+    "file_write",
+    "file_write_tool_call",
+    "apply_patch",
     "patch",
     "edit",
     "delete",
     "remove",
-    "rename",
     "move",
+    "rename",
     "mkdir",
-)
+    "rmdir",
+    "tool_call",
+    "mcp_tool_call",
+    "function_call",
+    "function_call_output",
+    "item.started",
+    "item.completed",
+    "item.updated",
+})
 _PATH_KEYS = {
     "path",
     "file_path",
@@ -125,7 +129,19 @@ _PATH_KEYS = {
     "working_directory",
     "directory",
 }
-_COMMAND_KEYS = {"command", "cmd", "argv", "args"}
+_COMMAND_KEYS = {"command", "cmd", "argv", "args", "script", "shell_command"}
+_AUTHORITY_STRUCTURE_KEYS = _COMMAND_KEYS | _PATH_KEYS | {
+    "arguments",
+    "file",
+    "file_name",
+    "filename",
+    "function",
+    "function_call",
+    "function_name",
+    "tool",
+    "tool_call",
+    "tool_name",
+}
 _PATH_OPTIONS = {
     "-C",
     "--cwd",
@@ -277,8 +293,8 @@ def _validate_profile(role_name: str, profile: Mapping[str, Any]) -> None:
         raise ArtifactValidationError("role profile timeout policy is invalid")
 
 
-def _context_limit(profile: Mapping[str, Any]) -> int | None:
-    names = (
+def _context_limit(role_name: str, profile: Mapping[str, Any]) -> int | None:
+    generic_names = (
         "context_limit_bytes",
         "max_context_bytes",
         "context_max_bytes",
@@ -288,15 +304,28 @@ def _context_limit(profile: Mapping[str, Any]) -> int | None:
         "limit_bytes",
         "max_size",
     )
-    sources: list[Mapping[str, Any]] = [profile]
+    role_name_key = f"{role_name}_context_bytes"
     policy = profile.get("policy")
+    context_policy = policy.get("context_policy") if isinstance(policy, Mapping) else None
+    role_sources: list[Mapping[str, Any]] = [profile]
     if isinstance(policy, Mapping):
-        sources.append(policy)
-        context_policy = policy.get("context_policy")
-        if isinstance(context_policy, Mapping):
-            sources.append(context_policy)
-    for source in sources:
-        for name in names:
+        role_sources.append(policy)
+    if isinstance(context_policy, Mapping):
+        role_sources.append(context_policy)
+    for source in role_sources:
+        if role_name_key in source:
+            value = source[role_name_key]
+            if type(value) is not int or value < 0:
+                raise ArtifactValidationError("configured context limit is invalid")
+            return value
+
+    generic_sources: list[Mapping[str, Any]] = []
+    if isinstance(context_policy, Mapping):
+        generic_sources.append(context_policy)
+    elif "context_limit_bytes" in profile:
+        generic_sources.append(profile)
+    for source in generic_sources:
+        for name in generic_names:
             if name in source:
                 value = source[name]
                 if type(value) is not int or value < 0:
@@ -354,35 +383,35 @@ def _event_types(event: dict[str, Any]) -> set[str]:
     return result
 
 
-def _event_has_mutation_shape(event: dict[str, Any]) -> bool:
+def _event_has_authority_structure(event: dict[str, Any]) -> bool:
     for node in _iter_dicts(event):
-        for key in node:
-            lowered = str(key).lower()
-            if lowered in {"command", "cmd", "argv", "args"}:
-                return True
-            if lowered in _PATH_KEYS:
-                return True
-            if any(word in lowered for word in _MUTATION_KEY_WORDS):
-                return True
-        for key in ("name", "tool", "function"):
-            value = node.get(key)
-            if isinstance(value, str) and any(word in value.lower() for word in _MUTATION_KEY_WORDS):
-                return True
+        if any(str(key).lower() in _AUTHORITY_STRUCTURE_KEYS for key in node):
+            return True
     return False
+
+
+def _event_has_only_primitive_values(event: dict[str, Any]) -> bool:
+    return all(type(value) in (str, int, float, bool) for value in event.values())
+
+
+def _unknown_mutation_event(event: dict[str, Any], types: set[str]) -> bool:
+    normalized = {value.lower() for value in types}
+    unknown = normalized - KNOWN_SAFE - KNOWN_AUTHORITY
+    if not normalized:
+        unknown.add("")
+    if not unknown:
+        return False
+    if _event_has_authority_structure(event):
+        return True
+    return not _event_has_only_primitive_values(event)
 
 
 def _mutation_types(types: set[str]) -> set[str]:
     return {value.lower() for value in types if value.lower() in _MUTATION_TYPES}
 
 
-def _unknown_mutation_event(event: dict[str, Any], types: set[str]) -> bool:
-    normalized = {value.lower() for value in types}
-    unknown = normalized - _SAFE_EVENT_TYPES - _MUTATION_TYPES
-    if any(any(word in value.lower() for word in _MUTATION_KEY_WORDS) for value in unknown):
-        return True
-    if normalized & {"tool_call", "mcp_tool_call", "function_call"} and _event_has_mutation_shape(event):
-        return True
-    return bool(unknown and _event_has_mutation_shape(event))
+def _authority_types(types: set[str]) -> set[str]:
+    return {value.lower() for value in types if value.lower() in KNOWN_AUTHORITY}
 
 
 def _path_inside(value: Any, workspace: Path) -> bool:
@@ -447,7 +476,11 @@ def _command_looks_mutating(command: str) -> bool:
     return any(token.lower() in {"rm", "mv", "cp", "touch", "mkdir", "rmdir", "chmod", "chown", "install", "tee"} for token in tokens)
 
 
-def _check_builder_command(command: str, workspace: Path, executable: str) -> bool:
+def _observe_builder_command_confinement(command: str, workspace: Path, executable: str) -> bool:
+    """HEURISTIC OBSERVABILITY ONLY. Not proven filesystem enforcement.
+
+    Final scope authority belongs to Runner/R3C.
+    """
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -487,17 +520,16 @@ def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Pa
     for event in events:
         types = _event_types(event)
         mutations = _mutation_types(types)
+        authority_types = _authority_types(types)
         if _unknown_mutation_event(event, types):
             raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
-        if role_name == "planner" and (mutations or _unknown_mutation_event(event, types)):
+        if role_name == "planner" and authority_types:
             raise GovernanceBlockerError("PLANNER_CAPABILITY_BREACH")
         if role_name == "reviewer":
-            if mutations & {"file_change", "file_write", "file_write_tool_call", "apply_patch", "patch", "edit", "delete", "remove", "move", "rename", "mkdir", "rmdir"}:
+            if authority_types & _FILE_MUTATION_TYPES:
                 raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
-            if "command_execution" in mutations:
-                command_texts = [text for command in _commands(event) for text in _command_texts(command)]
-                if not command_texts or any(_command_looks_mutating(text) for text in command_texts):
-                    raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
+            if "command_execution" in authority_types:
+                raise GovernanceBlockerError("REVIEWER_CAPABILITY_BREACH")
         if role_name == "builder":
             command_texts = [text for command in _commands(event) for text in _command_texts(command)]
             if "command_execution" in mutations and not command_texts:
@@ -509,7 +541,7 @@ def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Pa
                 if not _path_inside(value, workspace):
                     raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
             for text in command_texts:
-                if not _check_builder_command(text, workspace, executable):
+                if not _observe_builder_command_confinement(text, workspace, executable):
                     raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
 
 
@@ -657,6 +689,10 @@ class CodexExecutionAdapter:
         completion_output_path: Path | str | None = None,
         timeout: float | None = None,
     ) -> InvocationReceipt:
+        try:
+            role_name = role_name.lower()
+        except AttributeError as exc:
+            raise ArtifactValidationError("role_name must be planner, builder, or reviewer") from exc
         if role_name not in _ROLE_NAMES:
             raise ArtifactValidationError("role_name must be planner, builder, or reviewer")
         if not isinstance(task_id, str) or not task_id:
@@ -664,7 +700,11 @@ class CodexExecutionAdapter:
         if not isinstance(context_bytes, bytes):
             raise ArtifactValidationError("context_bytes must be bytes")
         _validate_profile(role_name, profile)
-        limit = _context_limit(profile)
+        if role_name == "planner" and profile["policy"]["sandbox"] != "read-only":
+            raise ArtifactValidationError("planner role must use read-only sandbox")
+        if role_name == "reviewer" and profile["policy"]["sandbox"] != "read-only":
+            raise ArtifactValidationError("reviewer role must use read-only sandbox")
+        limit = _context_limit(role_name, profile)
         if limit is not None and len(context_bytes) > limit:
             raise ArtifactValidationError("context exceeds configured limit")
         if timeout is not None and (type(timeout) not in (int, float) or timeout < 0):
