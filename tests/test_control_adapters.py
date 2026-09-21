@@ -438,6 +438,7 @@ class ControlAdapterTests(unittest.TestCase):
                 "type": "item.updated",
                 "item": {"metadata": {"phase": "planning", "count": 1, "complete": False}},
             },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "planning complete"}},
             {"type": "turn.started", "turn_id": "turn-1"},
             {"type": "turn.completed", "status": "ok"},
             {"type": "thread.completed", "reason": "done"},
@@ -447,6 +448,166 @@ class ControlAdapterTests(unittest.TestCase):
             with self.subTest(role_name=role_name):
                 receipt = self.execute(role_name, supervisor)
                 self.assertEqual(receipt.disposition, "SUCCESS")
+
+    def test_planner_single_message_semantic_result(self):
+        text = "Plan: task-1"
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], text)
+        self.assertEqual(receipt.semantic_result["message_count"], 1)
+        self.assertEqual(receipt.semantic_result["sha256"], hashlib.sha256(text.encode()).hexdigest())
+
+    def test_reviewer_single_message_semantic_result(self):
+        text = "Review: task-1 approved"
+        receipt = self.execute("reviewer", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], text)
+        self.assertEqual(receipt.semantic_result["message_count"], 1)
+        self.assertEqual(receipt.semantic_result["sha256"], hashlib.sha256(text.encode()).hexdigest())
+
+    def test_multiple_agent_messages_selects_final(self):
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "first"}},
+            {"type": "item.updated", "item": {"type": "agent_message", "text": "   "}},
+            {"type": "agent_message", "text": "final"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "second"}},
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["message_count"], 3)
+        self.assertEqual(receipt.semantic_result["text"], "second")
+
+    def test_empty_agent_messages_fails_closed(self):
+        events = [
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": ""}},
+            {"type": "item.updated", "item": {"type": "agent_message", "text": " \t\n "}},
+        ]
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                receipt = self.execute(role_name, FakeSupervisor(events=events))
+                self.assertEqual(receipt.disposition, "BLOCKED")
+                self.assertIsNone(receipt.semantic_result)
+
+    def test_no_agent_message_fails_closed(self):
+        events = [
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "turn.started", "turn_id": "turn-1"},
+            {"type": "turn.completed", "status": "ok"},
+            {"type": "thread.completed", "reason": "done"},
+        ]
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                receipt = self.execute(role_name, FakeSupervisor(events=events))
+                self.assertEqual(receipt.disposition, "BLOCKED")
+                self.assertIsNone(receipt.semantic_result)
+
+    def test_reasoning_text_excluded_from_semantic_result(self):
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {
+                "type": "item.completed",
+                "item": {"type": "reasoning", "text": "hidden reasoning"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "public plan"},
+            },
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], "public plan")
+        self.assertEqual(receipt.semantic_result["message_count"], 1)
+        self.assertNotIn("hidden reasoning", json.dumps(receipt.semantic_result))
+
+    def test_tool_output_excluded_from_semantic_result(self):
+        receipt = self.execute("reviewer", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [{"type": "output_text", "text": "tool output must not leak"}],
+                },
+            },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "review verdict"}},
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], "review verdict")
+        self.assertEqual(receipt.semantic_result["message_count"], 1)
+        self.assertNotIn("tool output must not leak", json.dumps(receipt.semantic_result))
+
+    def test_capability_breach_fails_closed_without_semantic_success(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "echo unsafe"}},
+        ])
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        with self.assertRaises(GovernanceBlockerError):
+            self.execute("planner", supervisor, evidence_dir=evidence_dir)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(failure_record["disposition"], "BLOCKED")
+        self.assertIsNone(failure_record["semantic_result"])
+
+    def test_semantic_result_size_bound_exact(self):
+        text = "x" * (64 * 1024)
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], text)
+        self.assertEqual(receipt.semantic_result["message_count"], 1)
+
+    def test_semantic_result_size_bound_plus_one_blocked(self):
+        text = "x" * (64 * 1024 + 1)
+        receipt = self.execute("reviewer", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertIsNone(receipt.semantic_result)
+        self.assertEqual(receipt.record["completion"]["summary"], "semantic result exceeds 64 KiB size limit")
+
+    def test_semantic_result_persisted_in_durable_evidence(self):
+        text = "Persist this planner result"
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]), evidence_dir=evidence_dir)
+        evidence_path = evidence_dir / f"{receipt.invocation_id}.evidence.json"
+        persisted = json.loads(evidence_path.read_text(encoding="utf-8"))
+        _validate_with_schema(persisted, "control-invocation.v1.schema.json", "persisted invocation record")
+        self.assertEqual(persisted["semantic_result"], receipt.semantic_result)
+
+    def test_semantic_result_digest_integrity(self):
+        receipt = self.execute("reviewer", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "integrity check"}},
+        ]))
+        semantic_result = receipt.semantic_result
+        self.assertEqual(
+            hashlib.sha256(semantic_result["text"].encode("utf-8")).hexdigest(),
+            semantic_result["sha256"],
+        )
+
+    def test_builder_completion_data_preserved_unaffected(self):
+        supervisor = FakeSupervisor(completion=self.completion())
+        with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+            receipt = self.execute("builder", supervisor)
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.completion_data["status"], "COMPLETED")
+        self.assertIsNone(receipt.semantic_result)
+        self.assertIsNone(receipt.record["semantic_result"])
 
     def test_envelope_command_without_item_type_blocks_planner_and_reviewer(self):
         for role_name in ("planner", "reviewer"):

@@ -21,6 +21,7 @@
     "supervision",
     "attestation",
     "completion",
+    "semantic_result",
     "evidence_digest",
     "disposition"
   ],
@@ -75,6 +76,22 @@
           "description": "Unverified provider-supplied output summary; the adapter does not recompute it."
         }
       }
+    },
+    "semantic_result": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "text", "message_count", "sha256"],
+          "properties": {
+            "kind": {"const": "TEXT"},
+            "text": {"type": "string"},
+            "message_count": {"type": "integer", "minimum": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      ]
     },
     "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "disposition": {"enum": ["SUCCESS", "BLOCKED", "FAILED"]}

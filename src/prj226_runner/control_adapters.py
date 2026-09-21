@@ -44,6 +44,7 @@ class InvocationReceipt:
     evidence_digest: str
     record: dict[str, Any]
     invocation_id_in_context: bool = True
+    semantic_result: dict[str, Any] | None = None
 
 
 _ROLE_NAMES = {"planner", "builder", "reviewer"}
@@ -52,6 +53,7 @@ ROLE_CONTEXT_LIMITS: dict[str, int] = {
     "builder": 1024 * 1024,
     "reviewer": 512 * 1024,
 }
+SEMANTIC_RESULT_MAX_BYTES = 64 * 1024
 
 SAFE_INFORMATIONAL_TYPES = {
     "agent_message",
@@ -254,6 +256,22 @@ def _manual_schema_check(value: Any, schema: Mapping[str, Any], label: str) -> N
     """Small dependency-free Draft-07 subset for the two local closed schemas."""
     if not isinstance(schema, Mapping):
         raise ArtifactValidationError(f"{label} schema is invalid")
+    alternatives = schema.get("oneOf")
+    if alternatives is not None:
+        if not isinstance(alternatives, list) or not alternatives:
+            raise ArtifactValidationError(f"{label} schema is invalid")
+        matches = 0
+        for alternative in alternatives:
+            if not isinstance(alternative, Mapping):
+                raise ArtifactValidationError(f"{label} schema is invalid")
+            try:
+                _manual_schema_check(value, alternative, label)
+            except ArtifactValidationError:
+                continue
+            matches += 1
+        if matches != 1:
+            raise ArtifactValidationError(f"invalid {label}")
+        return
     if "const" in schema and value != schema["const"]:
         raise ArtifactValidationError(f"invalid {label}")
     if "enum" in schema and value not in schema["enum"]:
@@ -1201,6 +1219,41 @@ def _completion_data_for_receipt(env: Any, value: Mapping[str, Any]) -> dict[str
     }
 
 
+def _semantic_result_for_events(
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, bool]:
+    messages: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item")
+        if (
+            isinstance(item, dict)
+            and str(item.get("type", "")).lower() == "agent_message"
+        ):
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                messages.append(text)
+        elif str(event.get("type", "")).lower() == "agent_message":
+            text = event.get("text")
+            if isinstance(text, str) and text.strip():
+                messages.append(text)
+
+    if not messages:
+        return None, False
+
+    final_text = messages[-1]
+    raw_bytes = final_text.encode("utf-8")
+    if len(raw_bytes) > SEMANTIC_RESULT_MAX_BYTES:
+        return None, True
+    return {
+        "kind": "TEXT",
+        "text": final_text,
+        "message_count": len(messages),
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }, False
+
+
 def _contains_sensitive(value: Any, sensitive: Any) -> bool:
     if isinstance(value, str):
         return any(isinstance(secret, str) and secret and secret in value for secret in sensitive)
@@ -1276,6 +1329,8 @@ def _assert_disposition_invariants(
     supervision: Mapping[str, Any],
     attestation: SessionAttestationResult | None,
     completion_record: Mapping[str, Any],
+    role_name: str,
+    semantic_result: dict[str, Any] | None,
 ) -> None:
     if disposition != "SUCCESS":
         return
@@ -1291,6 +1346,8 @@ def _assert_disposition_invariants(
         raise ArtifactValidationError("SUCCESS requires attestation passed")
     if completion_record.get("status") != "COMPLETED":
         raise ArtifactValidationError("SUCCESS requires non-blocked completion")
+    if role_name in ("planner", "reviewer") and semantic_result is None:
+        raise ArtifactValidationError("SUCCESS requires non-null semantic_result for non-builder")
 
 
 def _tokens_used(attestation: SessionAttestationResult) -> int | None:
@@ -1358,6 +1415,7 @@ def _failure_record(
             "summary": str(exc),
             "provider_output_declaration": None,
         },
+        "semantic_result": None,
         "disposition": disposition,
     }
     if env is not None:
@@ -1507,6 +1565,10 @@ class CodexExecutionAdapter:
                 stdout = _object_value(result, "stdout")
                 events = _jsonl_events(stdout)
                 _validate_capabilities(role_name, events, Path(cwd), profile["executable"])
+                if role_name in ("planner", "reviewer"):
+                    semantic_result, semantic_result_too_large = _semantic_result_for_events(events)
+                else:
+                    semantic_result, semantic_result_too_large = None, False
                 session_id = _session_id_from_events(events)
                 attestation = attest_session(env.codex_home, session_id, profile["model"], profile["provider"])
 
@@ -1527,11 +1589,25 @@ class CodexExecutionAdapter:
                     except ArtifactValidationError:
                         completion_data = None
 
-                if not process_ok:
+                if semantic_result_too_large:
+                    disposition = "BLOCKED"
+                    completion_record = {
+                        "status": "BLOCKED",
+                        "summary": "semantic result exceeds 64 KiB size limit",
+                        "provider_output_declaration": None,
+                    }
+                elif not process_ok:
                     disposition = "FAILED"
                     completion_record = {
                         "status": "BLOCKED",
                         "summary": f"{role_name} execution did not complete successfully",
+                        "provider_output_declaration": None,
+                    }
+                elif role_name in ("planner", "reviewer") and semantic_result is None:
+                    disposition = "BLOCKED"
+                    completion_record = {
+                        "status": "BLOCKED",
+                        "summary": "planner/reviewer semantic output is missing or empty",
                         "provider_output_declaration": None,
                     }
                 elif role_name == "builder" and completion_data is None:
@@ -1554,11 +1630,18 @@ class CodexExecutionAdapter:
                         "summary": f"{role_name} execution completed",
                         "provider_output_declaration": None,
                     }
-                    disposition = "SUCCESS" if process_ok else "FAILED"
+                    disposition = "SUCCESS"
 
                 completed_at = _utc_now()
                 duration_seconds = max(0.0, time.monotonic() - started_monotonic)
-                _assert_disposition_invariants(disposition, supervision, attestation, completion_record)
+                _assert_disposition_invariants(
+                    disposition,
+                    supervision,
+                    attestation,
+                    completion_record,
+                    role_name,
+                    semantic_result,
+                )
                 record_without_digest: dict[str, Any] = {
                     "schema_version": "PRJ226.CONTROL_INVOCATION.v1",
                     "invocation_id": invocation_id,
@@ -1582,6 +1665,7 @@ class CodexExecutionAdapter:
                         "tokens_used": _tokens_used(attestation),
                     },
                     "completion": completion_record,
+                    "semantic_result": semantic_result,
                     "disposition": disposition,
                 }
                 record_without_digest = env.sanitized(record_without_digest)
@@ -1610,6 +1694,7 @@ class CodexExecutionAdapter:
                     evidence_digest=env.sanitized(digest),
                     record=sanitized_record,
                     invocation_id_in_context=invocation_id_in_context,
+                    semantic_result=semantic_result,
                 )
             except Exception as exc:
                 if evidence_path is not None:
