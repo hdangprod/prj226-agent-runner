@@ -1221,7 +1221,8 @@ def _completion_data_for_receipt(env: Any, value: Mapping[str, Any]) -> dict[str
 
 def _semantic_result_for_events(
     events: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, bool]:
+    sensitive: Any = (),
+) -> tuple[dict[str, Any] | None, bool, bool]:
     messages: list[str] = []
     for event in events:
         if not isinstance(event, dict):
@@ -1240,18 +1241,21 @@ def _semantic_result_for_events(
                 messages.append(text)
 
     if not messages:
-        return None, False
+        return None, False, False
+
+    if any(_contains_sensitive(message, sensitive) for message in messages):
+        return None, False, True
 
     final_text = messages[-1]
     raw_bytes = final_text.encode("utf-8")
     if len(raw_bytes) > SEMANTIC_RESULT_MAX_BYTES:
-        return None, True
+        return None, True, False
     return {
         "kind": "TEXT",
         "text": final_text,
         "message_count": len(messages),
         "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-    }, False
+    }, False, False
 
 
 def _contains_sensitive(value: Any, sensitive: Any) -> bool:
@@ -1566,9 +1570,18 @@ class CodexExecutionAdapter:
                 events = _jsonl_events(stdout)
                 _validate_capabilities(role_name, events, Path(cwd), profile["executable"])
                 if role_name in ("planner", "reviewer"):
-                    semantic_result, semantic_result_too_large = _semantic_result_for_events(events)
+                    sensitive = getattr(env, "_sensitive", ())
+                    (
+                        semantic_result,
+                        semantic_result_too_large,
+                        semantic_result_contains_sensitive,
+                    ) = _semantic_result_for_events(events, sensitive)
                 else:
-                    semantic_result, semantic_result_too_large = None, False
+                    semantic_result, semantic_result_too_large, semantic_result_contains_sensitive = (
+                        None,
+                        False,
+                        False,
+                    )
                 session_id = _session_id_from_events(events)
                 attestation = attest_session(env.codex_home, session_id, profile["model"], profile["provider"])
 
@@ -1594,6 +1607,13 @@ class CodexExecutionAdapter:
                     completion_record = {
                         "status": "BLOCKED",
                         "summary": "semantic result exceeds 64 KiB size limit",
+                        "provider_output_declaration": None,
+                    }
+                elif semantic_result_contains_sensitive:
+                    disposition = "BLOCKED"
+                    completion_record = {
+                        "status": "BLOCKED",
+                        "summary": "semantic result contains credential material",
                         "provider_output_declaration": None,
                     }
                 elif not process_ok:
@@ -1679,6 +1699,8 @@ class CodexExecutionAdapter:
                     _persist_evidence(evidence_path, invocation_id, record)
 
                 sanitized_record = env.sanitized(record)
+                if not isinstance(sanitized_record, dict):
+                    raise ArtifactValidationError("sanitized evidence record must be an object")
                 sanitized_completion_data = env.sanitized(completion_data)
                 sanitized_attestation = _sanitized_attestation_result(env, attestation)
                 return InvocationReceipt(
@@ -1694,7 +1716,7 @@ class CodexExecutionAdapter:
                     evidence_digest=env.sanitized(digest),
                     record=sanitized_record,
                     invocation_id_in_context=invocation_id_in_context,
-                    semantic_result=semantic_result,
+                    semantic_result=sanitized_record["semantic_result"],
                 )
             except Exception as exc:
                 if evidence_path is not None:

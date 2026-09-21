@@ -508,6 +508,94 @@ class ControlAdapterTests(unittest.TestCase):
                 self.assertEqual(receipt.disposition, "BLOCKED")
                 self.assertIsNone(receipt.semantic_result)
 
+    def test_secret_in_final_agent_message_fails_closed(self):
+        secret = "sk-secret-token-12345"
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        receipt = self.execute(
+            "planner",
+            FakeSupervisor(events=[
+                {"type": "thread.started", "thread_id": SESSION_ID},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"Here is the token: {secret}"},
+                },
+            ]),
+            auth_source=EphemeralApiKeyAuth(secret),
+            evidence_dir=evidence_dir,
+        )
+        persisted = json.loads(
+            (evidence_dir / f"{receipt.invocation_id}.evidence.json").read_text(encoding="utf-8")
+        )
+        secret_digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertIsNone(receipt.semantic_result)
+        self.assertIsNone(receipt.record["semantic_result"])
+        self.assertIsNone(persisted["semantic_result"])
+        for evidence in (receipt.record, persisted, receipt):
+            serialized = repr(evidence) if evidence is receipt else json.dumps(evidence, sort_keys=True)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(secret_digest, serialized)
+
+    def test_secret_in_nonfinal_agent_message_fails_closed(self):
+        secret = "sk-secret-token-12345"
+        receipt = self.execute(
+            "reviewer",
+            FakeSupervisor(events=[
+                {"type": "thread.started", "thread_id": SESSION_ID},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"token: {secret}"},
+                },
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "Safe final message"},
+                },
+            ]),
+            auth_source=EphemeralApiKeyAuth(secret),
+        )
+
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertIsNone(receipt.semantic_result)
+        self.assertIsNone(receipt.record["semantic_result"])
+        self.assertEqual(
+            receipt.record["completion"]["summary"],
+            "semantic result contains credential material",
+        )
+
+    def test_secret_substring_detected(self):
+        secret = "sk-secret-token-12345"
+        receipt = self.execute(
+            "planner",
+            FakeSupervisor(events=[
+                {"type": "thread.started", "thread_id": SESSION_ID},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": f"abc{secret}xyz"},
+                },
+            ]),
+            auth_source=EphemeralApiKeyAuth(secret),
+        )
+
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertIsNone(receipt.semantic_result)
+
+    def test_safe_similar_text_allowed(self):
+        secret = "sk-secret-token-12345"
+        text = "token: sk-safe-token-67890"
+        receipt = self.execute(
+            "reviewer",
+            FakeSupervisor(events=[
+                {"type": "thread.started", "thread_id": SESSION_ID},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+            ]),
+            auth_source=EphemeralApiKeyAuth(secret),
+        )
+
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(receipt.semantic_result["text"], text)
+
     def test_reasoning_text_excluded_from_semantic_result(self):
         receipt = self.execute("planner", FakeSupervisor(events=[
             {"type": "thread.started", "thread_id": SESSION_ID},
@@ -576,6 +664,31 @@ class ControlAdapterTests(unittest.TestCase):
         self.assertIsNone(receipt.semantic_result)
         self.assertEqual(receipt.record["completion"]["summary"], "semantic result exceeds 64 KiB size limit")
 
+    def test_multibyte_utf8_exact_bound(self):
+        text = "é" * (64 * 1024 // 2)
+        self.assertEqual(len(text.encode("utf-8")), 64 * 1024)
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+
+        self.assertEqual(receipt.disposition, "SUCCESS")
+        self.assertEqual(
+            receipt.semantic_result["sha256"],
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+    def test_multibyte_utf8_exceeded_bound(self):
+        text = "é" * (64 * 1024 // 2) + "a"
+        self.assertEqual(len(text.encode("utf-8")), 64 * 1024 + 1)
+        receipt = self.execute("reviewer", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]))
+
+        self.assertEqual(receipt.disposition, "BLOCKED")
+        self.assertIsNone(receipt.semantic_result)
+
     def test_semantic_result_persisted_in_durable_evidence(self):
         text = "Persist this planner result"
         evidence_dir = Path(self.temp.name) / "evidence"
@@ -588,6 +701,25 @@ class ControlAdapterTests(unittest.TestCase):
         persisted = json.loads(evidence_path.read_text(encoding="utf-8"))
         _validate_with_schema(persisted, "control-invocation.v1.schema.json", "persisted invocation record")
         self.assertEqual(persisted["semantic_result"], receipt.semantic_result)
+
+    def test_receipt_and_persisted_record_exact_equality(self):
+        text = "Exact semantic result"
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        receipt = self.execute("planner", FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        ]), evidence_dir=evidence_dir)
+        persisted = json.loads(
+            (evidence_dir / f"{receipt.invocation_id}.evidence.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(receipt.semantic_result, receipt.record["semantic_result"])
+        self.assertEqual(receipt.record["semantic_result"], persisted["semantic_result"])
+        self.assertEqual(
+            receipt.semantic_result["sha256"],
+            hashlib.sha256(receipt.semantic_result["text"].encode("utf-8")).hexdigest(),
+        )
 
     def test_semantic_result_digest_integrity(self):
         receipt = self.execute("reviewer", FakeSupervisor(events=[
