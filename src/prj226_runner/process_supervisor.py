@@ -185,23 +185,28 @@ class SupervisedProcessRunner:
         flood = False
         timed_out = False
         try:
-            while selector.get_map():
+            while True:
                 if timeout is not None and time.monotonic() - started >= timeout:
                     timed_out = evidence.timeout_event = True
                     break
-                events = selector.select(0.05)
-                for key, _ in events:
-                    chunk = os.read(key.fileobj.fileno(), 65536)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    name = key.data
-                    outputs[name].extend(chunk)
-                    if len(outputs[name]) > limits[name]:
-                        flood = True
+                if selector.get_map():
+                    events = selector.select(0.05)
+                    for key, _ in events:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        name = key.data
+                        outputs[name].extend(chunk)
+                        if len(outputs[name]) > limits[name]:
+                            flood = True
+                            break
+                    if flood:
                         break
-                if flood:
-                    break
+                else:
+                    # Stream descriptors closed by the child: continue monitoring
+                    # process liveness and the timeout deadline.
+                    time.sleep(0.05)
                 # A leader can exit while descendants keep inherited pipes open.
                 # Group quiescence must be checked immediately, not after EOF.
                 if proc.poll() is not None:

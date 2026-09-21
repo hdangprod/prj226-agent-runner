@@ -11,9 +11,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from prj226_runner.candidate_authority import build_candidate_authority
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.runner import (
     RoleConfig,
+    _safe_relative_path,
     _fresh_reviewer_env,
     _parse_reviewer_result,
     build_builder_invocation,
@@ -23,6 +25,7 @@ from prj226_runner.runner import (
     load_config,
     parse_task_packet,
     run_packet,
+    run_strict_verifier,
 )
 
 
@@ -116,6 +119,71 @@ class TestHarn001Runner(unittest.TestCase):
         self.write_packet(run_id="../bad")
         with self.assertRaises(ArtifactValidationError):
             parse_task_packet(self.packet_path)
+
+    def test_safe_relative_path_rejects_raw_dot_components(self) -> None:
+        for value in ("./foo", "foo/./bar", "foo/.", "./", "foo//bar", "foo/", "/foo", "../foo", "foo/../bar", "foo/.git"):
+            with self.subTest(value=value):
+                with self.assertRaises(ArtifactValidationError):
+                    _safe_relative_path(value)
+
+    def test_strict_verifier_requires_qualified_sandbox_host(self) -> None:
+        with patch("prj226_runner.runner.sys.platform", "linux"):
+            with self.assertRaisesRegex(GovernanceBlockerError, "UNSUPPORTED_VERIFIER_CONFINEMENT"):
+                run_strict_verifier(
+                    self.repo,
+                    baseline_head=self.baseline,
+                    candidate_head=self.baseline,
+                    candidate_ref=self.branch,
+                    authority={},
+                    test_commands=[[sys.executable, "-c", "pass"]],
+                )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"),
+        "qualified sandbox-exec is required",
+    )
+    def test_strict_verifier_denies_candidate_and_canonical_writes(self) -> None:
+        probe = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1) (allow default)", sys.executable, "-c", "pass"],
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest("sandbox-exec cannot be applied by this host runner")
+        authority = build_candidate_authority(
+            self.repo, self.baseline, self.branch, self.baseline, []
+        )
+        scratch = self.root / "verifier-scratch"
+        canonical_target = self.repo / "canonical-write.txt"
+        script = (
+            "import errno, pathlib\n"
+            "targets = [pathlib.Path('candidate-write.txt'), pathlib.Path(%r)]\n"
+            "for target in targets:\n"
+            "    try:\n"
+            "        target.write_text('blocked')\n"
+            "    except OSError as exc:\n"
+            "        if exc.errno != errno.EPERM:\n"
+            "            raise\n"
+            "    else:\n"
+            "        raise SystemExit('write unexpectedly succeeded')\n"
+            "pathlib.Path(__import__('os').environ['TMPDIR'], 'allowed.txt').write_text('allowed')\n"
+        ) % str(canonical_target)
+        result = run_strict_verifier(
+            self.repo,
+            baseline_head=self.baseline,
+            candidate_head=self.baseline,
+            candidate_ref=self.branch,
+            authority=authority,
+            test_commands=[[sys.executable, "-c", script]],
+            canonical_repository=self.repo,
+            canonical_branch=self.branch,
+            baseline_tree=self.tree,
+            runtime_directories=[scratch],
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse((self.repo / "candidate-write.txt").exists())
+        self.assertFalse(canonical_target.exists())
+        self.assertFalse(scratch.exists())
 
     def test_inspect_is_read_only(self) -> None:
         before = self._git(self.repo, "status", "--porcelain")

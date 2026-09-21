@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -146,6 +147,24 @@ def format_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _read_first_journal_line(
+    path: Path,
+    *,
+    max_file_size: int = 16 * 1024 * 1024,
+    max_line_length: int = 64 * 1024,
+) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_file_size:
+            raise ArtifactValidationError("Evidence must be a bounded single-link regular file")
+        chunk = os.read(fd, min(info.st_size, max_line_length))
+        newline_idx = chunk.find(b"\n")
+        return chunk[:newline_idx] if newline_idx != -1 else chunk
+    finally:
+        os.close(fd)
+
+
 class DurableController:
     def __init__(self, root: Path | str, *, planner: ControllerPlannerPort | None = None,
                  builder: BuilderExecutorPort | None = None, reviewer: Any = None,
@@ -216,10 +235,9 @@ class DurableController:
         """Open a strict store through the R3C implementation when requested."""
         try:
             journal = self.store.root / "events.ndjson"
-            lines = read_file(journal, limit=2 * 1024 * 1024).splitlines()
-            if not lines:
+            first_line = _read_first_journal_line(journal, max_file_size=16 * 1024 * 1024)
+            if not first_line:
                 raise ArtifactValidationError("Controller journal is empty")
-            first_line = lines[0]
             first_event = decode(first_line)
             if isinstance(first_event, dict) and first_event.get("schema_version") == STRICT_VERSION:
                 return StrictExecutionController(
@@ -1048,10 +1066,6 @@ class StrictExecutionController:
             attested_session_id = getattr(raw, "attested_session_id", value.get("attested_session_id"))
         if attested_session_id is None and isinstance(record.get("attestation"), Mapping):
             attested_session_id = record["attestation"].get("attested_session_id", record["attestation"].get("session_id"))
-        # Lightweight deterministic doubles from the original local harness
-        # predate the explicit attested_session_id member.  They are accepted
-        # only when they are not claiming an InvocationReceipt envelope; real
-        # receipts must carry the attestation identity explicitly.
         explicit_receipt = (
             hasattr(raw, "invocation_id")
             or "invocation_id" in value
@@ -1059,8 +1073,6 @@ class StrictExecutionController:
             or "attestation" in value
             or isinstance(raw, Mapping) and isinstance(raw.get("receipt"), Mapping)
         )
-        if attested_session_id is None and not explicit_receipt and isinstance(session_id, str) and session_id:
-            attested_session_id = session_id
         semantic = getattr(raw, "semantic_result", value.get("semantic_result", record.get("semantic_result")))
         semantic = _strict_jsonable(semantic) if semantic is not None else None
         provider_receipt = True
@@ -1381,13 +1393,8 @@ class StrictExecutionController:
                     proposal = parsed.get("proposal", parsed if "summary" in parsed else None)
             elif isinstance(semantic, Mapping):
                 proposal = semantic.get("proposal", semantic if "summary" in semantic else None)
-        if proposal is None and receipt.get("explicit_receipt"):
-            raise ArtifactValidationError("Planner InvocationReceipt is missing its proposal")
-        # Compatibility with the small deterministic test doubles is kept
-        # data-only: the controller supplies a frozen, non-authorizing
-        # summary, then validates it through the same closed contract.
         if proposal is None:
-            proposal = {"summary": str(state["goal"]), "scope": list(state["scope"])}
+            raise ArtifactValidationError("Planner invocation did not produce an affirmative proposal")
         return validate_strict_planner_proposal(dict(proposal), approved_scope=list(state["scope"]))
 
     def _planner_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:

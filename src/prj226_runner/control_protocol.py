@@ -547,6 +547,8 @@ def _validate_strict_binding(binding: Any, gate_type: str) -> dict[str, Any]:
         string(binding[key], f"gate binding {key}", maximum=512)
     closed(binding["repair_policy"], {"max_repair_cycles"}, "gate binding repair policy")
     integer(binding["repair_policy"]["max_repair_cycles"], "gate binding max repair cycles", minimum=0)
+    if binding["repair_policy"]["max_repair_cycles"] > 2:
+        raise ArtifactValidationError("Gate binding max_repair_cycles cannot exceed 2")
     if gate_type == "GATE_B":
         _validate_strict_candidate(binding["candidate"])
         if binding["candidate"] is None:

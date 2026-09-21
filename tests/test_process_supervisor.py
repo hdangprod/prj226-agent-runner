@@ -58,6 +58,25 @@ class ProcessSupervisorTests(unittest.TestCase):
         self.assertTrue(result.supervision.timeout_event)
         self.assertTrue(result.supervision.final_group_quiescent)
 
+    def test_closed_streams_timeout_preserves_deadline(self):
+        started = time.monotonic()
+        result = SupervisedProcessRunner(term_grace=.2, kill_grace=.2).run(
+            [PYTHON, "-c", "import os, time; os.close(1); os.close(2); time.sleep(100)"],
+            timeout=.1,
+        )
+        self.assertLess(time.monotonic() - started, 3.5)
+        self.assertTrue(result.supervision.timeout_event)
+        self.assertTrue(result.supervision.final_group_quiescent)
+
+    def test_closed_streams_prompt_exit_succeeds(self):
+        result = SupervisedProcessRunner().run(
+            [PYTHON, "-c", "import os; os.close(1); os.close(2)"],
+            timeout=1,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.supervision.timeout_event)
+        self.assertTrue(result.supervision.final_group_quiescent)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,8 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from prj226_runner.control import StrictExecutionController
-from prj226_runner.control_protocol import STRICT_VERSION
+from prj226_runner.control import DurableController, StrictExecutionController
+from prj226_runner.control_protocol import STRICT_VERSION, _validate_strict_binding, strict_gate_binding
+from prj226_runner.errors import ArtifactValidationError
 
 
 def git(repo: Path, *args: str) -> str:
@@ -28,7 +29,9 @@ class PlannerDouble:
     def execute(self, request):
         self.calls += 1
         return {"session_id": "planner-session", "disposition": "SUCCESS", "exit_code": 0,
-                "supervision": {"quiescent": True}, "attestation_passed": True}
+                "attested_session_id": "planner-session", "supervision": {"quiescent": True},
+                "attestation_passed": True,
+                "proposal": {"summary": "strict lifecycle", "scope": ["src/app.txt"]}}
 
 
 class BuilderDouble:
@@ -46,7 +49,8 @@ class BuilderDouble:
             Path(request.worktree, "unauthorized.txt").write_text("breach\n", encoding="utf-8")
         session = self.sessions[self.calls - 1] if self.calls <= len(self.sessions) else f"builder-{self.calls}"
         return {"session_id": session, "disposition": "SUCCESS", "exit_code": 0,
-                "supervision": {"quiescent": self.quiescent}, "attestation_passed": True}
+                "attested_session_id": session, "supervision": {"quiescent": self.quiescent},
+                "attestation_passed": True}
 
 
 class ReviewerDouble:
@@ -59,7 +63,8 @@ class ReviewerDouble:
         verdict = self.verdicts[min(self.calls - 1, len(self.verdicts) - 1)]
         text = json.dumps({"verdict": verdict, "findings": []}, separators=(",", ":"))
         return {"session_id": f"reviewer-{self.calls}", "disposition": "SUCCESS", "exit_code": 0,
-                "supervision": {"quiescent": True}, "attestation_passed": True,
+                "attested_session_id": f"reviewer-{self.calls}", "supervision": {"quiescent": True},
+                "attestation_passed": True,
                 "semantic_result": {"kind": "TEXT", "text": text, "message_count": 1,
                                      "sha256": hashlib.sha256(text.encode()).hexdigest()}}
 
@@ -204,6 +209,46 @@ class StrictLifecycleTests(unittest.TestCase):
         self.reach_gate_a(controller)
         self.assertEqual(controller.resume()["status"], "BLOCKED")
         self.assertIn("duplicate session", controller.state()["terminal_reason"].lower())
+
+    def test_missing_explicit_attested_session_id_fails_closed(self) -> None:
+        controller = self.controller(name="missing-attestation")
+        receipt = controller._normalize_receipt(
+            {
+                "session_id": "session-1",
+                "disposition": "SUCCESS",
+                "exit_code": 0,
+                "supervision": {"quiescent": True},
+                "attestation_passed": True,
+            },
+            "builder",
+        )
+        self.assertFalse(receipt["ok"])
+        self.assertIsNone(receipt["attested_session_id"])
+        self.assertEqual(receipt["failure_reason"], "SESSION_ATTESTATION_MISMATCH")
+
+    def test_missing_planner_proposal_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ArtifactValidationError, "affirmative proposal"):
+            StrictExecutionController._planner_proposal(
+                {"session_id": "planner-session"},
+                {"goal": "strict lifecycle", "scope": ["src/app.txt"]},
+            )
+
+    def test_gate_a_binding_rejects_repair_budget_above_authoritative_cap(self) -> None:
+        controller = self.controller(name="invalid-gate-binding")
+        binding = strict_gate_binding(controller.state(), "GATE_A")
+        binding["repair_policy"]["max_repair_cycles"] = 3
+        with self.assertRaisesRegex(ArtifactValidationError, "cannot exceed 2"):
+            _validate_strict_binding(binding, "GATE_A")
+
+    def test_strict_delegate_accepts_journal_between_two_and_sixteen_mebibytes(self) -> None:
+        journal_root = self.root / "large-journal"
+        journal_root.mkdir()
+        first_event = json.dumps({"schema_version": STRICT_VERSION}, separators=(",", ":")).encode()
+        (journal_root / "events.ndjson").write_bytes(
+            first_event + b"\n" + b"x" * (2 * 1024 * 1024)
+        )
+        delegate = DurableController(journal_root)._strict_delegate()
+        self.assertIsInstance(delegate, StrictExecutionController)
 
 
 if __name__ == "__main__":

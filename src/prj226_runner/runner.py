@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -104,13 +106,15 @@ def _safe_repo_path(value: str) -> None:
 def _safe_relative_path(value: object, field: str = "authorized_paths") -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ArtifactValidationError(f"{field} contains an invalid path")
+    if value.startswith("/") or "\\" in value or "\x00" in value:
+        raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
+    raw_segments = value.split("/")
+    if any(segment in {"", ".", "..", ".git"} for segment in raw_segments):
+        raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
     path = Path(value)
-    if path.is_absolute() or "\\" in value or "\x00" in value or any(part in {"", "..", ".git"} for part in path.parts):
+    if path.is_absolute() or any(part in {"", ".", "..", ".git"} for part in path.parts):
         raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
-    normalized = [part for part in path.parts if part != "."]
-    if not normalized:
-        raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
-    return "/".join(normalized)
+    return value
 
 
 def parse_task_packet(path: Path | str) -> TaskPacket:
@@ -571,13 +575,40 @@ def run_strict_verifier(
     A nonzero approved command is an implementation failure eligible for
     assessment; timeout, authority drift, and canonical drift are blockers.
     """
+    if sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"):
+        raise GovernanceBlockerError(
+            "UNSUPPORTED_VERIFIER_CONFINEMENT: Host does not provide qualified /usr/bin/sandbox-exec"
+        )
     candidate_path = Path(worktree).resolve()
     if not candidate_path.is_dir():
         raise GovernanceBlockerError("Strict verifier candidate worktree is missing")
-    for directory in runtime_directories:
-        runtime_path = Path(directory).resolve()
-        if not runtime_path.is_dir():
-            raise GovernanceBlockerError("Strict verifier runtime directory is missing")
+    scratch_temp = Path(runtime_directories[0]).resolve() if runtime_directories else candidate_path / ".verifier_tmp"
+    scratch_home = scratch_temp / "home"
+    writable_roots = [str(scratch_temp.resolve()), str(scratch_home.resolve())]
+    candidate_resolved = str(candidate_path.resolve())
+    for root in writable_roots:
+        if candidate_resolved == root or candidate_resolved.startswith(root + "/"):
+            raise GovernanceBlockerError("VERIFIER_SECURITY_VIOLATION: Candidate worktree overlaps writable root")
+    if canonical_repository is not None:
+        canonical_resolved = str(Path(canonical_repository).resolve())
+        for root in writable_roots:
+            if canonical_resolved == root or canonical_resolved.startswith(root + "/"):
+                raise GovernanceBlockerError("VERIFIER_SECURITY_VIOLATION: Canonical repository overlaps writable root")
+    subpaths = "\n    ".join(f'(subpath "{root}")' for root in writable_roots)
+    profile = f"""(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+    {subpaths}
+)
+(allow file-write-data
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/dtracehelper")
+    (literal "/dev/tty")
+    (literal "/dev/ptmx")
+)
+"""
     from prj226_runner.candidate_authority import verify_candidate_authority
     verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
     if canonical_repository is not None:
@@ -592,67 +623,92 @@ def run_strict_verifier(
             raise GovernanceBlockerError("Canonical baseline drift")
     if not isinstance(test_commands, Sequence) or not test_commands:
         raise ArtifactValidationError("Strict verifier requires at least one test command")
+    scratch_temp.mkdir(parents=True, exist_ok=True)
+    scratch_home.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     supervisor = SupervisedProcessRunner(
         stdout_limit=10 * 1024 * 1024,
         stderr_limit=10 * 1024 * 1024,
     )
     verifier_env = os.environ.copy()
-    if runtime_directories:
-        temp_root = str(Path(runtime_directories[0]).resolve())
-        verifier_env.update({"TMPDIR": temp_root, "TMP": temp_root, "TEMP": temp_root})
-    for index, command in enumerate(test_commands, 1):
-        argv = list(command)
-        if not argv or not all(isinstance(arg, str) and arg for arg in argv):
-            raise ArtifactValidationError("Strict verifier commands must be non-empty argv arrays")
-        try:
-            result = supervisor.run(
-                argv,
-                cwd=str(candidate_path),
-                timeout=timeout_seconds,
-                env=verifier_env,
-            )
-        except Exception as exc:
-            message = str(exc).lower()
-            if "log limit" in message or "output flood" in message:
-                return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "OUTPUT_FLOOD", "tests": results}
-            if "timeout" in message or "timed out" in message:
+    verifier_env.update({
+        "TMPDIR": str(scratch_temp),
+        "TMP": str(scratch_temp),
+        "TEMP": str(scratch_temp),
+        "HOME": str(scratch_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+
+    def prepare_scratch() -> None:
+        scratch_temp.mkdir(parents=True, exist_ok=True)
+        scratch_home.mkdir(parents=True, exist_ok=True)
+
+    def cleanup_scratch() -> None:
+        shutil.rmtree(scratch_temp, ignore_errors=True)
+
+    def confined(command: Sequence[str]) -> list[str]:
+        return ["/usr/bin/sandbox-exec", "-p", profile, *command]
+
+    try:
+        for index, command in enumerate(test_commands, 1):
+            argv = list(command)
+            if not argv or not all(isinstance(arg, str) and arg for arg in argv):
+                raise ArtifactValidationError("Strict verifier commands must be non-empty argv arrays")
+            try:
+                result = supervisor.run(
+                    confined(argv),
+                    cwd=str(candidate_path),
+                    timeout=timeout_seconds,
+                    env=verifier_env,
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "log limit" in message or "output flood" in message:
+                    return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "OUTPUT_FLOOD", "tests": results}
+                if "timeout" in message or "timed out" in message:
+                    return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
+                if "survivor" in message or "quiescen" in message:
+                    return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "NON_QUIESCENT_PROCESS_GROUP", "tests": results}
+                raise RunnerEnvironmentError(f"Strict verifier command could not start: {exc}") from exc
+            finally:
+                cleanup_scratch()
+            if result.supervision.timeout_event:
                 return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
-            if "survivor" in message or "quiescen" in message:
-                return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "NON_QUIESCENT_PROCESS_GROUP", "tests": results}
-            raise RunnerEnvironmentError(f"Strict verifier command could not start: {exc}") from exc
-        if result.supervision.timeout_event:
+            item = {"index": index, "argv": argv, "exit_code": result.returncode}
+            results.append(item)
+            verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+            if _git(candidate_path, ["status", "--porcelain=v1", "--untracked-files=all"]):
+                raise GovernanceBlockerError("Candidate git status is not clean after verifier command")
+            if canonical_repository is not None:
+                canonical = Path(canonical_repository).resolve()
+                if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
+                    raise GovernanceBlockerError("Canonical baseline drift")
+                if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
+                    raise GovernanceBlockerError("Canonical baseline drift")
+                if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
+                    raise GovernanceBlockerError("Canonical baseline drift")
+                if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
+                    raise GovernanceBlockerError("Canonical baseline drift")
+            if result.returncode != 0:
+                return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
+            prepare_scratch()
+        prepare_scratch()
+        diff = supervisor.run(
+            confined(["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"]),
+            cwd=str(candidate_path), timeout=30,
+            env=verifier_env,
+        )
+        cleanup_scratch()
+        if diff.supervision.timeout_event:
             return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
-        item = {"index": index, "argv": argv, "exit_code": result.returncode}
-        results.append(item)
+        if diff.returncode != 0:
+            return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "tests": results}
         verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
         if _git(candidate_path, ["status", "--porcelain=v1", "--untracked-files=all"]):
             raise GovernanceBlockerError("Candidate git status is not clean after verifier command")
-        if canonical_repository is not None:
-            canonical = Path(canonical_repository).resolve()
-            if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
-                raise GovernanceBlockerError("Canonical baseline drift")
-            if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
-                raise GovernanceBlockerError("Canonical baseline drift")
-            if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
-                raise GovernanceBlockerError("Canonical baseline drift")
-            if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
-                raise GovernanceBlockerError("Canonical baseline drift")
-        if result.returncode != 0:
-            return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
-    diff = supervisor.run(
-        ["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"],
-        cwd=str(candidate_path), timeout=30,
-        env=verifier_env,
-    )
-    if diff.supervision.timeout_event:
-        return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
-    if diff.returncode != 0:
-        return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "tests": results}
-    verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
-    if _git(candidate_path, ["status", "--porcelain=v1", "--untracked-files=all"]):
-        raise GovernanceBlockerError("Candidate git status is not clean after verifier command")
-    return {"ok": True, "status": "PASS", "eligible_repair": False, "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "tests": results}
+        return {"ok": True, "status": "PASS", "eligible_repair": False, "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "tests": results}
+    finally:
+        cleanup_scratch()
 
 
 # Short aliases used by controller integrations.
