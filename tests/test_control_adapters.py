@@ -245,10 +245,61 @@ class ControlAdapterTests(unittest.TestCase):
             "response": {"output": [{"type": "future_remove", "path": "candidate.py"}]},
         })
 
+    def test_case_variant_key_collision_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "Type": "message",
+            "type": "future_remove",
+        })
+
+    def test_nested_case_variant_key_collision_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "response.completed",
+            "response": {
+                "output": [{"Type": "text", "type": "shell_command"}],
+            },
+        })
+
     def test_untyped_interpreter_name_is_blocked_for_planner_and_reviewer(self):
         self.assert_non_builder_capability_breach({
             "type": "item.completed",
             "item": {"name": "bash"},
+        })
+
+    def test_untyped_path_interpreter_name_is_blocked_for_planner_and_reviewer(self):
+        for payload in (
+            {"name": "/bin/bash"},
+            {"name": "/usr/local/bin/python3.12"},
+        ):
+            with self.subTest(payload=payload):
+                self.assert_non_builder_capability_breach({
+                    "type": "item.completed",
+                    "item": payload,
+                })
+
+    def test_untyped_versioned_interpreter_name_is_blocked_for_planner_and_reviewer(self):
+        for payload in (
+            {"name": "python3.12"},
+            {"name": "node20"},
+        ):
+            with self.subTest(payload=payload):
+                self.assert_non_builder_capability_breach({
+                    "type": "item.completed",
+                    "item": payload,
+                })
+
+    def test_unknown_nested_name_token_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {"name": "future_executor"},
+        })
+
+    def test_safe_parent_with_unsafe_child_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "content": {"type": "shell_command"},
+            },
         })
 
     def test_deeply_nested_unknown_typed_node_is_blocked_for_planner_and_reviewer(self):

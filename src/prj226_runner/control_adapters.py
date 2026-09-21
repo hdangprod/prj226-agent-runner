@@ -632,7 +632,7 @@ _INTERPRETER_OR_EXECUTOR_NAME_HINTS = frozenset({
 
 
 def _key_indicates_execution(key: Any) -> bool:
-    normalized = str(key).lower()
+    normalized = str(key).casefold()
     return normalized in _EXECUTION_INDICATOR_KEY_NAMES or any(
         token in normalized for token in _EXECUTION_INDICATOR_KEY_TOKENS
     )
@@ -641,9 +641,36 @@ def _key_indicates_execution(key: Any) -> bool:
 def _name_indicates_interpreter_or_executor(value: Any) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
-    normalized = value.strip().lower()
-    return normalized in _INTERPRETER_OR_EXECUTOR_NAME_HINTS or any(
-        token in normalized for token in ("tool", "exec", "command", "shell", "script", "function", "call")
+    raw = value.strip().lower()
+
+    # Normalize paths before comparing executable names. This catches both
+    # POSIX and Windows paths, as well as common executable extensions and
+    # version suffixes such as ``python3.12`` and ``node20``.
+    basename = raw.replace("\\", "/").rstrip("/").split("/")[-1]
+    basename_no_ext = re.sub(r"\.(exe|bat|cmd|sh)$", "", basename)
+    basename_no_ver = re.sub(r"[\d\._-]+$", "", basename_no_ext)
+
+    if (
+        raw in _INTERPRETER_OR_EXECUTOR_NAME_HINTS
+        or basename in _INTERPRETER_OR_EXECUTOR_NAME_HINTS
+        or basename_no_ext in _INTERPRETER_OR_EXECUTOR_NAME_HINTS
+        or basename_no_ver in _INTERPRETER_OR_EXECUTOR_NAME_HINTS
+    ):
+        return True
+
+    return any(
+        token in raw
+        for token in (
+            "tool",
+            "exec",
+            "command",
+            "shell",
+            "script",
+            "function",
+            "call",
+            "executor",
+            "action",
+        )
     )
 
 
@@ -661,27 +688,46 @@ def _is_safe_informational_node(node: Any) -> bool:
     if not isinstance(node, dict):
         return False
 
-    if any(_key_indicates_execution(key) for key in node):
-        return False
-    if any(
-        str(key).lower() == "name" and _name_indicates_interpreter_or_executor(value)
-        for key, value in node.items()
-    ):
+    canonical_keys: dict[str, Any] = {}
+    for key in node:
+        canonical_key = str(key).casefold()
+        if canonical_key in canonical_keys:
+            return False
+        canonical_keys[canonical_key] = key
+    if len(canonical_keys) != len(node):
         return False
 
-    type_key = next((key for key in node if str(key).lower() == "type"), None)
-    if type_key is not None:
-        node_type = node[type_key]
-        if not isinstance(node_type, str) or not node_type:
+    if any(_key_indicates_execution(key) for key in node):
+        return False
+
+    if "type" in canonical_keys:
+        raw_type = node[canonical_keys["type"]]
+        if not isinstance(raw_type, str) or not raw_type.strip():
             return False
-        normalized_type = node_type.lower()
-        if normalized_type not in SAFE_INFORMATIONAL_TYPES and normalized_type not in LIFECYCLE_ENVELOPE_TYPES:
+        normalized_type = raw_type.strip().lower()
+        if (
+            normalized_type not in SAFE_INFORMATIONAL_TYPES
+            and normalized_type not in LIFECYCLE_ENVELOPE_TYPES
+        ):
             return False
-        return all(
-            _is_safe_informational_node(value)
-            for key, value in node.items()
-            if key != type_key
-        )
+
+        for canonical_key, original_key in canonical_keys.items():
+            if canonical_key == "type":
+                continue
+            value = node[original_key]
+            if (
+                canonical_key == "name"
+                and _name_indicates_interpreter_or_executor(value)
+            ):
+                return False
+            if not _is_safe_informational_node(value):
+                return False
+        return True
+
+    if "name" in canonical_keys:
+        value = node[canonical_keys["name"]]
+        if _name_indicates_interpreter_or_executor(value):
+            return False
 
     return all(_is_safe_informational_node(value) for value in node.values())
 
