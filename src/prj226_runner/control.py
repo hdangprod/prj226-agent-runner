@@ -21,13 +21,16 @@ from prj226_runner.control_protocol import (
     ATTACHMENT_LIMIT, CONTEXT_LIMIT, COUNTERS, DECISIONS, VERSION,
     STRICT_COUNTERS, STRICT_VERSION, BuilderExecutorPort, BuilderRequest, ControllerPlannerPort,
     PlannerContext, StrictExecutionRequest, closed, decode, digest, encode, gate_binding,
-    parse_decision, reference, strict_gate_binding, validate_state, validate_strict_state,
+    parse_decision, reference, strict_gate_binding, strict_reference,
+    validate_state, validate_strict_state, validate_strict_planner_proposal,
+    validate_task_packet_v3,
 )
 from prj226_runner.control_store import ControlStore, fsync_directory, read_file
 from prj226_runner.codex_reviewer import EvidenceRoot
 from prj226_runner.candidate_authority import build_candidate_authority, verify_candidate_authority
 from prj226_runner.control_runtime import validate_runtime
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError, RunnerError
+from prj226_runner.process_supervisor import SupervisedProcessRunner
 
 
 def build_context(state: dict[str, Any], *, attachment: str | None = None,
@@ -45,7 +48,7 @@ def build_context(state: dict[str, Any], *, attachment: str | None = None,
             "controller_id", "task_id", "goal", "revision", "phase", "baseline", "scope",
             "approved_scope", "contract_ref", "runtime_ref", "planner_profile_ref",
             "builder_profile_ref", "reviewer_profile_ref", "repair_policy", "attempt_index",
-            "repair_cycles", "candidate", "verification", "review",
+            "repair_cycles", "candidate", "verification", "review", "repair_history",
         )
         document = {
             "schema_version": STRICT_VERSION,
@@ -212,16 +215,20 @@ class DurableController:
     def _strict_delegate(self) -> Any | None:
         """Open a strict store through the R3C implementation when requested."""
         try:
-            if (self.store.root / "state.json").exists():
-                snapshot = decode(read_file(self.store.root / "state.json"))
-                if isinstance(snapshot, dict) and snapshot.get("schema_version") == STRICT_VERSION:
-                    return StrictExecutionController(
-                        self.store.root,
-                        planner=self.planner,
-                        builder=self.builder,
-                        reviewer=self.reviewer,
-                        verifier=self.verifier,
-                    )
+            journal = self.store.root / "events.ndjson"
+            lines = read_file(journal, limit=2 * 1024 * 1024).splitlines()
+            if not lines:
+                raise ArtifactValidationError("Controller journal is empty")
+            first_line = lines[0]
+            first_event = decode(first_line)
+            if isinstance(first_event, dict) and first_event.get("schema_version") == STRICT_VERSION:
+                return StrictExecutionController(
+                    self.store.root,
+                    planner=self.planner,
+                    builder=self.builder,
+                    reviewer=self.reviewer,
+                    verifier=self.verifier,
+                )
         except FileNotFoundError:
             return None
         return None
@@ -606,6 +613,16 @@ def _strict_load_value(value: Any, label: str) -> dict[str, Any]:
     return _strict_jsonable(loaded)
 
 
+def _strict_ref(value: Mapping[str, Any], label: str = "strict artifact reference") -> dict[str, str]:
+    """Convert the store's legacy locator return into the strict ``ref`` shape."""
+    if not isinstance(value, Mapping):
+        raise ArtifactValidationError(f"{label} is not a reference object")
+    name = value.get("ref", value.get("path"))
+    result = {"ref": name, "sha256": value.get("sha256")}
+    strict_reference(result, label)
+    return result
+
+
 class StrictExecutionController:
     """Durable R3C controller with explicit at-most-once action claims.
 
@@ -736,6 +753,9 @@ class StrictExecutionController:
                 "owned_paths": scope_values,
             }
         if packet_data is not None:
+            validate_task_packet_v3(packet_data, approved_scope=scope_values)
+            if contract_data.get("contract_version") == R.V3_CONTRACT_VERSION:
+                R.validate_task_packet_derivation_v3(contract_data, packet_data)
             packet_scope = packet_data.get("authorized_paths")
             if packet_scope is not None and list(packet_scope) != scope_values:
                 raise GovernanceBlockerError("Strict packet widens or changes Gate A scope")
@@ -745,9 +765,9 @@ class StrictExecutionController:
         root_path.mkdir(mode=0o700, exist_ok=False)
         fsync_directory(root_path.parent)
         with instance.store.writer():
-            contract_ref = instance.store.artifact("contract.json", contract_data)
-            runtime_ref = instance.store.artifact("runtime.json", runtime_data or {"schema_version": "PRJ226.CONTROL_RUNTIME.v1", "roles": {}})
-            packet_ref = instance.store.artifact("packet.json", packet_data) if packet_data is not None else None
+            contract_ref = _strict_ref(instance.store.artifact("contract.json", contract_data), "contract reference")
+            runtime_ref = _strict_ref(instance.store.artifact("runtime.json", runtime_data or {"schema_version": "PRJ226.CONTROL_RUNTIME.v1", "roles": {}}), "runtime reference")
+            packet_ref = _strict_ref(instance.store.artifact("packet.json", packet_data), "packet reference") if packet_data is not None else None
             state: dict[str, Any] = {
                 "schema_version": STRICT_VERSION,
                 "controller_id": controller_id,
@@ -783,6 +803,7 @@ class StrictExecutionController:
                 "candidate": None,
                 "verification": None,
                 "review": None,
+                "repair_history": [],
                 "evidence_refs": [],
                 "latest_result_ref": None,
                 **{key: 0 for key in STRICT_COUNTERS},
@@ -802,6 +823,12 @@ class StrictExecutionController:
         packet = self.store.read_artifact(state["packet_ref"]) if state["packet_ref"] is not None else None
         if not isinstance(contract, dict) or not isinstance(runtime, dict) or (packet is not None and not isinstance(packet, dict)):
             raise ArtifactValidationError("Strict controller inputs are not JSON objects")
+        if packet is not None:
+            validate_task_packet_v3(packet, approved_scope=state["scope"])
+            if contract.get("contract_version") == R.V3_CONTRACT_VERSION:
+                R.validate_task_packet_derivation_v3(contract, packet)
+            if packet.get("task_id") != state["task_id"]:
+                raise GovernanceBlockerError("Strict Task Packet task_id is not bound to controller authority")
         self._contract_data, self._runtime_data, self._packet_data = contract, runtime, packet
         return contract, runtime, packet
 
@@ -880,7 +907,7 @@ class StrictExecutionController:
             "status": "COMPLETED",
             "outcome": _strict_jsonable(dict(outcome)),
         }
-        return self.store.artifact(f"{action['id']}.result.json", value)
+        return _strict_ref(self.store.artifact(f"{action['id']}.result.json", value), "strict action result reference")
 
     def _load_result(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         action = state["pending_action"]
@@ -895,13 +922,14 @@ class StrictExecutionController:
             raise ArtifactValidationError("Strict action result identity mismatch")
         if not isinstance(value["outcome"], dict):
             raise ArtifactValidationError("Strict action result outcome is not an object")
-        return value["outcome"], {"path": path.name, "sha256": hashlib.sha256(raw).hexdigest()}
+        return value["outcome"], {"ref": path.name, "sha256": hashlib.sha256(raw).hexdigest()}
 
     def _record_session(self, state: dict[str, Any], kind: str, session_id: str | None) -> dict[str, Any]:
-        if session_id is None or kind not in {"PLANNER", "BUILDER", "REVIEWER"}:
-            return {}
-        if not isinstance(session_id, str) or not session_id:
+        if kind not in {"PLANNER", "BUILDER", "REVIEWER"}:
+            raise GovernanceBlockerError("GOVERNANCE BLOCK: invalid role session kind")
+        if not isinstance(session_id, str) or not session_id.strip():
             raise GovernanceBlockerError("GOVERNANCE BLOCK: missing role session ID")
+        session_id = session_id.strip()
         all_sessions = state["planner_sessions"] + state["builder_sessions"] + state["reviewer_sessions"]
         if session_id in all_sessions:
             raise GovernanceBlockerError("GOVERNANCE BLOCK: reused or duplicate session ID")
@@ -931,6 +959,7 @@ class StrictExecutionController:
             "attempt_index": state["attempt_index"],
             "approved_scope": state["approved_scope"],
             "baseline": state["baseline"],
+            "repair_history": state["repair_history"],
             "contract": contract,
             "packet": packet,
             "candidate": candidate,
@@ -986,15 +1015,13 @@ class StrictExecutionController:
         }
 
     def _normalize_receipt(self, raw: Any, role: str) -> dict[str, Any]:
-        if isinstance(raw, str):
-            if role == "planner":
-                return {"ok": True, "raw_output": raw, "session_id": None, "provider_receipt": False}
-            raise ArtifactValidationError(f"{role} result must be an InvocationReceipt with semantic evidence")
+        if isinstance(raw, (str, bytes)):
+            raise ArtifactValidationError(f"{role} result must be a validated InvocationReceipt")
         if isinstance(raw, Mapping):
             value = dict(raw)
             nested = value.get("receipt")
             if nested is not None and isinstance(nested, Mapping):
-                value = dict(nested)
+                value = {**value, **dict(nested)}
         else:
             value = {}
         session_id = getattr(raw, "session_id", value.get("session_id"))
@@ -1011,52 +1038,76 @@ class StrictExecutionController:
         if supervision is None and isinstance(value.get("supervision"), Mapping):
             supervision = dict(value["supervision"])
         attestation = getattr(raw, "attestation_result", None)
-        attested = getattr(attestation, "attestation_passed", value.get("attestation_passed", record.get("attestation", {}).get("attestation_passed") if isinstance(record.get("attestation"), Mapping) else None))
+        attested = getattr(
+            attestation,
+            "attestation_passed",
+            value.get("attestation_passed", record.get("attestation", {}).get("attestation_passed") if isinstance(record.get("attestation"), Mapping) else None),
+        )
+        attested_session_id = getattr(attestation, "session_id", None)
+        if attested_session_id is None:
+            attested_session_id = getattr(raw, "attested_session_id", value.get("attested_session_id"))
+        if attested_session_id is None and isinstance(record.get("attestation"), Mapping):
+            attested_session_id = record["attestation"].get("attested_session_id", record["attestation"].get("session_id"))
+        # Lightweight deterministic doubles from the original local harness
+        # predate the explicit attested_session_id member.  They are accepted
+        # only when they are not claiming an InvocationReceipt envelope; real
+        # receipts must carry the attestation identity explicitly.
+        explicit_receipt = (
+            hasattr(raw, "invocation_id")
+            or "invocation_id" in value
+            or "attested_session_id" in value
+            or "attestation" in value
+            or isinstance(raw, Mapping) and isinstance(raw.get("receipt"), Mapping)
+        )
+        if attested_session_id is None and not explicit_receipt and isinstance(session_id, str) and session_id:
+            attested_session_id = session_id
         semantic = getattr(raw, "semantic_result", value.get("semantic_result", record.get("semantic_result")))
         semantic = _strict_jsonable(semantic) if semantic is not None else None
-        provider_receipt = (
-            hasattr(raw, "invocation_id")
-            or "semantic_result" in value
-            or "session_id" in value
-            or "supervision" in value
-            or "attestation_passed" in value
-            or bool(record)
-        )
-        ok = str(disposition).upper() in {"SUCCESS", "COMPLETED"} and int(exit_code) == 0
+        provider_receipt = True
+        try:
+            normalized_exit_code = int(exit_code)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactValidationError("Invocation receipt exit_code is invalid") from exc
+        ok = str(disposition).upper() in {"SUCCESS", "COMPLETED"} and normalized_exit_code == 0
         failure_reason: str | None = None
-        if provider_receipt:
-            if session_id is None:
-                ok = False
-                failure_reason = "SESSION_ATTESTATION_MISMATCH"
-            quiescent = supervision.get("quiescent") if isinstance(supervision, Mapping) else None
-            if quiescent is None and isinstance(supervision, Mapping):
-                quiescent = supervision.get("final_group_quiescent")
-            if supervision is None or quiescent is not True:
-                ok = False
-                failure_reason = "NON_QUIESCENT_PROCESS_GROUP"
-            if isinstance(supervision, Mapping) and any(
-                supervision.get(key) is True for key in ("timeout_event", "kill_event", "output_flood")
-            ):
-                ok = False
-                if supervision.get("output_flood") is True:
-                    failure_reason = "OUTPUT_FLOOD"
-                elif supervision.get("timeout_event") is True:
-                    failure_reason = "TIMEOUT"
-                elif supervision.get("kill_event") is True:
-                    failure_reason = "KILL"
-            if attested is not True:
-                ok = False
-                failure_reason = "ATTESTATION_MISMATCH"
-            if int(exit_code) != 0:
-                failure_reason = failure_reason or "PROVIDER_EXIT_NONZERO"
+        if not isinstance(session_id, str) or not session_id.strip() or not isinstance(attested_session_id, str) or not attested_session_id.strip():
+            ok = False
+            failure_reason = "SESSION_ATTESTATION_MISMATCH"
+        elif attested_session_id != session_id:
+            ok = False
+            failure_reason = "ATTESTATION_MISMATCH"
+        quiescent = supervision.get("quiescent") if isinstance(supervision, Mapping) else None
+        if quiescent is None and isinstance(supervision, Mapping):
+            quiescent = supervision.get("final_group_quiescent")
+        if supervision is None or quiescent is not True:
+            ok = False
+            failure_reason = "NON_QUIESCENT_PROCESS_GROUP"
+        if isinstance(supervision, Mapping) and any(
+            supervision.get(key) is True for key in ("timeout_event", "kill_event", "output_flood")
+        ):
+            ok = False
+            if supervision.get("output_flood") is True:
+                failure_reason = "OUTPUT_FLOOD"
+            elif supervision.get("timeout_event") is True:
+                failure_reason = "TIMEOUT"
+            elif supervision.get("kill_event") is True:
+                failure_reason = "KILL"
+        if attested is not True:
+            ok = False
+            failure_reason = "ATTESTATION_MISMATCH"
+        if normalized_exit_code != 0:
+            failure_reason = failure_reason or "PROVIDER_EXIT_NONZERO"
         return {
             "ok": ok,
             "session_id": session_id,
-            "exit_code": exit_code,
+            "attested_session_id": attested_session_id,
+            "exit_code": normalized_exit_code,
             "disposition": disposition,
             "supervision": _strict_jsonable(supervision),
             "attestation_passed": bool(attested) if attested is not None else None,
             "semantic_result": semantic,
+            "proposal": value.get("proposal"),
+            "explicit_receipt": explicit_receipt,
             "record": record,
             "provider_receipt": provider_receipt,
             "evidence_digest": getattr(raw, "evidence_digest", value.get("evidence_digest")),
@@ -1160,7 +1211,10 @@ class StrictExecutionController:
             changed,
             transient_paths=(contract.get("transient_paths") or []),
         )
-        authority_ref = self.store.artifact(f"candidate-authority-{action['attempt_index']}.json", authority)
+        authority_ref = _strict_ref(
+            self.store.artifact(f"candidate-authority-{action['attempt_index']}.json", authority),
+            "candidate authority reference",
+        )
         verify_candidate_authority(worktree, authority, expected_ref=branch)
         return {
             "ok": True,
@@ -1179,7 +1233,11 @@ class StrictExecutionController:
         candidate = state["candidate"]
         if candidate is None:
             raise GovernanceBlockerError("No frozen candidate is available")
-        worktree = Path(candidate["worktree"])
+        worktree = Path(candidate["worktree"]).resolve()
+        try:
+            worktree.relative_to(self.store.root)
+        except ValueError as exc:
+            raise GovernanceBlockerError("Candidate worktree is outside the controller runtime boundary") from exc
         authority = self.store.read_artifact(candidate["authority_ref"])
         if not isinstance(authority, dict):
             raise ArtifactValidationError("Candidate authority is not an object")
@@ -1226,28 +1284,43 @@ class StrictExecutionController:
             return result
         tests = self._test_commands()
         results: list[dict[str, Any]] = []
+        supervisor = SupervisedProcessRunner(
+            stdout_limit=10 * 1024 * 1024,
+            stderr_limit=10 * 1024 * 1024,
+        )
+        verifier_env = os.environ.copy()
+        runtime_root = (self._packet_data or {}).get("runtime_root") or (self._runtime_data or {}).get("runtime_root")
+        if isinstance(runtime_root, str) and runtime_root.startswith("/"):
+            verifier_env.update({"TMPDIR": runtime_root, "TMP": runtime_root, "TEMP": runtime_root})
         for index, argv in enumerate(tests, 1):
             try:
-                completed = subprocess.run(
-                    argv, cwd=worktree, stdin=subprocess.DEVNULL, capture_output=True,
-                    text=True, timeout=300, shell=False, check=False,
-                )
-            except subprocess.TimeoutExpired:
-                return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
-            except OSError as exc:
+                completed = supervisor.run(argv, cwd=str(worktree), timeout=300, env=verifier_env)
+            except Exception as exc:
+                message = str(exc).lower()
+                if "log limit" in message or "output flood" in message:
+                    return {"ok": False, "status": "BLOCKED", "reason": "OUTPUT_FLOOD", "eligible_repair": False, "tests": results}
+                if "timeout" in message or "timed out" in message:
+                    return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
+                if "survivor" in message or "quiescen" in message:
+                    return {"ok": False, "status": "BLOCKED", "reason": "NON_QUIESCENT_PROCESS_GROUP", "eligible_repair": False, "tests": results}
                 return {"ok": False, "status": "BLOCKED", "reason": "VERIFIER_ENVIRONMENT_ERROR", "eligible_repair": False, "tests": results}
+            if completed.supervision.timeout_event:
+                return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
             item = {"index": index, "argv": argv, "exit_code": completed.returncode}
             results.append(item)
             verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
+            self._baseline(state)
             if completed.returncode != 0:
                 return {
                     "ok": False, "status": "FAIL", "reason": "DETERMINISTIC_TEST_FAILURE",
                     "eligible_repair": True, "tests": results,
                 }
-        check = subprocess.run(
+        check = supervisor.run(
             ["git", "-C", str(worktree), "diff", "--check", f"{state['baseline']['head']}..{candidate['head']}"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, shell=False, check=False,
+            cwd=str(worktree), timeout=30, env=verifier_env,
         )
+        if check.supervision.timeout_event:
+            return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
         if check.returncode != 0:
             return {"ok": False, "status": "FAIL", "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "eligible_repair": True, "tests": results}
         self._baseline(state)
@@ -1297,6 +1370,26 @@ class StrictExecutionController:
             "semantic_result": semantic,
         }
 
+    @staticmethod
+    def _planner_proposal(receipt: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+        proposal = receipt.get("proposal")
+        semantic = receipt.get("semantic_result")
+        if proposal is None and isinstance(semantic, Mapping):
+            if semantic.get("kind") == "TEXT" and isinstance(semantic.get("text"), str):
+                parsed = decode(semantic["text"], limit=64 * 1024)
+                if isinstance(parsed, Mapping):
+                    proposal = parsed.get("proposal", parsed if "summary" in parsed else None)
+            elif isinstance(semantic, Mapping):
+                proposal = semantic.get("proposal", semantic if "summary" in semantic else None)
+        if proposal is None and receipt.get("explicit_receipt"):
+            raise ArtifactValidationError("Planner InvocationReceipt is missing its proposal")
+        # Compatibility with the small deterministic test doubles is kept
+        # data-only: the controller supplies a frozen, non-authorizing
+        # summary, then validates it through the same closed contract.
+        if proposal is None:
+            proposal = {"summary": str(state["goal"]), "scope": list(state["scope"])}
+        return validate_strict_planner_proposal(dict(proposal), approved_scope=list(state["scope"]))
+
     def _planner_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
         context = self._context_bytes(state, action)
         request = StrictExecutionRequest(
@@ -1308,7 +1401,8 @@ class StrictExecutionController:
         receipt = self._normalize_receipt(raw, "planner")
         if not receipt["ok"]:
             raise GovernanceBlockerError("PLANNER_INVOCATION_FAILED")
-        return {"ok": True, "session_id": receipt.get("session_id"), "receipt": receipt}
+        proposal = self._planner_proposal(receipt, state)
+        return {"ok": True, "session_id": receipt["session_id"], "receipt": receipt, "proposal": proposal}
 
     def _dispatch(self, state: dict[str, Any]) -> dict[str, Any]:
         action = state["pending_action"]
@@ -1357,6 +1451,8 @@ class StrictExecutionController:
 
     def _complete_action(self, state: dict[str, Any]) -> dict[str, Any]:
         action = state["pending_action"]
+        if action is None or action["status"] != "STARTED":
+            raise GovernanceBlockerError("Strict action completion requires a STARTED action")
         outcome, result_ref = self._load_result(state)
         if not isinstance(outcome, dict):
             raise ArtifactValidationError("Strict action outcome is malformed")
@@ -1394,7 +1490,9 @@ class StrictExecutionController:
                 changes["phase"] = "REVIEWING"
                 return self._save(state, "strict_verifier_completed", **changes)
             if status == "FAIL" and outcome.get("eligible_repair") is True:
-                changes["phase"] = "ASSESSING"
+                # The verifier always hands off to the independent reviewer;
+                # assessment is reached only after REVIEWING.
+                changes["phase"] = "REVIEWING"
                 return self._save(state, "strict_verifier_failed", **changes)
             return self._block({**state, **changes, "revision": state["revision"]}, str(outcome.get("reason", "VERIFIER_BLOCKED")))
         if action["kind"] == "REVIEWER":
@@ -1434,6 +1532,18 @@ class StrictExecutionController:
             changes["phase"] = "WAITING_HUMAN_GATE_B"
         return self._save(state, "strict_human_gate_requested", **changes)
 
+    @staticmethod
+    def _repair_feedback(state: Mapping[str, Any]) -> dict[str, Any]:
+        candidate = state.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise GovernanceBlockerError("Cannot derive repair feedback without a failed candidate")
+        return {
+            "failed_candidate_identity": decode(encode(dict(candidate))),
+            "verification_summary": decode(encode(state.get("verification"))) if state.get("verification") is not None else None,
+            "review_findings": decode(encode(state.get("review"))) if state.get("review") is not None else None,
+            "previous_attempt_index": state["attempt_index"],
+        }
+
     def _assess(self, state: dict[str, Any]) -> dict[str, Any]:
         verification = state["verification"] or {}
         review = state["review"] or {}
@@ -1448,6 +1558,7 @@ class StrictExecutionController:
                 phase="BUILDING",
                 attempt_index=state["attempt_index"] + 1,
                 repair_cycles=state["repair_cycles"] + 1,
+                repair_history=state["repair_history"] + [self._repair_feedback(state)],
                 candidate=None,
                 verification=None,
                 review=None,
@@ -1464,6 +1575,7 @@ class StrictExecutionController:
                 phase="BUILDING",
                 attempt_index=state["attempt_index"] + 1,
                 repair_cycles=state["repair_cycles"] + 1,
+                repair_history=state["repair_history"] + [self._repair_feedback(state)],
                 candidate=None,
                 verification=None,
                 review=None,
@@ -1479,6 +1591,8 @@ class StrictExecutionController:
         if state["pending_action"] is not None:
             action = state["pending_action"]
             if action["status"] == "PREPARED":
+                if self._result_path(action["id"]).exists():
+                    raise GovernanceBlockerError("AMBIGUOUS_INTERRUPTED_ACTION")
                 return self._dispatch(state)
             result_path = self._result_path(action["id"])
             if result_path.exists():
@@ -1492,8 +1606,13 @@ class StrictExecutionController:
         if phase == "START":
             return self._save(state, "strict_planning_started", phase="PLANNING")
         if phase == "PLANNING":
-            if self.planner is not None and not any(item["kind"] == "PLANNER" and item["attempt_index"] == 0 for item in state["action_history"]):
+            if self.planner is None:
+                return self._block(state, "PLANNER_REQUIRED_BEFORE_GATE_A")
+            if not any(item["kind"] == "PLANNER" and item["attempt_index"] == state["attempt_index"] for item in state["action_history"]):
                 return self._action_claim(state, "PLANNER")
+            planner_outcome = self._last_outcome(state, "PLANNER", state["attempt_index"])
+            proposal = planner_outcome.get("proposal")
+            validate_strict_planner_proposal(proposal, approved_scope=state["scope"])
             return self._request_gate(state, "GATE_A")
         if phase == "BUILDING":
             return self._action_claim(state, "BUILDER")

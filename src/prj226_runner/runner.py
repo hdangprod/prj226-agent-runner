@@ -47,6 +47,7 @@ from prj226_runner.errors import (
 from prj226_runner.models import ReviewMode, ReviewStatus, RunState
 from prj226_runner.paths import get_runner_root, get_runtime_root
 from prj226_runner.review_policy import normalize_review_policy
+from prj226_runner.process_supervisor import SupervisedProcessRunner
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -104,9 +105,12 @@ def _safe_relative_path(value: object, field: str = "authorized_paths") -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ArtifactValidationError(f"{field} contains an invalid path")
     path = Path(value)
-    if path.is_absolute() or "\\" in value or any(part in {"", ".", "..", ".git"} for part in path.parts):
+    if path.is_absolute() or "\\" in value or "\x00" in value or any(part in {"", "..", ".git"} for part in path.parts):
         raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
-    return value
+    normalized = [part for part in path.parts if part != "."]
+    if not normalized:
+        raise ArtifactValidationError(f"{field} contains an unsafe path: {value!r}")
+    return "/".join(normalized)
 
 
 def parse_task_packet(path: Path | str) -> TaskPacket:
@@ -560,6 +564,7 @@ def run_strict_verifier(
     canonical_branch: str | None = None,
     baseline_tree: str | None = None,
     timeout_seconds: int = 300,
+    runtime_directories: Sequence[Path | str] = (),
 ) -> dict[str, Any]:
     """Run the zero-model deterministic R3C verifier.
 
@@ -567,6 +572,12 @@ def run_strict_verifier(
     assessment; timeout, authority drift, and canonical drift are blockers.
     """
     candidate_path = Path(worktree).resolve()
+    if not candidate_path.is_dir():
+        raise GovernanceBlockerError("Strict verifier candidate worktree is missing")
+    for directory in runtime_directories:
+        runtime_path = Path(directory).resolve()
+        if not runtime_path.is_dir():
+            raise GovernanceBlockerError("Strict verifier runtime directory is missing")
     from prj226_runner.candidate_authority import verify_candidate_authority
     verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
     if canonical_repository is not None:
@@ -579,43 +590,69 @@ def run_strict_verifier(
             raise GovernanceBlockerError("Canonical baseline drift")
         if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
             raise GovernanceBlockerError("Canonical baseline drift")
+    if not isinstance(test_commands, Sequence) or not test_commands:
+        raise ArtifactValidationError("Strict verifier requires at least one test command")
     results: list[dict[str, Any]] = []
+    supervisor = SupervisedProcessRunner(
+        stdout_limit=10 * 1024 * 1024,
+        stderr_limit=10 * 1024 * 1024,
+    )
+    verifier_env = os.environ.copy()
+    if runtime_directories:
+        temp_root = str(Path(runtime_directories[0]).resolve())
+        verifier_env.update({"TMPDIR": temp_root, "TMP": temp_root, "TEMP": temp_root})
     for index, command in enumerate(test_commands, 1):
         argv = list(command)
         if not argv or not all(isinstance(arg, str) and arg for arg in argv):
             raise ArtifactValidationError("Strict verifier commands must be non-empty argv arrays")
         try:
-            result = subprocess.run(
+            result = supervisor.run(
                 argv,
-                cwd=candidate_path,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
+                cwd=str(candidate_path),
                 timeout=timeout_seconds,
-                shell=False,
-                check=False,
+                env=verifier_env,
             )
-        except subprocess.TimeoutExpired:
-            return {"status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
-        except OSError as exc:
+        except Exception as exc:
+            message = str(exc).lower()
+            if "log limit" in message or "output flood" in message:
+                return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "OUTPUT_FLOOD", "tests": results}
+            if "timeout" in message or "timed out" in message:
+                return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
+            if "survivor" in message or "quiescen" in message:
+                return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "NON_QUIESCENT_PROCESS_GROUP", "tests": results}
             raise RunnerEnvironmentError(f"Strict verifier command could not start: {exc}") from exc
+        if result.supervision.timeout_event:
+            return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
         item = {"index": index, "argv": argv, "exit_code": result.returncode}
         results.append(item)
         verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+        if _git(candidate_path, ["status", "--porcelain=v1", "--untracked-files=all"]):
+            raise GovernanceBlockerError("Candidate git status is not clean after verifier command")
+        if canonical_repository is not None:
+            canonical = Path(canonical_repository).resolve()
+            if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
+                raise GovernanceBlockerError("Canonical baseline drift")
         if result.returncode != 0:
-            return {"status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
-    diff = subprocess.run(
+            return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
+    diff = supervisor.run(
         ["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        shell=False,
-        check=False,
+        cwd=str(candidate_path), timeout=30,
+        env=verifier_env,
     )
+    if diff.supervision.timeout_event:
+        return {"ok": False, "status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
     if diff.returncode != 0:
-        return {"status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "tests": results}
+        return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "tests": results}
     verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
-    return {"status": "PASS", "eligible_repair": False, "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "tests": results}
+    if _git(candidate_path, ["status", "--porcelain=v1", "--untracked-files=all"]):
+        raise GovernanceBlockerError("Candidate git status is not clean after verifier command")
+    return {"ok": True, "status": "PASS", "eligible_repair": False, "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "tests": results}
 
 
 # Short aliases used by controller integrations.
@@ -1127,8 +1164,7 @@ def parse_task_packet_v3(path: Path | str) -> TaskPacketV3:
         raise ArtifactValidationError("authorized_paths must be a non-empty list of paths")
     safe_paths: list[str] = []
     for item in paths:
-        _safe_relative_path(item, field="authorized_paths")
-        safe_paths.append(item)
+        safe_paths.append(_safe_relative_path(item, field="authorized_paths"))
     if len(set(safe_paths)) != len(safe_paths):
         raise ArtifactValidationError("authorized_paths must not contain duplicates")
     transient_paths: list[str] = []
@@ -1137,19 +1173,18 @@ def parse_task_packet_v3(path: Path | str) -> TaskPacketV3:
         if not isinstance(raw_transient, list):
             raise ArtifactValidationError("transient_paths must be a list of relative paths")
         for item in raw_transient:
-            _safe_relative_path(item, field="transient_paths")
-            transient_paths.append(item)
+            transient_paths.append(_safe_relative_path(item, field="transient_paths"))
         if len(set(transient_paths)) != len(transient_paths):
             raise ArtifactValidationError("transient_paths must not contain duplicates")
     criteria = data["acceptance_criteria"]
     if not isinstance(criteria, list) or not criteria or not all(isinstance(x, str) and x.strip() for x in criteria):
         raise ArtifactValidationError("acceptance_criteria must be a non-empty array of strings")
     commands = data["test_commands"]
-    if not isinstance(commands, list) or not all(
+    if not isinstance(commands, list) or not commands or not all(
         isinstance(cmd, list) and cmd and all(isinstance(arg, str) and arg for arg in cmd)
         for cmd in commands
     ):
-        raise ArtifactValidationError("test_commands must be an array of non-empty argv arrays")
+        raise ArtifactValidationError("test_commands must be a non-empty array of non-empty argv arrays")
     return TaskPacketV3(
         packet_version=V3_PACKET_VERSION, contract_id=data["contract_id"],
         contract_hash=data["contract_hash"].lower(),

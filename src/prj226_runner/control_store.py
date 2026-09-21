@@ -104,11 +104,37 @@ class ControlStore:
         return ref
 
     def read_artifact(self, ref: dict[str, str]) -> Any:
-        reference(ref)
-        payload = read_file(self._path(ref["path"]))
+        if isinstance(ref, dict) and "ref" in ref:
+            if set(ref) != {"ref", "sha256"}:
+                raise ArtifactValidationError("Invalid strict artifact reference")
+            name = ref["ref"]
+            if not isinstance(name, str) or not name or Path(name).name != name or name in {".", ".."} or "\\" in name:
+                raise ArtifactValidationError("Strict artifact locator must be a local filename")
+        else:
+            reference(ref)
+            name = ref["path"]
+        payload = read_file(self._path(name))
         if hashlib.sha256(payload).hexdigest() != ref["sha256"]:
             raise ArtifactValidationError("Controller artifact digest mismatch")
         return decode(payload)
+
+    def _verify_strict_artifacts(self, state: dict[str, Any]) -> None:
+        """Resolve every strict reference before its state event is published."""
+        if state.get("schema_version") != STRICT_VERSION:
+            return
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if set(value) == {"ref", "sha256"}:
+                    self.read_artifact(value)
+                    return
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(state)
 
     def _atomic(self, path: Path, payload: bytes) -> None:
         self._require_writer()
@@ -184,6 +210,9 @@ class ControlStore:
     def commit(self, state: dict[str, Any], kind: str) -> dict[str, Any]:
         self._require_writer()
         validate_state(state)
+        # A state event is never durable authority for an artifact whose
+        # bytes have not already been resolved and digest-checked.
+        self._verify_strict_artifacts(state)
         journal = self.root / "events.ndjson"
         previous = None
         if journal.exists():

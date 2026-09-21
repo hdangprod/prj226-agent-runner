@@ -10,7 +10,7 @@
     "phase", "attempt_index", "repair_cycles", "planner_session", "builder_session",
     "reviewer_session", "planner_sessions", "builder_sessions", "reviewer_sessions",
     "gate_a", "gate_b", "gate_a_history", "gate_b_history", "pending_gate",
-    "pending_action", "action_history", "candidate", "verification", "review",
+    "pending_action", "action_history", "candidate", "verification", "review", "repair_history",
     "evidence_refs", "latest_result_ref", "planner_invocations", "builder_invocations",
     "freeze_invocations", "verifier_invocations", "reviewer_invocations", "terminal_state",
     "terminal_reason"
@@ -19,7 +19,7 @@
     "schema_version": {"const": "PRJ226.CONTROL_STATE.v1"},
     "controller_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1},
     "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1},
-    "goal": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1, "maxLength": 8192},
     "revision": {"type": "integer", "minimum": 1},
     "baseline": {"$ref": "#/$defs/baseline"},
     "scope": {"$ref": "#/$defs/scope"},
@@ -27,9 +27,9 @@
     "contract_ref": {"$ref": "#/$defs/ref"},
     "runtime_ref": {"$ref": "#/$defs/ref"},
     "packet_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
-    "planner_profile_ref": {"type": "string", "minLength": 1},
-    "builder_profile_ref": {"type": "string", "minLength": 1},
-    "reviewer_profile_ref": {"type": "string", "minLength": 1},
+    "planner_profile_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+    "builder_profile_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+    "reviewer_profile_ref": {"type": "string", "minLength": 1, "maxLength": 512},
     "repair_policy": {
       "type": "object", "additionalProperties": false, "required": ["max_repair_cycles"],
       "properties": {"max_repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2}}
@@ -37,12 +37,12 @@
     "phase": {"enum": ["START", "PLANNING", "WAITING_HUMAN_GATE_A", "BUILDING", "FREEZING", "VERIFYING", "REVIEWING", "ASSESSING", "WAITING_HUMAN_GATE_B", "COMPLETE", "BLOCKED"]},
     "attempt_index": {"type": "integer", "minimum": 0, "maximum": 2},
     "repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2},
-    "planner_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
-    "builder_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
-    "reviewer_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
-    "planner_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "builder_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "reviewer_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "planner_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 256}]},
+    "builder_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 256}]},
+    "reviewer_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 256}]},
+    "planner_sessions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+    "builder_sessions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+    "reviewer_sessions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
     "gate_a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gate"}]},
     "gate_b": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gate"}]},
     "gate_a_history": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/gate_entry"}},
@@ -53,6 +53,7 @@
     "candidate": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/candidate"}]},
     "verification": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
     "review": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
+    "repair_history": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/repair_feedback"}},
     "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}},
     "latest_result_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
     "planner_invocations": {"type": "integer", "minimum": 0},
@@ -61,12 +62,12 @@
     "verifier_invocations": {"type": "integer", "minimum": 0},
     "reviewer_invocations": {"type": "integer", "minimum": 0},
     "terminal_state": {"anyOf": [{"type": "null"}, {"enum": ["COMPLETE", "BLOCKED"]}]},
-    "terminal_reason": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
+    "terminal_reason": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 2048}]}
   },
   "$defs": {
     "ref": {
-      "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
-      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      "type": "object", "additionalProperties": false, "required": ["ref", "sha256"],
+      "properties": {"ref": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^/\\\\]+$", "not": {"enum": [".", ".."]}}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
     },
     "baseline": {
       "type": "object", "additionalProperties": false, "required": ["repository", "branch", "head", "tree"],
@@ -77,12 +78,17 @@
       "type": "object", "additionalProperties": false,
       "required": ["gate_id", "gate_type", "revision", "binding", "binding_digest", "question"],
       "properties": {
-        "gate_id": {"type": "string", "minLength": 1},
+        "gate_id": {"type": "string", "minLength": 1, "maxLength": 200},
         "gate_type": {"enum": ["GATE_A", "GATE_B"]},
         "revision": {"type": "integer", "minimum": 1},
-        "binding": {"type": "object", "additionalProperties": true},
+        "binding": {
+          "oneOf": [
+            {"$ref": "#/$defs/gate_a_binding"},
+            {"$ref": "#/$defs/gate_b_binding"}
+          ]
+        },
         "binding_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "question": {"type": "string", "minLength": 1}
+        "question": {"type": "string", "minLength": 1, "maxLength": 32768}
       }
     },
     "gate_entry": {
@@ -102,7 +108,7 @@
         "id": {"type": "string", "pattern": "^action-[A-Za-z0-9._-]+$"},
         "kind": {"enum": ["PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"]},
         "status": {"enum": ["PREPARED", "STARTED"]},
-        "attempt_index": {"type": "integer", "minimum": 0},
+        "attempt_index": {"type": "integer", "minimum": 0, "maximum": 2},
         "revision": {"type": "integer", "minimum": 1}
       }
     },
@@ -113,9 +119,9 @@
         "id": {"type": "string", "pattern": "^action-[A-Za-z0-9._-]+$"},
         "kind": {"enum": ["PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"]},
         "status": {"const": "COMPLETED"},
-        "attempt_index": {"type": "integer", "minimum": 0},
+        "attempt_index": {"type": "integer", "minimum": 0, "maximum": 2},
         "result_ref": {"$ref": "#/$defs/ref"},
-        "session_id": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "session_id": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 256}]},
         "revision": {"type": "integer", "minimum": 1}
       }
     },
@@ -125,17 +131,72 @@
       "properties": {
         "head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
         "tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
-        "ref": {"type": "string", "minLength": 1},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 256},
         "authority_ref": {"$ref": "#/$defs/ref"},
-        "worktree": {"type": "string", "minLength": 1},
-        "attempt_index": {"type": "integer", "minimum": 0},
+        "worktree": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "attempt_index": {"type": "integer", "minimum": 0, "maximum": 2},
         "changed_paths": {"$ref": "#/$defs/scope"}
+      }
+    },
+    "repair_feedback": {
+      "type": "object", "additionalProperties": false,
+      "required": ["failed_candidate_identity", "verification_summary", "review_findings", "previous_attempt_index"],
+      "properties": {
+        "failed_candidate_identity": {"$ref": "#/$defs/candidate"},
+        "verification_summary": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
+        "review_findings": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
+        "previous_attempt_index": {"type": "integer", "minimum": 0, "maximum": 2}
+      }
+    },
+    "gate_a_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["controller_id", "task_id", "goal", "baseline", "scope", "contract_ref", "runtime_ref", "packet_ref", "planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref", "repair_policy"],
+      "properties": {
+        "controller_id": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "minLength": 1},
+        "goal": {"type": "string", "minLength": 1},
+        "baseline": {"$ref": "#/$defs/baseline"},
+        "scope": {"$ref": "#/$defs/scope"},
+        "contract_ref": {"$ref": "#/$defs/ref"},
+        "runtime_ref": {"$ref": "#/$defs/ref"},
+        "packet_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
+        "planner_profile_ref": {"type": "string", "minLength": 1},
+        "builder_profile_ref": {"type": "string", "minLength": 1},
+        "reviewer_profile_ref": {"type": "string", "minLength": 1},
+        "repair_policy": {"type": "object", "additionalProperties": false, "required": ["max_repair_cycles"], "properties": {"max_repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2}}}
+      }
+    },
+    "gate_b_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["controller_id", "task_id", "goal", "baseline", "scope", "contract_ref", "runtime_ref", "packet_ref", "planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref", "repair_policy", "candidate", "verification_ref", "reviewer_receipt_ref", "review_verdict"],
+      "properties": {
+        "controller_id": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "minLength": 1},
+        "goal": {"type": "string", "minLength": 1},
+        "baseline": {"$ref": "#/$defs/baseline"},
+        "scope": {"$ref": "#/$defs/scope"},
+        "contract_ref": {"$ref": "#/$defs/ref"},
+        "runtime_ref": {"$ref": "#/$defs/ref"},
+        "packet_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
+        "planner_profile_ref": {"type": "string", "minLength": 1},
+        "builder_profile_ref": {"type": "string", "minLength": 1},
+        "reviewer_profile_ref": {"type": "string", "minLength": 1},
+        "repair_policy": {"type": "object", "additionalProperties": false, "required": ["max_repair_cycles"], "properties": {"max_repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2}}},
+        "candidate": {"$ref": "#/$defs/candidate"},
+        "verification_ref": {"$ref": "#/$defs/ref"},
+        "reviewer_receipt_ref": {"$ref": "#/$defs/ref"},
+        "review_verdict": {"type": "string", "enum": ["PASS", "NEEDS_FIX", "BLOCKED"]}
       }
     },
     "result": {
       "type": "object", "additionalProperties": true,
       "required": ["status"],
-      "properties": {"status": {"type": "string", "minLength": 1}}
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "eligible_repair": {"type": "boolean"},
+        "report_ref": {"$ref": "#/$defs/ref"},
+        "receipt_ref": {"$ref": "#/$defs/ref"}
+      }
     }
   }
 }
