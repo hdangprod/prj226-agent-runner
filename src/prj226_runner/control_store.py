@@ -16,7 +16,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from prj226_runner.control_protocol import VERSION, closed, decode, digest, encode, reference, validate_state, validate_transition
+from prj226_runner.control_protocol import (
+    STRICT_VERSION,
+    VERSION,
+    closed,
+    decode,
+    digest,
+    encode,
+    reference,
+    validate_state,
+    validate_strict_event,
+    validate_transition,
+)
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 
 
@@ -118,17 +129,26 @@ class ControlStore:
         previous = None
         for line in raw.splitlines():
             event = closed(decode(line), {"schema_version", "kind", "revision", "previous_digest", "state", "digest"}, "controller event")
-            if event["schema_version"] != VERSION or event["revision"] != len(events) + 1:
+            if event["revision"] != len(events) + 1:
                 raise ArtifactValidationError("Controller event sequence/version mismatch")
-            if event["previous_digest"] != previous or digest({k:v for k,v in event.items() if k != "digest"}) != event["digest"]:
-                raise ArtifactValidationError("Controller event chain mismatch")
-            validate_state(event["state"])
-            if event["state"]["revision"] != event["revision"]:
-                raise ArtifactValidationError("State/event revision mismatch")
-            if events:
-                validate_transition(events[-1]["state"], event["state"])
-            elif event["state"]["phase"] != "START":
-                raise ArtifactValidationError("Controller journal must begin at START")
+            if event["schema_version"] == STRICT_VERSION:
+                if events and events[-1]["schema_version"] != STRICT_VERSION:
+                    raise ArtifactValidationError("Legacy and strict controller journals cannot be mixed")
+                validate_strict_event(event, events[-1] if events else None)
+            elif event["schema_version"] == VERSION:
+                if events and events[-1]["schema_version"] != VERSION:
+                    raise ArtifactValidationError("Legacy and strict controller journals cannot be mixed")
+                if event["previous_digest"] != previous or digest({k:v for k,v in event.items() if k != "digest"}) != event["digest"]:
+                    raise ArtifactValidationError("Controller event chain mismatch")
+                validate_state(event["state"])
+                if event["state"]["revision"] != event["revision"]:
+                    raise ArtifactValidationError("State/event revision mismatch")
+                if events:
+                    validate_transition(events[-1]["state"], event["state"])
+                elif event["state"]["phase"] != "START":
+                    raise ArtifactValidationError("Controller journal must begin at START")
+            else:
+                raise ArtifactValidationError("Controller event sequence/version mismatch")
             events.append(event)
             previous = event["digest"]
         return events
@@ -145,7 +165,18 @@ class ControlStore:
             revision = snapshot["revision"]
             if revision > len(events) or snapshot != events[revision - 1]["state"]:
                 raise ArtifactValidationError("Snapshot conflicts with durable controller journal")
-        if recover and snapshot != latest:
+        # Strict R3C loads are normally made under the writer lock during
+        # resume.  Rebuild the cache whenever that lock is held, even when a
+        # caller did not spell out ``recover=True``; the journal remains the
+        # sole authority.  Legacy callers retain their historical read-only
+        # load behavior unless they request recovery explicitly.
+        if snapshot != latest and latest.get("schema_version") == STRICT_VERSION and not self._locked:
+            # A strict snapshot is explicitly a rebuildable cache.  Acquire
+            # the same single-writer lock used by commits so a read-side
+            # recovery cannot race another controller.
+            with self.writer():
+                return self.load(recover=True)
+        if (recover or (self._locked and latest.get("schema_version") == STRICT_VERSION)) and snapshot != latest:
             self._require_writer()
             self._atomic(snapshot_path, encode(latest))
         return latest
@@ -157,11 +188,13 @@ class ControlStore:
         previous = None
         if journal.exists():
             events = self._journal()
+            if events[-1]["schema_version"] != state["schema_version"]:
+                raise GovernanceBlockerError("Legacy and strict controller journals cannot be mixed")
             validate_transition(events[-1]["state"], state)
             previous = events[-1]["digest"]
         elif state["revision"] != 1 or state["phase"] != "START":
             raise GovernanceBlockerError("Controller must initialize at START revision 1")
-        event = {"schema_version": VERSION, "kind": kind, "revision": state["revision"], "previous_digest": previous, "state": state}
+        event = {"schema_version": state["schema_version"], "kind": kind, "revision": state["revision"], "previous_digest": previous, "state": state}
         event["digest"] = digest(event)
         fd = os.open(journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "ab") as stream:

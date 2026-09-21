@@ -11,6 +11,9 @@ from typing import Any, Protocol
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 
 VERSION = "PRJ226.CONTROL.v1"
+# R3C deliberately uses a separate state version.  VERSION is kept as the
+# legacy CTRL-R001 protocol and must continue to be accepted by old stores.
+STRICT_VERSION = "PRJ226.CONTROL_STATE.v1"
 DECISION_VERSION = "PRJ226.CONTROL_DECISION.v1"
 CONTEXT_LIMIT = 32 * 1024
 ATTACHMENT_LIMIT = 64 * 1024
@@ -28,6 +31,20 @@ PHASES = {
     "COMPLETE": set(),
     "BLOCKED": set(),
 }
+STRICT_PHASES = {
+    "START": {"PLANNING"},
+    "PLANNING": {"WAITING_HUMAN_GATE_A"},
+    "WAITING_HUMAN_GATE_A": {"BUILDING"},
+    "BUILDING": {"FREEZING"},
+    "FREEZING": {"VERIFYING"},
+    "VERIFYING": {"REVIEWING", "ASSESSING"},
+    "REVIEWING": {"ASSESSING"},
+    "ASSESSING": {"BUILDING", "WAITING_HUMAN_GATE_B"},
+    "WAITING_HUMAN_GATE_B": {"COMPLETE"},
+    "COMPLETE": set(),
+    "BLOCKED": set(),
+}
+STRICT_ACTION_KINDS = {"PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"}
 DECISIONS = {
     "PLANNING": {"PROPOSE_TASK", "BLOCK"},
     "PLANNER_ASSESSMENT": {"PREPARE_GATE_B", "BLOCK"},
@@ -120,6 +137,8 @@ def validate_gate(gate: Any) -> None:
 
 
 def validate_state(state: Any) -> dict[str, Any]:
+    if isinstance(state, dict) and state.get("schema_version") == STRICT_VERSION:
+        return validate_strict_state(state)
     closed(state, STATE_KEYS, "controller state")
     if state["schema_version"] != VERSION or not isinstance(state["phase"], str) or state["phase"] not in PHASES:
         raise ArtifactValidationError("Unsupported controller state/version")
@@ -209,6 +228,10 @@ def validate_state(state: Any) -> dict[str, Any]:
 
 
 def validate_transition(before: dict[str, Any], after: dict[str, Any]) -> None:
+    if (isinstance(before, dict) and before.get("schema_version") == STRICT_VERSION) or (
+        isinstance(after, dict) and after.get("schema_version") == STRICT_VERSION
+    ):
+        return validate_strict_transition(before, after)
     validate_state(after)
     if before["phase"] in {"COMPLETE", "BLOCKED"}:
         raise GovernanceBlockerError("Terminal controller cannot advance")
@@ -235,6 +258,432 @@ def validate_transition(before: dict[str, Any], after: dict[str, Any]) -> None:
         raise GovernanceBlockerError("Completion lacks verified evidence or Gate B")
 
 
+# ---------------------------------------------------------------------------
+# CTRL-R002A R3C strict execution protocol
+# ---------------------------------------------------------------------------
+
+STRICT_COUNTERS = (
+    "planner_invocations",
+    "builder_invocations",
+    "freeze_invocations",
+    "verifier_invocations",
+    "reviewer_invocations",
+)
+STRICT_STATE_KEYS = {
+    "schema_version",
+    "controller_id",
+    "task_id",
+    "goal",
+    "revision",
+    "baseline",
+    "scope",
+    "approved_scope",
+    "contract_ref",
+    "runtime_ref",
+    "packet_ref",
+    "planner_profile_ref",
+    "builder_profile_ref",
+    "reviewer_profile_ref",
+    "repair_policy",
+    "phase",
+    "attempt_index",
+    "repair_cycles",
+    "planner_session",
+    "builder_session",
+    "reviewer_session",
+    "planner_sessions",
+    "builder_sessions",
+    "reviewer_sessions",
+    "gate_a",
+    "gate_b",
+    "gate_a_history",
+    "gate_b_history",
+    "pending_gate",
+    "pending_action",
+    "action_history",
+    "candidate",
+    "verification",
+    "review",
+    "evidence_refs",
+    "latest_result_ref",
+    *STRICT_COUNTERS,
+    "terminal_state",
+    "terminal_reason",
+}
+STRICT_GATE_KEYS = {"gate_id", "gate_type", "revision", "binding", "binding_digest", "question"}
+STRICT_GATE_ENTRY_KEYS = {"gate", "human_response", "source", "authorization"}
+STRICT_ACTION_KEYS = {"id", "kind", "status", "attempt_index", "revision"}
+STRICT_COMPLETED_ACTION_KEYS = {
+    "id", "kind", "status", "attempt_index", "result_ref", "session_id", "revision"
+}
+STRICT_GATE_A_BINDING_KEYS = {
+    "controller_id", "task_id", "goal", "baseline", "scope", "contract_ref", "runtime_ref",
+    "planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref", "repair_policy",
+}
+STRICT_GATE_B_BINDING_KEYS = STRICT_GATE_A_BINDING_KEYS | {
+    "candidate", "verification_ref", "reviewer_receipt_ref", "review_verdict",
+}
+
+
+def _strict_identifier(value: Any, label: str, maximum: int = 160) -> str:
+    string(value, label, maximum=maximum)
+    if re.fullmatch(r"[A-Za-z0-9._-]+", value) is None:
+        raise ArtifactValidationError(f"Invalid identifier: {label}")
+    return value
+
+
+def _strict_sha(value: Any, label: str, length: int) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{%d}" % length, value) is None:
+        raise ArtifactValidationError(f"Invalid {label}")
+    return value.lower()
+
+
+def _strict_ref_or_none(value: Any, label: str) -> None:
+    if value is not None:
+        try:
+            reference(value)
+            if "/" in value["path"] or "\\" in value["path"] or value["path"] in {".", ".."}:
+                raise ArtifactValidationError("strict artifact references must be local filenames")
+        except ArtifactValidationError as exc:
+            raise ArtifactValidationError(f"Invalid {label}") from exc
+
+
+def _strict_baseline(value: Any) -> dict[str, Any]:
+    closed(value, {"repository", "branch", "head", "tree"}, "strict baseline")
+    string(value["repository"], "baseline repository")
+    string(value["branch"], "baseline branch")
+    _strict_sha(value["head"], "baseline HEAD", 40)
+    _strict_sha(value["tree"], "baseline TREE", 40)
+    return value
+
+
+def _strict_scope(value: Any, label: str = "approved scope") -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise ArtifactValidationError(f"Invalid {label}")
+    if len(value) != len(set(value)):
+        raise ArtifactValidationError(f"Invalid {label}")
+    from prj226_runner.runner import _safe_relative_path
+    for item in value:
+        if not isinstance(item, str):
+            raise ArtifactValidationError(f"Invalid {label}")
+        _safe_relative_path(item)
+    return value
+
+
+def strict_gate_binding(state: dict[str, Any], gate_type: str) -> dict[str, Any]:
+    """Return the immutable authority bound by a strict human gate."""
+    if gate_type == "GATE_A":
+        keys = STRICT_GATE_A_BINDING_KEYS
+    elif gate_type == "GATE_B":
+        keys = STRICT_GATE_B_BINDING_KEYS
+    else:
+        raise ArtifactValidationError("Invalid strict gate type")
+    result: dict[str, Any] = {}
+    for key in keys:
+        if key in state:
+            result[key] = state[key]
+        elif gate_type == "GATE_B" and key == "verification_ref":
+            verification = state.get("verification")
+            if isinstance(verification, dict) and isinstance(verification.get("report_ref"), dict):
+                result[key] = verification["report_ref"]
+        elif gate_type == "GATE_B" and key == "reviewer_receipt_ref":
+            review = state.get("review")
+            if isinstance(review, dict) and isinstance(review.get("receipt_ref"), dict):
+                result[key] = review["receipt_ref"]
+        elif gate_type == "GATE_B" and key == "review_verdict":
+            review = state.get("review")
+            if isinstance(review, dict):
+                result[key] = review.get("status")
+    if set(result) != keys:
+        raise ArtifactValidationError("Strict gate binding is incomplete")
+    return result
+
+
+def _validate_strict_gate(value: Any, expected_type: str | None = None) -> dict[str, Any]:
+    closed(value, STRICT_GATE_KEYS, "strict gate")
+    string(value["gate_id"], "strict gate ID", maximum=200)
+    if value["gate_type"] not in {"GATE_A", "GATE_B"}:
+        raise ArtifactValidationError("Invalid strict gate type")
+    if expected_type is not None and value["gate_type"] != expected_type:
+        raise ArtifactValidationError("Strict gate type mismatch")
+    integer(value["revision"], "strict gate revision", minimum=1)
+    string(value["question"], "strict gate question", maximum=32768)
+    binding = value["binding"]
+    expected_keys = STRICT_GATE_A_BINDING_KEYS if value["gate_type"] == "GATE_A" else STRICT_GATE_B_BINDING_KEYS
+    closed(binding, expected_keys, "strict gate binding")
+    if digest(binding) != value["binding_digest"]:
+        raise ArtifactValidationError("Strict gate binding digest mismatch")
+    return value
+
+
+def _validate_strict_gate_history(value: Any, expected_type: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 1:
+        raise ArtifactValidationError("Invalid strict gate history")
+    for entry in value:
+        closed(entry, STRICT_GATE_ENTRY_KEYS, "strict gate response")
+        gate = _validate_strict_gate(entry["gate"], expected_type)
+        if entry["human_response"] not in {"approve", "deny"} or entry["source"] != "local-cli":
+            raise ArtifactValidationError("Invalid strict human gate response")
+        authorization = entry["authorization"]
+        if entry["human_response"] == "deny":
+            if authorization is not None:
+                raise ArtifactValidationError("Denied strict gate cannot authorize")
+        elif authorization != {
+            "gate_id": gate["gate_id"],
+            "binding_digest": gate["binding_digest"],
+            "decision": "APPROVED",
+        }:
+            raise ArtifactValidationError("Invalid strict gate authorization")
+    return value
+
+
+def _validate_strict_action(value: Any, *, completed: bool = False) -> dict[str, Any]:
+    keys = STRICT_COMPLETED_ACTION_KEYS if completed else STRICT_ACTION_KEYS
+    closed(value, keys, "strict action")
+    if not isinstance(value["id"], str) or re.fullmatch(r"action-[A-Za-z0-9._-]+", value["id"]) is None:
+        raise ArtifactValidationError("Invalid strict action ID")
+    if value["kind"] not in STRICT_ACTION_KINDS:
+        raise ArtifactValidationError("Invalid strict action kind")
+    expected_status = "COMPLETED" if completed else None
+    if expected_status is not None and value["status"] != expected_status:
+        raise ArtifactValidationError("Invalid completed strict action status")
+    if expected_status is None and value["status"] not in {"PREPARED", "STARTED"}:
+        raise ArtifactValidationError("Invalid strict action status")
+    integer(value["attempt_index"], "strict action attempt", minimum=0)
+    integer(value["revision"], "strict action revision", minimum=1)
+    if completed:
+        _strict_ref_or_none(value["result_ref"], "strict action result reference")
+        if value["session_id"] is not None:
+            string(value["session_id"], "strict action session", maximum=256)
+    return value
+
+
+def _validate_strict_candidate(value: Any) -> None:
+    if value is None:
+        return
+    closed(value, {"head", "tree", "ref", "authority_ref", "worktree", "attempt_index", "changed_paths"}, "strict candidate")
+    _strict_sha(value["head"], "candidate HEAD", 40)
+    _strict_sha(value["tree"], "candidate TREE", 40)
+    string(value["ref"], "candidate ref", maximum=256)
+    _strict_ref_or_none(value["authority_ref"], "candidate authority reference")
+    string(value["worktree"], "candidate worktree", maximum=4096)
+    integer(value["attempt_index"], "candidate attempt", minimum=0)
+    _strict_scope(value["changed_paths"], "candidate changed paths")
+
+
+def _validate_strict_result(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or not isinstance(value.get("status"), str):
+        raise ArtifactValidationError(f"Invalid strict {label}")
+    if label == "verification" and value["status"] not in {"PASS", "FAIL", "BLOCKED"}:
+        raise ArtifactValidationError("Invalid strict verification status")
+    if label == "review" and value["status"] not in {"PASS", "NEEDS_FIX", "BLOCKED"}:
+        raise ArtifactValidationError("Invalid strict review status")
+
+
+def validate_strict_state(state: Any) -> dict[str, Any]:
+    """Validate the R3C state snapshot without weakening the legacy schema."""
+    closed(state, STRICT_STATE_KEYS, "strict controller state")
+    if state["schema_version"] != STRICT_VERSION or state["phase"] not in STRICT_PHASES:
+        raise ArtifactValidationError("Unsupported strict controller state/version")
+    for key in ("controller_id", "task_id"):
+        _strict_identifier(state[key], key)
+    string(state["goal"], "goal", maximum=8192)
+    integer(state["revision"], "revision", minimum=1)
+    _strict_baseline(state["baseline"])
+    scope = _strict_scope(state["scope"])
+    if state["approved_scope"] != scope:
+        raise GovernanceBlockerError("Approved strict scope changed")
+    for key in ("contract_ref", "runtime_ref"):
+        _strict_ref_or_none(state[key], key)
+    _strict_ref_or_none(state["packet_ref"], "packet reference")
+    for key in ("planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref"):
+        string(state[key], key, maximum=512)
+    closed(state["repair_policy"], {"max_repair_cycles"}, "repair policy")
+    integer(state["repair_policy"]["max_repair_cycles"], "max repair cycles", minimum=0)
+    if state["repair_policy"]["max_repair_cycles"] > 2:
+        raise ArtifactValidationError("Maximum repair cycles is 2")
+    integer(state["attempt_index"], "attempt index", minimum=0)
+    integer(state["repair_cycles"], "repair cycles", minimum=0)
+    if state["repair_cycles"] != state["attempt_index"]:
+        raise GovernanceBlockerError("Repair cycle and attempt index diverged")
+    for key in ("planner_session", "builder_session", "reviewer_session"):
+        if state[key] is not None:
+            string(state[key], key, maximum=256)
+    for key in ("planner_sessions", "builder_sessions", "reviewer_sessions"):
+        values = state[key]
+        if not isinstance(values, list) or len(values) != len(set(values)):
+            raise ArtifactValidationError(f"Invalid {key}")
+        for session in values:
+            string(session, f"{key} session", maximum=256)
+    all_sessions = [
+        *state["planner_sessions"], *state["builder_sessions"], *state["reviewer_sessions"]
+    ]
+    if len(all_sessions) != len(set(all_sessions)):
+        raise GovernanceBlockerError("GOVERNANCE BLOCK: duplicate role session ID")
+    current = [item for item in (state["planner_session"], state["builder_session"], state["reviewer_session"]) if item]
+    if len(current) != len(set(current)):
+        raise GovernanceBlockerError("GOVERNANCE BLOCK: pairwise role session IDs must be distinct")
+    for key, sessions, current_id in (
+        ("planner_session", state["planner_sessions"], state["planner_session"]),
+        ("builder_session", state["builder_sessions"], state["builder_session"]),
+        ("reviewer_session", state["reviewer_sessions"], state["reviewer_session"]),
+    ):
+        if current_id is not None and (not sessions or sessions[-1] != current_id):
+            raise GovernanceBlockerError(f"{key} is not the latest durable session")
+    for key, expected in (("gate_a_history", "GATE_A"), ("gate_b_history", "GATE_B")):
+        _validate_strict_gate_history(state[key], expected)
+    for key in ("gate_a", "gate_b"):
+        if state[key] is not None:
+            _validate_strict_gate(state[key])
+    pending_gate = state["pending_gate"]
+    if pending_gate is not None:
+        _validate_strict_gate(pending_gate)
+        if state["phase"] != "WAITING_HUMAN_" + pending_gate["gate_type"] or pending_gate["revision"] != state["revision"]:
+            raise ArtifactValidationError("Strict pending gate phase/revision mismatch")
+        expected_binding = strict_gate_binding(state, pending_gate["gate_type"])
+        if pending_gate["binding"] != expected_binding:
+            raise GovernanceBlockerError("Strict pending gate authority drift")
+    elif state["phase"].startswith("WAITING_HUMAN_"):
+        raise ArtifactValidationError("Strict waiting phase requires a pending gate")
+    if state["pending_action"] is not None:
+        action = _validate_strict_action(state["pending_action"])
+        if action["revision"] != state["revision"] or action["attempt_index"] != state["attempt_index"]:
+            raise ArtifactValidationError("Strict action revision/attempt mismatch")
+        phase_for_kind = {
+            "PLANNER": "PLANNING", "BUILDER": "BUILDING", "FREEZE": "FREEZING",
+            "VERIFIER": "VERIFYING", "REVIEWER": "REVIEWING",
+        }[action["kind"]]
+        if state["phase"] != phase_for_kind:
+            raise ArtifactValidationError("Strict action phase mismatch")
+    if not isinstance(state["action_history"], list):
+        raise ArtifactValidationError("Invalid strict action history")
+    action_ids: set[str] = set()
+    for action in state["action_history"]:
+        _validate_strict_action(action, completed=True)
+        if action["id"] in action_ids:
+            raise ArtifactValidationError("Duplicate strict action ID")
+        action_ids.add(action["id"])
+    if state["pending_action"] is not None and state["pending_action"]["id"] in action_ids:
+        raise ArtifactValidationError("Active strict action was already completed")
+    for key in ("candidate", "verification", "review"):
+        if key == "candidate":
+            _validate_strict_candidate(state[key])
+        else:
+            _validate_strict_result(state[key], key)
+    if not isinstance(state["evidence_refs"], list):
+        raise ArtifactValidationError("Invalid strict evidence references")
+    for item in state["evidence_refs"]:
+        _strict_ref_or_none(item, "strict evidence reference")
+    _strict_ref_or_none(state["latest_result_ref"], "latest result reference")
+    for key in STRICT_COUNTERS:
+        integer(state[key], key, minimum=0)
+    terminal = state["phase"] in {"COMPLETE", "BLOCKED"}
+    if state["terminal_state"] != (state["phase"] if terminal else None):
+        raise ArtifactValidationError("Strict terminal state mismatch")
+    if terminal:
+        string(state["terminal_reason"], "strict terminal reason", maximum=2048)
+        if state["pending_gate"] is not None or state["pending_action"] is not None:
+            raise ArtifactValidationError("Strict terminal state retains active authority")
+    elif state["terminal_reason"] is not None:
+        raise ArtifactValidationError("Unexpected strict terminal reason")
+    return state
+
+
+def validate_strict_transition(before: dict[str, Any], after: dict[str, Any]) -> None:
+    validate_strict_state(before)
+    validate_strict_state(after)
+    if before["schema_version"] != STRICT_VERSION or after["schema_version"] != STRICT_VERSION:
+        raise GovernanceBlockerError("Strict and legacy controller states cannot be mixed")
+    if before["phase"] in {"COMPLETE", "BLOCKED"}:
+        raise GovernanceBlockerError("Terminal strict controller cannot advance")
+    if after["revision"] != before["revision"] + 1:
+        raise GovernanceBlockerError("Strict controller revision must advance exactly once")
+    immutable = {
+        "schema_version", "controller_id", "task_id", "goal", "baseline", "scope", "approved_scope",
+        "contract_ref", "runtime_ref", "planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref",
+        "repair_policy",
+    }
+    if any(before[key] != after[key] for key in immutable):
+        raise GovernanceBlockerError("Frozen strict controller authority changed")
+    if after["phase"] not in STRICT_PHASES[before["phase"]] | {before["phase"], "BLOCKED"}:
+        raise GovernanceBlockerError("Illegal strict controller transition")
+    for key in STRICT_COUNTERS:
+        if after[key] < before[key]:
+            raise GovernanceBlockerError("Strict controller counter decreased")
+    for key in ("gate_a_history", "gate_b_history", "action_history", "evidence_refs",
+                "planner_sessions", "builder_sessions", "reviewer_sessions"):
+        if after[key][:len(before[key])] != before[key]:
+            raise GovernanceBlockerError("Strict controller history is append-only")
+    if after["attempt_index"] < before["attempt_index"] or after["repair_cycles"] < before["repair_cycles"]:
+        raise GovernanceBlockerError("Strict repair attempt counter decreased")
+    before_action = before["pending_action"]
+    after_action = after["pending_action"]
+    if before_action is None and after_action is not None:
+        if after_action["status"] != "PREPARED" or after["action_history"] != before["action_history"]:
+            raise GovernanceBlockerError("Strict action must be durably PREPARED before STARTED")
+    elif before_action is not None and after_action is not None:
+        if (
+            before_action["id"] != after_action["id"]
+            or before_action["kind"] != after_action["kind"]
+            or before_action["attempt_index"] != after_action["attempt_index"]
+            or before_action["status"] != "PREPARED"
+            or after_action["status"] != "STARTED"
+            or after["action_history"] != before["action_history"]
+        ):
+            raise GovernanceBlockerError("Strict action must advance PREPARED -> STARTED exactly once")
+    elif before_action is not None and after_action is None and after["phase"] != "BLOCKED":
+        completed = after["action_history"][len(before["action_history"]):]
+        if len(completed) != 1 or completed[0]["id"] != before_action["id"] or completed[0]["status"] != "COMPLETED":
+            raise GovernanceBlockerError("Strict action completion is not journaled exactly once")
+    elif before_action is None and after_action is None and after["action_history"] != before["action_history"]:
+        raise GovernanceBlockerError("Strict action history advanced without an active action")
+    required_completed_kind = {
+        "BUILDING": "BUILDER", "FREEZING": "FREEZE", "VERIFYING": "VERIFIER", "REVIEWING": "REVIEWER",
+    }.get(before["phase"])
+    if required_completed_kind is not None and before["phase"] != after["phase"] and after["phase"] != "BLOCKED":
+        if not after["action_history"] or after["action_history"][-1]["kind"] != required_completed_kind:
+            raise GovernanceBlockerError("Strict phase advanced without the required completed action")
+    if before["phase"] == "WAITING_HUMAN_GATE_A" and after["phase"] == "BUILDING":
+        if not after["gate_a_history"] or after["gate_a_history"][-1]["human_response"] != "approve":
+            raise GovernanceBlockerError("Gate A approval required")
+        if after["attempt_index"] != 0 or after["repair_cycles"] != 0:
+            raise GovernanceBlockerError("Initial Gate A approval must start attempt zero")
+    if before["phase"] == "WAITING_HUMAN_GATE_B" and after["phase"] == "COMPLETE":
+        if not after["gate_b_history"] or after["gate_b_history"][-1]["human_response"] != "approve":
+            raise GovernanceBlockerError("Gate B approval required")
+        if after["terminal_reason"] != "INTEGRATION_PREPARED_ONLY":
+            raise GovernanceBlockerError("Strict completion reason is not integration-prepared-only")
+    if before["phase"] == "ASSESSING" and after["phase"] == "BUILDING":
+        if after["attempt_index"] != before["attempt_index"] + 1 or after["repair_cycles"] != before["repair_cycles"] + 1:
+            raise GovernanceBlockerError("Strict repair attempt must advance exactly once")
+    if after["phase"] == "COMPLETE" and (not after["gate_b_history"] or after["review"] is None or after["verification"] is None):
+        raise GovernanceBlockerError("Strict completion lacks Gate B or verified evidence")
+
+
+def validate_strict_event(event: Any, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate one strict journal event, including its hash-chain link."""
+    closed(event, {"schema_version", "kind", "revision", "previous_digest", "state", "digest"}, "strict controller event")
+    if event["schema_version"] != STRICT_VERSION:
+        raise ArtifactValidationError("Unsupported strict controller event version")
+    string(event["kind"], "strict event kind", maximum=256)
+    integer(event["revision"], "strict event revision", minimum=1)
+    validate_strict_state(event["state"])
+    if event["state"]["revision"] != event["revision"]:
+        raise ArtifactValidationError("Strict state/event revision mismatch")
+    expected_previous = previous["digest"] if previous is not None else None
+    if event["previous_digest"] != expected_previous:
+        raise ArtifactValidationError("Strict controller event chain mismatch")
+    if digest({key: value for key, value in event.items() if key != "digest"}) != event["digest"]:
+        raise ArtifactValidationError("Strict controller event digest mismatch")
+    if previous is not None:
+        validate_strict_transition(previous["state"], event["state"])
+    elif event["revision"] != 1 or event["state"]["phase"] != "START":
+        raise ArtifactValidationError("Strict journal must begin at START revision 1")
+    return event
+
+
 @dataclass(frozen=True)
 class PlannerContext:
     """Serialized immutable inputs: adapters never receive mutable controller state."""
@@ -252,6 +701,21 @@ class BuilderRequest:
     contract_json: bytes
     packet_json: bytes
     gate_a_json: bytes
+
+
+@dataclass(frozen=True)
+class StrictExecutionRequest:
+    """Immutable R3C request passed to a role or deterministic executor."""
+
+    action_id: str
+    task_id: str
+    attempt_index: int
+    worktree: str
+    scope: tuple[str, ...]
+    context_json: bytes
+    contract_json: bytes
+    runtime_json: bytes
+    candidate_json: bytes | None = None
 
 
 class ControllerPlannerPort(Protocol):

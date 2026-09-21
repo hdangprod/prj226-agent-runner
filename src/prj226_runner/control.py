@@ -9,18 +9,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
 
 from prj226_runner import controller as C, runner as R
 from prj226_runner.control_protocol import (
     ATTACHMENT_LIMIT, CONTEXT_LIMIT, COUNTERS, DECISIONS, VERSION,
-    BuilderExecutorPort, BuilderRequest, ControllerPlannerPort, PlannerContext,
-    closed, decode, digest, encode, gate_binding, parse_decision, reference, validate_state,
+    STRICT_COUNTERS, STRICT_VERSION, BuilderExecutorPort, BuilderRequest, ControllerPlannerPort,
+    PlannerContext, StrictExecutionRequest, closed, decode, digest, encode, gate_binding,
+    parse_decision, reference, strict_gate_binding, validate_state, validate_strict_state,
 )
 from prj226_runner.control_store import ControlStore, fsync_directory, read_file
 from prj226_runner.codex_reviewer import EvidenceRoot
+from prj226_runner.candidate_authority import build_candidate_authority, verify_candidate_authority
+from prj226_runner.control_runtime import validate_runtime
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError, RunnerError
 
 
@@ -34,6 +40,32 @@ def build_context(state: dict[str, Any], *, attachment: str | None = None,
     source = attachment.encode("utf-8") if attachment is not None else None
     if source is not None and len(source) > ATTACHMENT_LIMIT:
         raise GovernanceBlockerError("Semantic attachment exceeds byte budget; no truncation allowed")
+    if state.get("schema_version") == STRICT_VERSION:
+        keys = (
+            "controller_id", "task_id", "goal", "revision", "phase", "baseline", "scope",
+            "approved_scope", "contract_ref", "runtime_ref", "planner_profile_ref",
+            "builder_profile_ref", "reviewer_profile_ref", "repair_policy", "attempt_index",
+            "repair_cycles", "candidate", "verification", "review",
+        )
+        document = {
+            "schema_version": STRICT_VERSION,
+            "state": {key: state[key] for key in keys},
+            "included_sections": list(keys),
+            "omitted_sections": ["raw_logs", "unrelated_history", "repository_files"],
+            "attachment": None,
+            "byte_count": 0,
+        }
+        if source is not None:
+            document["attachment"] = {"byte_count": len(source), "sha256": hashlib.sha256(source).hexdigest()}
+            document["included_sections"].append("semantic_attachment")
+        else:
+            document["omitted_sections"].append("semantic_attachment")
+        while document["byte_count"] != len(encode(document)):
+            document["byte_count"] = len(encode(document))
+        raw = encode(document)
+        if len(raw) > limit:
+            raise GovernanceBlockerError("Required controller context exceeds byte budget")
+        return PlannerContext(raw, hashlib.sha256(raw).hexdigest(), source)
     keys = ("controller_id", "task_id", "goal", "revision", "phase", "baseline", "scope",
             "planner_profile_ref", "builder_profile_ref", "contract_ref", "packet_ref",
             "candidate", "verification_summary", "latest_decision_ref", *COUNTERS)
@@ -55,6 +87,35 @@ def build_context(state: dict[str, Any], *, attachment: str | None = None,
 
 
 def compact_report(state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("schema_version") == STRICT_VERSION:
+        validate_strict_state(state)
+        gate = state["pending_gate"]
+        report = {
+            "schema_version": STRICT_VERSION,
+            "status": state["terminal_state"] or ("HUMAN_GATE_REQUIRED" if gate else "RUNNING"),
+            "controller_id": state["controller_id"],
+            "task": state["task_id"],
+            "revision": state["revision"],
+            "phase": state["phase"],
+            "question": gate["question"] if gate else None,
+            "gate": {key: gate[key] for key in ("gate_id", "revision", "binding_digest")} if gate else None,
+            "candidate": state["candidate"],
+            "verification": state["verification"],
+            "review": state["review"],
+            "planner_invocations": state["planner_invocations"],
+            "builder_invocations": state["builder_invocations"],
+            "freeze_invocations": state["freeze_invocations"],
+            "verifier_invocations": state["verifier_invocations"],
+            "reviewer_invocations": state["reviewer_invocations"],
+            "repair_cycles": state["repair_cycles"],
+            "attempt_index": state["attempt_index"],
+            "blocker_count": 1 if state["phase"] == "BLOCKED" else 0,
+            "reason": state["terminal_reason"],
+            "canonical_integration_performed": False,
+            "token_usage": None,
+        }
+        report["disposition"] = report["status"]
+        return report
     validate_state(state)
     status = state["terminal_state"] or ("HUMAN_GATE_REQUIRED" if state["pending_gate"] else "RUNNING")
     gate = state["pending_gate"]
@@ -84,14 +145,40 @@ def format_report(report: dict[str, Any]) -> str:
 
 class DurableController:
     def __init__(self, root: Path | str, *, planner: ControllerPlannerPort | None = None,
-                 builder: BuilderExecutorPort | None = None) -> None:
+                 builder: BuilderExecutorPort | None = None, reviewer: Any = None,
+                 verifier: Any = None) -> None:
         self.store = ControlStore(root)
         self.planner, self.builder = planner, builder
+        self.reviewer, self.verifier = reviewer, verifier
 
     @classmethod
-    def start(cls, root: Path | str, *, controller_id: str, goal: str, contract_path: Path | str,
+    def start(cls, root: Path | str, *, controller_id: str, goal: str, contract_path: Path | str | None = None,
               planner_profile_ref: str, builder_profile_ref: str, planner_budget: int = 2,
-              planner: ControllerPlannerPort | None = None, builder: BuilderExecutorPort | None = None) -> "DurableController":
+              planner: ControllerPlannerPort | None = None, builder: BuilderExecutorPort | None = None,
+              strict: bool = False, **strict_options: Any) -> "DurableController":
+        if not strict and set(strict_options) & {
+            "runtime", "runtime_path", "reviewer", "verifier", "max_repair_cycles",
+            "baseline", "repository", "scope", "approved_scope", "packet", "packet_path",
+            "reviewer_profile_ref", "contract",
+        }:
+            strict = True
+        if strict:
+            # The explicit flag is the only bridge from the legacy facade to
+            # the R3C schema; a legacy store is never reinterpreted in place.
+            strict_contract = strict_options.pop("contract", None)
+            return StrictExecutionController.start(
+                root,
+                controller_id=controller_id,
+                goal=goal,
+                **({"contract_path": contract_path} if contract_path is not None else {"contract": strict_contract}),
+                planner_profile_ref=planner_profile_ref,
+                builder_profile_ref=builder_profile_ref,
+                planner=planner,
+                builder=builder,
+                **strict_options,
+            )  # type: ignore[return-value]
+        if contract_path is None:
+            raise ArtifactValidationError("Legacy controller start requires contract_path")
         contract = C._contract_value_v3(decode(read_file(Path(contract_path))))
         instance = cls(root, planner=planner, builder=builder)
         repo = Path(contract["repository_path"]).resolve()
@@ -117,6 +204,27 @@ class DurableController:
             instance.store.artifact("contract.json", contract)
             instance.store.commit(state, "controller_created")
         return instance
+
+    @classmethod
+    def start_strict(cls, *args: Any, **kwargs: Any) -> "StrictExecutionController":
+        return StrictExecutionController.start(*args, **kwargs)
+
+    def _strict_delegate(self) -> Any | None:
+        """Open a strict store through the R3C implementation when requested."""
+        try:
+            if (self.store.root / "state.json").exists():
+                snapshot = decode(read_file(self.store.root / "state.json"))
+                if isinstance(snapshot, dict) and snapshot.get("schema_version") == STRICT_VERSION:
+                    return StrictExecutionController(
+                        self.store.root,
+                        planner=self.planner,
+                        builder=self.builder,
+                        reviewer=self.reviewer,
+                        verifier=self.verifier,
+                    )
+        except FileNotFoundError:
+            return None
+        return None
 
     def _baseline(self, state: dict[str, Any]) -> None:
         baseline = state["baseline"]
@@ -314,12 +422,21 @@ class DurableController:
         return state
 
     def resume(self, *, max_steps: int = 32) -> dict[str, Any]:
+        strict = self._strict_delegate()
+        if strict is not None:
+            return strict.resume(max_steps=max_steps)
         if type(max_steps) is not int or not 1 <= max_steps <= 64:
             raise ArtifactValidationError("Invalid deterministic step budget")
         with self.store.writer():
             state = self.store.load(recover=True)
             for _ in range(max_steps):
-                if state["terminal_state"] or state["pending_gate"]:
+                if state["terminal_state"]:
+                    break
+                if state["pending_gate"]:
+                    try:
+                        self._baseline(state)
+                    except Exception as exc:
+                        state = self._block(self.store.load(), f"{type(exc).__name__}: {str(exc)[:512]}")
                     break
                 try:
                     next_state = self._step(state)
@@ -336,6 +453,9 @@ class DurableController:
             return compact_report(state)
 
     def reply(self, *, gate_id: str, revision: int, binding_digest: str, response: str) -> dict[str, Any]:
+        strict = self._strict_delegate()
+        if strict is not None:
+            return strict.reply(gate_id=gate_id, revision=revision, binding_digest=binding_digest, response=response)
         with self.store.writer():
             state = self.store.load(recover=True)
             gate = state["pending_gate"]
@@ -357,11 +477,17 @@ class DurableController:
             return compact_report(state)
 
     def status(self) -> dict[str, Any]:
+        strict = self._strict_delegate()
+        if strict is not None:
+            return strict.status()
         state = self.store.load()
         self._contract(state)
         return compact_report(state)
 
     def wait(self, *, timeout: float = 30.0, interval: float = 0.1) -> dict[str, Any]:
+        strict = self._strict_delegate()
+        if strict is not None:
+            return strict.wait(timeout=timeout, interval=interval)
         if not 0 <= timeout <= 60 or not 0 < interval <= 1:
             raise ArtifactValidationError("Wait requires timeout 0..60 seconds and interval 0..1")
         deadline = time.monotonic() + timeout
@@ -419,3 +545,1099 @@ def run_cli(args: Any) -> int:
         error_class = exc.error_class.value if isinstance(exc, RunnerError) else "ENVIRONMENT_ERROR"
         print(json.dumps({"status":"BLOCKED", "error_class":error_class, "reason":str(exc)}))
         return 20
+
+
+# ---------------------------------------------------------------------------
+# R3C strict execution lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _strict_jsonable(value: Any) -> Any:
+    """Convert provider-facing values to bounded JSON without trusting repr()."""
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _strict_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_jsonable(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return _strict_jsonable(vars(value))
+    raise ArtifactValidationError("Strict action result is not JSON serializable")
+
+
+def _strict_read_json(path: Path) -> Any:
+    return decode(read_file(path))
+
+
+def _strict_git(repository: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+    except OSError as exc:
+        raise GovernanceBlockerError(f"Git unavailable: {exc}") from exc
+    if result.returncode != 0:
+        raise GovernanceBlockerError(
+            f"Git command failed: {' '.join(args)}: {(result.stderr or result.stdout).strip()}"
+        )
+    return result.stdout.strip()
+
+
+def _strict_changed_paths(worktree: Path, baseline_head: str) -> list[str]:
+    tracked = _strict_git(worktree, "diff", "--name-only", baseline_head).splitlines()
+    untracked = _strict_git(worktree, "ls-files", "--others", "--exclude-standard").splitlines()
+    return sorted(set(path for path in (*tracked, *untracked) if path))
+
+
+def _strict_load_value(value: Any, label: str) -> dict[str, Any]:
+    if isinstance(value, (str, Path)):
+        loaded = decode(read_file(Path(value)))
+    else:
+        loaded = value
+    if not isinstance(loaded, dict):
+        raise ArtifactValidationError(f"{label} must be a JSON object")
+    return _strict_jsonable(loaded)
+
+
+class StrictExecutionController:
+    """Durable R3C controller with explicit at-most-once action claims.
+
+    The class is intentionally independent of the legacy ``DurableController``.
+    A strict run is selected by this class (or one of its compatibility aliases)
+    and therefore cannot silently reinterpret an existing CTRL-R001 store.
+    """
+
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        planner: Any = None,
+        builder: Any = None,
+        verifier: Any = None,
+        reviewer: Any = None,
+    ) -> None:
+        self.store = ControlStore(root)
+        self.planner = planner
+        self.builder = builder
+        self.verifier = verifier
+        self.reviewer = reviewer
+        self._contract_data: dict[str, Any] | None = None
+        self._runtime_data: dict[str, Any] | None = None
+        self._packet_data: dict[str, Any] | None = None
+
+    @classmethod
+    def start(
+        cls,
+        root: Path | str,
+        *,
+        controller_id: str,
+        goal: str,
+        contract: Mapping[str, Any] | Path | str | None = None,
+        contract_path: Path | str | None = None,
+        runtime: Mapping[str, Any] | Path | str | None = None,
+        runtime_path: Path | str | None = None,
+        packet: Mapping[str, Any] | Path | str | None = None,
+        packet_path: Path | str | None = None,
+        baseline: Mapping[str, Any] | None = None,
+        repository: Path | str | None = None,
+        task_id: str | None = None,
+        scope: Sequence[str] | None = None,
+        approved_scope: Sequence[str] | None = None,
+        planner_profile_ref: str | None = None,
+        builder_profile_ref: str | None = None,
+        reviewer_profile_ref: str | None = None,
+        max_repair_cycles: int = 2,
+        planner: Any = None,
+        builder: Any = None,
+        verifier: Any = None,
+        reviewer: Any = None,
+    ) -> "StrictExecutionController":
+        instance = cls(root, planner=planner, builder=builder, verifier=verifier, reviewer=reviewer)
+        if contract is not None and contract_path is not None:
+            raise ArtifactValidationError("Provide either contract or contract_path, not both")
+        if runtime is not None and runtime_path is not None:
+            raise ArtifactValidationError("Provide either runtime or runtime_path, not both")
+        if packet is not None and packet_path is not None:
+            raise ArtifactValidationError("Provide either packet or packet_path, not both")
+        contract_data = _strict_load_value(contract_path or contract, "strict contract") if (contract_path or contract) is not None else {}
+        runtime_data = _strict_load_value(runtime_path or runtime, "strict runtime") if (runtime_path or runtime) is not None else {}
+        packet_data = _strict_load_value(packet_path or packet, "strict packet") if (packet_path or packet) is not None else None
+
+        # A qualified runtime bundle is validated structurally without probing
+        # provider executables during state creation.  R3B performs the live
+        # executable and session checks at invocation time.
+        if runtime_data.get("schema_version") == "PRJ226.CONTROL_RUNTIME.v1":
+            runtime_data = validate_runtime(runtime_data, verify_executables=False)
+        roles = runtime_data.get("roles") if isinstance(runtime_data.get("roles"), dict) else {}
+
+        def role_ref(role: str, explicit: str | None) -> str:
+            if explicit is not None:
+                if not isinstance(explicit, str) or not explicit.strip():
+                    raise ArtifactValidationError(f"Invalid {role} profile reference")
+                configured = roles.get(role, {}) if isinstance(roles, dict) else {}
+                configured_ref = configured.get("profile_ref") if isinstance(configured, dict) else None
+                if configured_ref is not None and configured_ref != explicit:
+                    raise GovernanceBlockerError(f"{role} profile substitution forbidden")
+                return explicit
+            value = roles.get(role, {}) if isinstance(roles, dict) else {}
+            candidate = value.get("profile_ref") if isinstance(value, dict) else None
+            return candidate if isinstance(candidate, str) and candidate else f"strict-{role}-profile"
+
+        planner_profile_ref = role_ref("planner", planner_profile_ref)
+        builder_profile_ref = role_ref("builder", builder_profile_ref)
+        reviewer_profile_ref = role_ref("reviewer", reviewer_profile_ref)
+        if type(max_repair_cycles) is not int or not 0 <= max_repair_cycles <= 2:
+            raise ArtifactValidationError("max_repair_cycles must be an integer from 0 through 2")
+
+        repository_value = repository
+        if repository_value is None:
+            repository_value = contract_data.get("repository_path") or contract_data.get("repository")
+        baseline_data = dict(baseline or {})
+        if repository_value is not None:
+            baseline_data.setdefault("repository", str(Path(repository_value).resolve()))
+        for target, source in (("branch", "canonical_branch"), ("head", "baseline_head"), ("tree", "baseline_tree")):
+            if target not in baseline_data and source in contract_data:
+                baseline_data[target] = contract_data[source]
+        required_baseline = {"repository", "branch", "head", "tree"}
+        if set(baseline_data) != required_baseline:
+            raise ArtifactValidationError("Strict controller requires an exact canonical baseline")
+        baseline_data["repository"] = str(Path(baseline_data["repository"]).resolve())
+        baseline_data["head"] = str(baseline_data["head"]).lower()
+        baseline_data["tree"] = str(baseline_data["tree"]).lower()
+        repository_path = Path(baseline_data["repository"])
+        scope_values = list(approved_scope if approved_scope is not None else (scope if scope is not None else contract_data.get("owned_paths", contract_data.get("scope", []))))
+        if not scope_values:
+            raise ArtifactValidationError("Strict controller requires a non-empty approved scope")
+        if task_id is None:
+            task_id = contract_data.get("work_item_id") or contract_data.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ArtifactValidationError("Strict controller requires task_id")
+        if instance.store.root == repository_path or repository_path in instance.store.root.parents:
+            raise GovernanceBlockerError("Strict controller evidence must be outside the canonical repository")
+        instance._assert_baseline_values(baseline_data)
+
+        if not contract_data:
+            contract_data = {
+                "contract_version": "PRJ226.R3C.CONTRACT.v1",
+                "controller_id": controller_id,
+                "task_id": task_id,
+                "goal": goal,
+                "repository_path": baseline_data["repository"],
+                "canonical_branch": baseline_data["branch"],
+                "baseline_head": baseline_data["head"],
+                "baseline_tree": baseline_data["tree"],
+                "owned_paths": scope_values,
+            }
+        if packet_data is not None:
+            packet_scope = packet_data.get("authorized_paths")
+            if packet_scope is not None and list(packet_scope) != scope_values:
+                raise GovernanceBlockerError("Strict packet widens or changes Gate A scope")
+
+        root_path = instance.store.root
+        root_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_path.mkdir(mode=0o700, exist_ok=False)
+        fsync_directory(root_path.parent)
+        with instance.store.writer():
+            contract_ref = instance.store.artifact("contract.json", contract_data)
+            runtime_ref = instance.store.artifact("runtime.json", runtime_data or {"schema_version": "PRJ226.CONTROL_RUNTIME.v1", "roles": {}})
+            packet_ref = instance.store.artifact("packet.json", packet_data) if packet_data is not None else None
+            state: dict[str, Any] = {
+                "schema_version": STRICT_VERSION,
+                "controller_id": controller_id,
+                "task_id": task_id,
+                "goal": goal,
+                "revision": 1,
+                "baseline": baseline_data,
+                "scope": list(scope_values),
+                "approved_scope": list(scope_values),
+                "contract_ref": contract_ref,
+                "runtime_ref": runtime_ref,
+                "packet_ref": packet_ref,
+                "planner_profile_ref": planner_profile_ref,
+                "builder_profile_ref": builder_profile_ref,
+                "reviewer_profile_ref": reviewer_profile_ref,
+                "repair_policy": {"max_repair_cycles": max_repair_cycles},
+                "phase": "START",
+                "attempt_index": 0,
+                "repair_cycles": 0,
+                "planner_session": None,
+                "builder_session": None,
+                "reviewer_session": None,
+                "planner_sessions": [],
+                "builder_sessions": [],
+                "reviewer_sessions": [],
+                "gate_a": None,
+                "gate_b": None,
+                "gate_a_history": [],
+                "gate_b_history": [],
+                "pending_gate": None,
+                "pending_action": None,
+                "action_history": [],
+                "candidate": None,
+                "verification": None,
+                "review": None,
+                "evidence_refs": [],
+                "latest_result_ref": None,
+                **{key: 0 for key in STRICT_COUNTERS},
+                "terminal_state": None,
+                "terminal_reason": None,
+            }
+            validate_strict_state(state)
+            instance.store.commit(state, "strict_controller_created")
+        instance._contract_data = contract_data
+        instance._runtime_data = runtime_data
+        instance._packet_data = packet_data
+        return instance
+
+    def _inputs(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+        contract = self.store.read_artifact(state["contract_ref"])
+        runtime = self.store.read_artifact(state["runtime_ref"])
+        packet = self.store.read_artifact(state["packet_ref"]) if state["packet_ref"] is not None else None
+        if not isinstance(contract, dict) or not isinstance(runtime, dict) or (packet is not None and not isinstance(packet, dict)):
+            raise ArtifactValidationError("Strict controller inputs are not JSON objects")
+        self._contract_data, self._runtime_data, self._packet_data = contract, runtime, packet
+        return contract, runtime, packet
+
+    @staticmethod
+    def _assert_baseline_values(baseline: Mapping[str, Any]) -> None:
+        repository = Path(str(baseline["repository"]))
+        observed = (
+            _strict_git(repository, "branch", "--show-current"),
+            _strict_git(repository, "rev-parse", "HEAD").lower(),
+            _strict_git(repository, "rev-parse", "HEAD^{tree}").lower(),
+            _strict_git(repository, "status", "--porcelain=v1", "--untracked-files=all"),
+        )
+        expected = (baseline["branch"], str(baseline["head"]).lower(), str(baseline["tree"]).lower(), "")
+        if observed != expected:
+            raise GovernanceBlockerError("Canonical baseline drift")
+
+    def _baseline(self, state: dict[str, Any]) -> None:
+        self._assert_baseline_values(state["baseline"])
+
+    def _save(self, state: dict[str, Any], kind: str, **changes: Any) -> dict[str, Any]:
+        return self.store.commit({**state, **changes, "revision": state["revision"] + 1}, kind)
+
+    def _block(self, state: dict[str, Any], reason: str) -> dict[str, Any]:
+        if state["phase"] == "BLOCKED":
+            return state
+        return self._save(
+            state,
+            "strict_controller_blocked",
+            phase="BLOCKED",
+            terminal_state="BLOCKED",
+            terminal_reason=reason[:2048],
+            pending_gate=None,
+            pending_action=None,
+        )
+
+    def _action_claim(self, state: dict[str, Any], kind: str) -> dict[str, Any]:
+        if kind not in {"PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"}:
+            raise ArtifactValidationError("Invalid strict action kind")
+        action = {
+            "id": f"action-{state['revision'] + 1}",
+            "kind": kind,
+            "status": "PREPARED",
+            "attempt_index": state["attempt_index"],
+            "revision": state["revision"] + 1,
+        }
+        return self._save(state, "strict_action_prepared", pending_action=action)
+
+    def _mark_started(self, state: dict[str, Any]) -> dict[str, Any]:
+        action = state["pending_action"]
+        if action is None or action["status"] != "PREPARED":
+            raise GovernanceBlockerError("Strict action is not PREPARED")
+        counter_key = {
+            "PLANNER": "planner_invocations",
+            "BUILDER": "builder_invocations",
+            "FREEZE": "freeze_invocations",
+            "VERIFIER": "verifier_invocations",
+            "REVIEWER": "reviewer_invocations",
+        }[action["kind"]]
+        started = {**action, "status": "STARTED", "revision": state["revision"] + 1}
+        return self._save(
+            state,
+            "strict_action_started",
+            pending_action=started,
+            **{counter_key: state[counter_key] + 1},
+        )
+
+    def _result_path(self, action_id: str) -> Path:
+        return self.store.root / f"{action_id}.result.json"
+
+    def _persist_result(self, action: dict[str, Any], outcome: Mapping[str, Any]) -> dict[str, str]:
+        value = {
+            "schema_version": STRICT_VERSION,
+            "action_id": action["id"],
+            "kind": action["kind"],
+            "attempt_index": action["attempt_index"],
+            "status": "COMPLETED",
+            "outcome": _strict_jsonable(dict(outcome)),
+        }
+        return self.store.artifact(f"{action['id']}.result.json", value)
+
+    def _load_result(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+        action = state["pending_action"]
+        if action is None:
+            raise GovernanceBlockerError("No strict action is pending")
+        path = self._result_path(action["id"])
+        raw = read_file(path)
+        value = decode(raw)
+        if not isinstance(value, dict) or set(value) != {"schema_version", "action_id", "kind", "attempt_index", "status", "outcome"}:
+            raise ArtifactValidationError("Strict action result has an invalid closed envelope")
+        if value["schema_version"] != STRICT_VERSION or value["action_id"] != action["id"] or value["kind"] != action["kind"] or value["attempt_index"] != action["attempt_index"] or value["status"] != "COMPLETED":
+            raise ArtifactValidationError("Strict action result identity mismatch")
+        if not isinstance(value["outcome"], dict):
+            raise ArtifactValidationError("Strict action result outcome is not an object")
+        return value["outcome"], {"path": path.name, "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def _record_session(self, state: dict[str, Any], kind: str, session_id: str | None) -> dict[str, Any]:
+        if session_id is None or kind not in {"PLANNER", "BUILDER", "REVIEWER"}:
+            return {}
+        if not isinstance(session_id, str) or not session_id:
+            raise GovernanceBlockerError("GOVERNANCE BLOCK: missing role session ID")
+        all_sessions = state["planner_sessions"] + state["builder_sessions"] + state["reviewer_sessions"]
+        if session_id in all_sessions:
+            raise GovernanceBlockerError("GOVERNANCE BLOCK: reused or duplicate session ID")
+        mapping = {
+            "PLANNER": ("planner_sessions", "planner_session"),
+            "BUILDER": ("builder_sessions", "builder_session"),
+            "REVIEWER": ("reviewer_sessions", "reviewer_session"),
+        }
+        list_key, current_key = mapping[kind]
+        return {list_key: state[list_key] + [session_id], current_key: session_id}
+
+    def _profile(self, runtime: Mapping[str, Any], role: str) -> dict[str, Any]:
+        roles = runtime.get("roles")
+        profile = roles.get(role) if isinstance(roles, Mapping) else None
+        if isinstance(profile, Mapping):
+            return dict(profile)
+        return {"profile_ref": "", "model": "gpt-6-astra" if role == "reviewer" else ""}
+
+    def _context_bytes(self, state: dict[str, Any], action: dict[str, Any], *, candidate: dict[str, Any] | None = None) -> bytes:
+        contract, runtime, packet = self._inputs(state)
+        context = {
+            "schema_version": STRICT_VERSION,
+            "controller_id": state["controller_id"],
+            "task_id": state["task_id"],
+            "goal": state["goal"],
+            "phase": state["phase"],
+            "attempt_index": state["attempt_index"],
+            "approved_scope": state["approved_scope"],
+            "baseline": state["baseline"],
+            "contract": contract,
+            "packet": packet,
+            "candidate": candidate,
+            "action_id": action["id"],
+        }
+        return encode(context)
+
+    def _call_role(self, role: str, adapter: Any, request: StrictExecutionRequest, context: bytes, cwd: Path) -> Any:
+        if adapter is None:
+            raise GovernanceBlockerError(f"No {role} adapter is configured")
+        runtime = self._runtime_data or {}
+        profile = self._profile(runtime, role)
+        adapter_profile = getattr(adapter, "profile_ref", None)
+        configured_profile = profile.get("profile_ref")
+        if adapter_profile is not None and configured_profile and adapter_profile != configured_profile:
+            raise GovernanceBlockerError(f"{role} adapter profile substitution forbidden")
+        evidence_dir = self.store.root / "invocations" / request.action_id / role
+        evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        execute_role = getattr(adapter, "execute_role", None)
+        if callable(execute_role):
+            return execute_role(
+                role_name=role,
+                profile=profile,
+                task_id=request.task_id,
+                context_bytes=context,
+                cwd=cwd,
+                evidence_dir=evidence_dir,
+            )
+        if role == "planner" and callable(getattr(adapter, "decide", None)):
+            return adapter.decide(PlannerContext(context, hashlib.sha256(context).hexdigest()))
+        if callable(getattr(adapter, "execute", None)):
+            return adapter.execute(request)
+        if callable(getattr(adapter, "invoke", None)):
+            return adapter.invoke(request)
+        if callable(adapter):
+            return adapter(request)
+        raise GovernanceBlockerError(f"Configured {role} adapter is not callable")
+
+    @staticmethod
+    def _supervision_value(receipt: Any, record: Mapping[str, Any]) -> dict[str, Any] | None:
+        evidence = getattr(receipt, "supervision_evidence", None)
+        if evidence is None and isinstance(record.get("supervision"), Mapping):
+            return dict(record["supervision"])
+        if evidence is None:
+            return None
+        return {
+            "exit_code": getattr(evidence, "returncode", getattr(evidence, "exit_code", None)),
+            "quiescent": getattr(evidence, "final_group_quiescent", getattr(evidence, "quiescent", False)),
+            "timeout_event": getattr(evidence, "timeout_event", False),
+            "term_event": getattr(evidence, "term_event", False),
+            "kill_event": getattr(evidence, "kill_event", False),
+            "output_flood": False,
+        }
+
+    def _normalize_receipt(self, raw: Any, role: str) -> dict[str, Any]:
+        if isinstance(raw, str):
+            if role == "planner":
+                return {"ok": True, "raw_output": raw, "session_id": None, "provider_receipt": False}
+            raise ArtifactValidationError(f"{role} result must be an InvocationReceipt with semantic evidence")
+        if isinstance(raw, Mapping):
+            value = dict(raw)
+            nested = value.get("receipt")
+            if nested is not None and isinstance(nested, Mapping):
+                value = dict(nested)
+        else:
+            value = {}
+        session_id = getattr(raw, "session_id", value.get("session_id"))
+        observed_role = getattr(raw, "role", value.get("role"))
+        if observed_role is not None and str(observed_role).upper() != role.upper():
+            raise GovernanceBlockerError("Invocation receipt role identity mismatch")
+        disposition = getattr(raw, "disposition", value.get("disposition", "SUCCESS"))
+        exit_code = getattr(raw, "exit_code", value.get("exit_code", 0))
+        record = getattr(raw, "record", value.get("record", {}))
+        if not isinstance(record, Mapping):
+            record = {}
+        record = _strict_jsonable(dict(record))
+        supervision = self._supervision_value(raw, record)
+        if supervision is None and isinstance(value.get("supervision"), Mapping):
+            supervision = dict(value["supervision"])
+        attestation = getattr(raw, "attestation_result", None)
+        attested = getattr(attestation, "attestation_passed", value.get("attestation_passed", record.get("attestation", {}).get("attestation_passed") if isinstance(record.get("attestation"), Mapping) else None))
+        semantic = getattr(raw, "semantic_result", value.get("semantic_result", record.get("semantic_result")))
+        semantic = _strict_jsonable(semantic) if semantic is not None else None
+        provider_receipt = (
+            hasattr(raw, "invocation_id")
+            or "semantic_result" in value
+            or "session_id" in value
+            or "supervision" in value
+            or "attestation_passed" in value
+            or bool(record)
+        )
+        ok = str(disposition).upper() in {"SUCCESS", "COMPLETED"} and int(exit_code) == 0
+        failure_reason: str | None = None
+        if provider_receipt:
+            if session_id is None:
+                ok = False
+                failure_reason = "SESSION_ATTESTATION_MISMATCH"
+            quiescent = supervision.get("quiescent") if isinstance(supervision, Mapping) else None
+            if quiescent is None and isinstance(supervision, Mapping):
+                quiescent = supervision.get("final_group_quiescent")
+            if supervision is None or quiescent is not True:
+                ok = False
+                failure_reason = "NON_QUIESCENT_PROCESS_GROUP"
+            if isinstance(supervision, Mapping) and any(
+                supervision.get(key) is True for key in ("timeout_event", "kill_event", "output_flood")
+            ):
+                ok = False
+                if supervision.get("output_flood") is True:
+                    failure_reason = "OUTPUT_FLOOD"
+                elif supervision.get("timeout_event") is True:
+                    failure_reason = "TIMEOUT"
+                elif supervision.get("kill_event") is True:
+                    failure_reason = "KILL"
+            if attested is not True:
+                ok = False
+                failure_reason = "ATTESTATION_MISMATCH"
+            if int(exit_code) != 0:
+                failure_reason = failure_reason or "PROVIDER_EXIT_NONZERO"
+        return {
+            "ok": ok,
+            "session_id": session_id,
+            "exit_code": exit_code,
+            "disposition": disposition,
+            "supervision": _strict_jsonable(supervision),
+            "attestation_passed": bool(attested) if attested is not None else None,
+            "semantic_result": semantic,
+            "record": record,
+            "provider_receipt": provider_receipt,
+            "evidence_digest": getattr(raw, "evidence_digest", value.get("evidence_digest")),
+            "failure_reason": failure_reason,
+        }
+
+    def _builder_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        repository = Path(state["baseline"]["repository"])
+        attempt_dir = self.store.root / f"attempt-{action['attempt_index']}"
+        worktree = attempt_dir / "builder-worktree"
+        run_suffix = hashlib.sha256(str(self.store.root).encode("utf-8")).hexdigest()[:10]
+        branch = f"prj226-{state['controller_id'].lower()}-{run_suffix}-attempt-{action['attempt_index']}"
+        if worktree.exists():
+            raise GovernanceBlockerError("Planned builder worktree already exists")
+        attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _strict_git(repository, "worktree", "add", "-b", branch, str(worktree), state["baseline"]["head"])
+        context = self._context_bytes(state, action)
+        request = StrictExecutionRequest(
+            action_id=action["id"], task_id=state["task_id"], attempt_index=action["attempt_index"],
+            worktree=str(worktree), scope=tuple(state["scope"]), context_json=context,
+            contract_json=encode(self._contract_data or {}), runtime_json=encode(self._runtime_data or {}),
+        )
+        receipt = self._normalize_receipt(self._call_role("builder", self.builder, request, context, worktree), "builder")
+        # A builder is confined to its candidate worktree; re-check the
+        # canonical repository before accepting any builder evidence.
+        self._baseline(state)
+        if not receipt["ok"]:
+            raise GovernanceBlockerError(receipt.get("failure_reason") or "BUILDER_INVOCATION_FAILED")
+        if _strict_git(worktree, "rev-parse", "HEAD").lower() != state["baseline"]["head"].lower():
+            raise GovernanceBlockerError("BUILDER_COMMIT_DETECTED")
+        changed = _strict_changed_paths(worktree, state["baseline"]["head"])
+        unauthorized = sorted(set(changed) - set(state["scope"]))
+        if unauthorized:
+            raise GovernanceBlockerError(f"SCOPE_BREACH: builder changed unauthorized paths {unauthorized}")
+        if not changed:
+            raise GovernanceBlockerError("BUILDER_PRODUCED_NO_CHANGES")
+        diff_check = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--check"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, shell=False, check=False,
+        )
+        if diff_check.returncode != 0:
+            raise GovernanceBlockerError("BUILDER_DIFF_CHECK_FAILED")
+        return {
+            "ok": True,
+            "session_id": receipt["session_id"],
+            "receipt": receipt,
+            "worktree": str(worktree),
+            "branch": branch,
+            "changed_paths": changed,
+        }
+
+    def _last_outcome(self, state: dict[str, Any], kind: str, attempt: int | None = None) -> dict[str, Any]:
+        for item in reversed(state["action_history"]):
+            if item["kind"] == kind and (attempt is None or item["attempt_index"] == attempt):
+                value = self.store.read_artifact(item["result_ref"])
+                if not isinstance(value, dict) or not isinstance(value.get("outcome"), dict):
+                    raise ArtifactValidationError("Strict action history result is malformed")
+                return value["outcome"]
+        raise GovernanceBlockerError(f"Missing completed strict {kind} action")
+
+    def _freeze_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        builder = self._last_outcome(state, "BUILDER", action["attempt_index"])
+        if builder.get("ok") is not True:
+            raise GovernanceBlockerError("Cannot freeze an unsuccessful builder action")
+        worktree = Path(str(builder["worktree"]))
+        branch = str(builder["branch"])
+        changed = list(builder["changed_paths"])
+        self._baseline(state)
+        if _strict_git(worktree, "rev-parse", "HEAD").lower() != state["baseline"]["head"].lower():
+            raise GovernanceBlockerError("BUILDER_COMMIT_DETECTED")
+        if sorted(set(_strict_changed_paths(worktree, state["baseline"]["head"]))) != sorted(changed):
+            raise GovernanceBlockerError("SCOPE_BREACH: changed paths changed before freeze")
+        if set(changed) - set(state["scope"]):
+            raise GovernanceBlockerError("SCOPE_BREACH: freeze path set is outside approved scope")
+        check = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--check"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, shell=False, check=False,
+        )
+        if check.returncode != 0:
+            raise GovernanceBlockerError("git diff --check failed before freeze")
+        for path in changed:
+            _strict_git(worktree, "add", "--", path)
+        staged = _strict_git(worktree, "diff", "--cached", "--name-only", state["baseline"]["head"]).splitlines()
+        if sorted(staged) != sorted(changed):
+            raise GovernanceBlockerError("Freeze staging did not exactly match approved scope")
+        contract = self._contract_data or {}
+        message = contract.get("commit_message") or f"candidate: {state['task_id']} attempt {action['attempt_index']}"
+        if not isinstance(message, str) or not message.strip():
+            raise ArtifactValidationError("Strict candidate commit message is invalid")
+        _strict_git(worktree, "commit", "-m", message)
+        head = _strict_git(worktree, "rev-parse", "HEAD").lower()
+        tree = _strict_git(worktree, "rev-parse", "HEAD^{tree}").lower()
+        parents = _strict_git(worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()
+        if len(parents) != 2 or parents[1].lower() != state["baseline"]["head"].lower():
+            raise GovernanceBlockerError("Candidate topology does not have the canonical baseline as its sole parent")
+        authority = build_candidate_authority(
+            worktree,
+            head,
+            branch,
+            state["baseline"]["head"],
+            changed,
+            transient_paths=(contract.get("transient_paths") or []),
+        )
+        authority_ref = self.store.artifact(f"candidate-authority-{action['attempt_index']}.json", authority)
+        verify_candidate_authority(worktree, authority, expected_ref=branch)
+        return {
+            "ok": True,
+            "candidate": {
+                "head": head,
+                "tree": tree,
+                "ref": branch,
+                "authority_ref": authority_ref,
+                "worktree": str(worktree),
+                "attempt_index": action["attempt_index"],
+                "changed_paths": changed,
+            },
+        }
+
+    def _candidate_authority(self, state: dict[str, Any]) -> tuple[dict[str, Any], Path]:
+        candidate = state["candidate"]
+        if candidate is None:
+            raise GovernanceBlockerError("No frozen candidate is available")
+        worktree = Path(candidate["worktree"])
+        authority = self.store.read_artifact(candidate["authority_ref"])
+        if not isinstance(authority, dict):
+            raise ArtifactValidationError("Candidate authority is not an object")
+        verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
+        return authority, worktree
+
+    def _test_commands(self) -> list[list[str]]:
+        packet = self._packet_data or {}
+        contract = self._contract_data or {}
+        commands = packet.get("test_commands", contract.get("acceptance_instruments", []))
+        if not isinstance(commands, list):
+            raise ArtifactValidationError("Approved verifier commands are malformed")
+        result: list[list[str]] = []
+        for command in commands:
+            if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
+                raise ArtifactValidationError("Approved verifier commands must be argv arrays")
+            result.append(list(command))
+        return result
+
+    def _verifier_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        authority, worktree = self._candidate_authority(state)
+        self._baseline(state)
+        candidate = state["candidate"]
+        context = self._context_bytes(state, action, candidate=candidate)
+        request = StrictExecutionRequest(
+            action_id=action["id"], task_id=state["task_id"], attempt_index=action["attempt_index"],
+            worktree=str(worktree), scope=tuple(state["scope"]), context_json=context,
+            contract_json=encode(self._contract_data or {}), runtime_json=encode(self._runtime_data or {}),
+            candidate_json=encode(candidate),
+        )
+        if self.verifier is not None:
+            raw = self.verifier.execute(request) if callable(getattr(self.verifier, "execute", None)) else self.verifier(request) if callable(self.verifier) else None
+            if not isinstance(raw, Mapping):
+                raise ArtifactValidationError("Verifier result must be a JSON object")
+            result = _strict_jsonable(dict(raw))
+            status = result.get("status", result.get("verdict"))
+            if status not in {"PASS", "FAIL", "BLOCKED"}:
+                raise ArtifactValidationError("Verifier result must be PASS, FAIL, or BLOCKED")
+            result["status"] = status
+            if status == "FAIL":
+                result.setdefault("eligible_repair", True)
+            result["ok"] = status != "BLOCKED"
+            verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
+            return result
+        tests = self._test_commands()
+        results: list[dict[str, Any]] = []
+        for index, argv in enumerate(tests, 1):
+            try:
+                completed = subprocess.run(
+                    argv, cwd=worktree, stdin=subprocess.DEVNULL, capture_output=True,
+                    text=True, timeout=300, shell=False, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
+            except OSError as exc:
+                return {"ok": False, "status": "BLOCKED", "reason": "VERIFIER_ENVIRONMENT_ERROR", "eligible_repair": False, "tests": results}
+            item = {"index": index, "argv": argv, "exit_code": completed.returncode}
+            results.append(item)
+            verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
+            if completed.returncode != 0:
+                return {
+                    "ok": False, "status": "FAIL", "reason": "DETERMINISTIC_TEST_FAILURE",
+                    "eligible_repair": True, "tests": results,
+                }
+        check = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--check", f"{state['baseline']['head']}..{candidate['head']}"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, shell=False, check=False,
+        )
+        if check.returncode != 0:
+            return {"ok": False, "status": "FAIL", "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "eligible_repair": True, "tests": results}
+        self._baseline(state)
+        verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
+        return {"ok": True, "status": "PASS", "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "eligible_repair": False, "tests": results}
+
+    def _review_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        authority, worktree = self._candidate_authority(state)
+        self._baseline(state)
+        profile = self._profile(self._runtime_data or {}, "reviewer")
+        if profile.get("model") and profile.get("model") != "gpt-6-astra":
+            raise GovernanceBlockerError("Reviewer must use the fresh gpt-6-astra profile")
+        context = self._context_bytes(state, action, candidate=state["candidate"])
+        request = StrictExecutionRequest(
+            action_id=action["id"], task_id=state["task_id"], attempt_index=action["attempt_index"],
+            worktree=str(worktree), scope=tuple(state["scope"]), context_json=context,
+            contract_json=encode(self._contract_data or {}), runtime_json=encode(self._runtime_data or {}),
+            candidate_json=encode(state["candidate"]),
+        )
+        raw = self._call_role("reviewer", self.reviewer, request, context, worktree)
+        receipt = self._normalize_receipt(raw, "reviewer")
+        if not receipt["ok"]:
+            raise GovernanceBlockerError(receipt.get("failure_reason") or "REVIEWER_INVOCATION_FAILED")
+        semantic = receipt.get("semantic_result")
+        if not isinstance(semantic, Mapping) or semantic.get("kind") != "TEXT" or not isinstance(semantic.get("text"), str):
+            raise ArtifactValidationError("Reviewer semantic result is missing or not InvocationReceipt-owned")
+        text_value = semantic["text"]
+        if len(text_value.encode("utf-8")) > 64 * 1024:
+            raise ArtifactValidationError("Reviewer semantic result exceeds 64 KiB")
+        if semantic.get("sha256") != hashlib.sha256(text_value.encode("utf-8")).hexdigest():
+            raise ArtifactValidationError("Reviewer semantic result digest mismatch")
+        parsed = decode(text_value, limit=64 * 1024)
+        if not isinstance(parsed, dict):
+            raise ArtifactValidationError("Reviewer semantic result must be a JSON object")
+        verdict = parsed.get("verdict", parsed.get("result", parsed.get("disposition")))
+        if verdict not in {"PASS", "NEEDS_FIX"}:
+            raise ArtifactValidationError("Reviewer must return PASS or NEEDS_FIX")
+        verify_candidate_authority(worktree, authority, expected_ref=state["candidate"]["ref"])
+        self._baseline(state)
+        return {
+            "ok": True,
+            "status": verdict,
+            "verdict": verdict,
+            "findings": parsed.get("findings", []),
+            "session_id": receipt["session_id"],
+            "receipt": receipt,
+            "semantic_result": semantic,
+        }
+
+    def _planner_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        context = self._context_bytes(state, action)
+        request = StrictExecutionRequest(
+            action_id=action["id"], task_id=state["task_id"], attempt_index=action["attempt_index"],
+            worktree=state["baseline"]["repository"], scope=tuple(state["scope"]), context_json=context,
+            contract_json=encode(self._contract_data or {}), runtime_json=encode(self._runtime_data or {}),
+        )
+        raw = self._call_role("planner", self.planner, request, context, Path(state["baseline"]["repository"]))
+        receipt = self._normalize_receipt(raw, "planner")
+        if not receipt["ok"]:
+            raise GovernanceBlockerError("PLANNER_INVOCATION_FAILED")
+        return {"ok": True, "session_id": receipt.get("session_id"), "receipt": receipt}
+
+    def _dispatch(self, state: dict[str, Any]) -> dict[str, Any]:
+        action = state["pending_action"]
+        if action is None:
+            raise GovernanceBlockerError("No strict action is pending")
+        if action["status"] == "PREPARED":
+            state = self._mark_started(state)
+            action = state["pending_action"]
+        if action["status"] != "STARTED":
+            raise GovernanceBlockerError("Strict action is not STARTED")
+        kind = action["kind"]
+        try:
+            if kind == "PLANNER":
+                outcome = self._planner_operation(state, action)
+            elif kind == "BUILDER":
+                outcome = self._builder_operation(state, action)
+            elif kind == "FREEZE":
+                outcome = self._freeze_operation(state, action)
+            elif kind == "VERIFIER":
+                outcome = self._verifier_operation(state, action)
+            elif kind == "REVIEWER":
+                outcome = self._review_operation(state, action)
+            else:  # pragma: no cover - state validation closes this branch
+                raise GovernanceBlockerError("Unknown strict action")
+        except Exception as exc:
+            # Ordinary provider/deterministic failures still receive a durable
+            # result.  A real interruption (KeyboardInterrupt/SystemExit) is
+            # deliberately not caught, leaving STARTED for fail-closed resume.
+            message = str(exc).lower()
+            classified = (
+                "TIMEOUT" if "timeout" in message or "timed out" in message else
+                "OUTPUT_FLOOD" if "log limit" in message or "output flood" in message else
+                "NON_QUIESCENT_PROCESS_GROUP" if "survivor" in message or "quiescen" in message else
+                "ATTESTATION_MISMATCH" if "attest" in message else
+                "HASH_MISMATCH" if "digest" in message or "authority" in message else
+                None
+            )
+            outcome = {
+                "ok": False,
+                "status": "BLOCKED",
+                "reason": classified or f"{type(exc).__name__}: {str(exc)[:512]}",
+                "eligible_repair": False,
+            }
+        self._persist_result(action, outcome)
+        return self._complete_action(state)
+
+    def _complete_action(self, state: dict[str, Any]) -> dict[str, Any]:
+        action = state["pending_action"]
+        outcome, result_ref = self._load_result(state)
+        if not isinstance(outcome, dict):
+            raise ArtifactValidationError("Strict action outcome is malformed")
+        history_entry = {
+            "id": action["id"], "kind": action["kind"], "status": "COMPLETED",
+            "attempt_index": action["attempt_index"], "result_ref": result_ref,
+            "session_id": outcome.get("session_id"), "revision": state["revision"] + 1,
+        }
+        changes: dict[str, Any] = {
+            "pending_action": None,
+            "action_history": state["action_history"] + [history_entry],
+            "evidence_refs": state["evidence_refs"] + [result_ref],
+            "latest_result_ref": result_ref,
+        }
+        if action["kind"] in {"PLANNER", "BUILDER", "REVIEWER"} and outcome.get("ok") is True:
+            changes.update(self._record_session(state, action["kind"], outcome.get("session_id")))
+        if action["kind"] == "PLANNER":
+            if outcome.get("ok") is not True:
+                return self._block({**state, **changes, "revision": state["revision"]}, "PLANNER_INVOCATION_FAILED")
+            return self._save(state, "strict_planner_completed", **changes)
+        if action["kind"] == "BUILDER":
+            if outcome.get("ok") is not True:
+                return self._block({**state, **changes, "revision": state["revision"]}, str(outcome.get("reason", "BUILDER_BLOCKED")))
+            return self._save(state, "strict_builder_completed", phase="FREEZING", **changes)
+        if action["kind"] == "FREEZE":
+            if outcome.get("ok") is not True:
+                return self._block({**state, **changes, "revision": state["revision"]}, str(outcome.get("reason", "FREEZE_BLOCKED")))
+            return self._save(state, "strict_freeze_completed", phase="VERIFYING", candidate=outcome["candidate"], **changes)
+        if action["kind"] == "VERIFIER":
+            status = outcome.get("status")
+            report = {key: value for key, value in outcome.items() if key != "ok"}
+            report["report_ref"] = result_ref
+            changes["verification"] = report
+            if status == "PASS":
+                changes["phase"] = "REVIEWING"
+                return self._save(state, "strict_verifier_completed", **changes)
+            if status == "FAIL" and outcome.get("eligible_repair") is True:
+                changes["phase"] = "ASSESSING"
+                return self._save(state, "strict_verifier_failed", **changes)
+            return self._block({**state, **changes, "revision": state["revision"]}, str(outcome.get("reason", "VERIFIER_BLOCKED")))
+        if action["kind"] == "REVIEWER":
+            status = outcome.get("status")
+            report = {key: value for key, value in outcome.items() if key != "ok"}
+            report["receipt_ref"] = result_ref
+            changes["review"] = report
+            if status in {"PASS", "NEEDS_FIX"}:
+                changes["phase"] = "ASSESSING"
+                return self._save(state, "strict_reviewer_completed", **changes)
+            return self._block({**state, **changes, "revision": state["revision"]}, str(outcome.get("reason", "REVIEWER_BLOCKED")))
+        raise GovernanceBlockerError("Unknown strict action completion")
+
+    def _request_gate(self, state: dict[str, Any], gate_type: str) -> dict[str, Any]:
+        binding = strict_gate_binding(state, gate_type)
+        revision = state["revision"] + 1
+        question = (
+            f"{gate_type}: {state['task_id']}\n"
+            f"Scope: {', '.join(state['scope'])}\n"
+            + ("Authorize attempt 0?" if gate_type == "GATE_A" else "Authorize integration preparation only (no canonical Git mutation)?")
+            + "\nReply: approve / deny"
+        )
+        gate = {
+            "gate_id": f"{state['controller_id']}-{gate_type}-{revision}",
+            "gate_type": gate_type,
+            "revision": revision,
+            "binding": binding,
+            "binding_digest": digest(binding),
+            "question": question,
+        }
+        changes = {"pending_gate": gate}
+        if gate_type == "GATE_A":
+            changes["gate_a"] = gate
+            changes["phase"] = "WAITING_HUMAN_GATE_A"
+        else:
+            changes["gate_b"] = gate
+            changes["phase"] = "WAITING_HUMAN_GATE_B"
+        return self._save(state, "strict_human_gate_requested", **changes)
+
+    def _assess(self, state: dict[str, Any]) -> dict[str, Any]:
+        verification = state["verification"] or {}
+        review = state["review"] or {}
+        if verification.get("status") == "FAIL":
+            if verification.get("eligible_repair") is not True:
+                return self._block(state, str(verification.get("reason", "INELIGIBLE_VERIFICATION_FAILURE")))
+            if state["repair_cycles"] >= state["repair_policy"]["max_repair_cycles"]:
+                return self._block(state, "REPAIR_BUDGET_EXHAUSTED")
+            return self._save(
+                state,
+                "strict_repair_started",
+                phase="BUILDING",
+                attempt_index=state["attempt_index"] + 1,
+                repair_cycles=state["repair_cycles"] + 1,
+                candidate=None,
+                verification=None,
+                review=None,
+                gate_b=None,
+            )
+        if verification.get("status") != "PASS":
+            return self._block(state, "VERIFICATION_DID_NOT_PASS")
+        if review.get("status") == "NEEDS_FIX":
+            if state["repair_cycles"] >= state["repair_policy"]["max_repair_cycles"]:
+                return self._block(state, "REPAIR_BUDGET_EXHAUSTED")
+            return self._save(
+                state,
+                "strict_repair_started",
+                phase="BUILDING",
+                attempt_index=state["attempt_index"] + 1,
+                repair_cycles=state["repair_cycles"] + 1,
+                candidate=None,
+                verification=None,
+                review=None,
+                gate_b=None,
+            )
+        if review.get("status") == "PASS":
+            return self._request_gate(state, "GATE_B")
+        return self._block(state, "REVIEW_DID_NOT_PASS")
+
+    def _step(self, state: dict[str, Any]) -> dict[str, Any]:
+        self._inputs(state)
+        self._baseline(state)
+        if state["pending_action"] is not None:
+            action = state["pending_action"]
+            if action["status"] == "PREPARED":
+                return self._dispatch(state)
+            result_path = self._result_path(action["id"])
+            if result_path.exists():
+                try:
+                    self._load_result(state)
+                except Exception as exc:
+                    raise GovernanceBlockerError("AMBIGUOUS_INTERRUPTED_ACTION") from exc
+                return self._complete_action(state)
+            raise GovernanceBlockerError("AMBIGUOUS_INTERRUPTED_ACTION")
+        phase = state["phase"]
+        if phase == "START":
+            return self._save(state, "strict_planning_started", phase="PLANNING")
+        if phase == "PLANNING":
+            if self.planner is not None and not any(item["kind"] == "PLANNER" and item["attempt_index"] == 0 for item in state["action_history"]):
+                return self._action_claim(state, "PLANNER")
+            return self._request_gate(state, "GATE_A")
+        if phase == "BUILDING":
+            return self._action_claim(state, "BUILDER")
+        if phase == "FREEZING":
+            return self._action_claim(state, "FREEZE")
+        if phase == "VERIFYING":
+            return self._action_claim(state, "VERIFIER")
+        if phase == "REVIEWING":
+            return self._action_claim(state, "REVIEWER")
+        if phase == "ASSESSING":
+            return self._assess(state)
+        return state
+
+    def state(self) -> dict[str, Any]:
+        value = self.store.load()
+        validate_strict_state(value)
+        return value
+
+    def _report(self, state: dict[str, Any]) -> dict[str, Any]:
+        result = dict(state)
+        result["status"] = state["terminal_state"] or ("HUMAN_GATE_REQUIRED" if state["pending_gate"] else "RUNNING")
+        result["disposition"] = result["status"]
+        result["task"] = state["task_id"]
+        result["question"] = state["pending_gate"]["question"] if state["pending_gate"] else None
+        result["gate"] = state["pending_gate"]
+        result["reason"] = state["terminal_reason"]
+        result["canonical_integration_performed"] = False
+        return result
+
+    def status(self) -> dict[str, Any]:
+        return self._report(self.state())
+
+    def _gate_b_evidence(self, state: dict[str, Any]) -> None:
+        """Revalidate the immutable evidence bound by Gate B before approval."""
+        verification = state.get("verification")
+        review = state.get("review")
+        if not isinstance(verification, Mapping) or verification.get("status") != "PASS":
+            raise GovernanceBlockerError("Gate B requires a verifier PASS")
+        if not isinstance(review, Mapping) or review.get("status") != "PASS":
+            raise GovernanceBlockerError("Gate B requires a reviewer PASS")
+        report_ref = verification.get("report_ref")
+        receipt_ref = review.get("receipt_ref")
+        if not isinstance(report_ref, Mapping) or not isinstance(receipt_ref, Mapping):
+            raise GovernanceBlockerError("Gate B evidence references are incomplete")
+        report = self.store.read_artifact(dict(report_ref))
+        receipt = self.store.read_artifact(dict(receipt_ref))
+        if not isinstance(report, Mapping) or not isinstance(receipt, Mapping):
+            raise GovernanceBlockerError("Gate B evidence artifacts are malformed")
+        if report.get("kind") != "VERIFIER" or report.get("status") != "COMPLETED":
+            raise GovernanceBlockerError("Gate B verifier report is not a completed result")
+        if receipt.get("kind") != "REVIEWER" or receipt.get("status") != "COMPLETED":
+            raise GovernanceBlockerError("Gate B reviewer receipt is not a completed result")
+        report_outcome = report.get("outcome")
+        receipt_outcome = receipt.get("outcome")
+        if not isinstance(report_outcome, Mapping) or report_outcome.get("status") != "PASS":
+            raise GovernanceBlockerError("Gate B verifier report does not prove PASS")
+        if not isinstance(receipt_outcome, Mapping) or receipt_outcome.get("status") != "PASS":
+            raise GovernanceBlockerError("Gate B reviewer receipt does not prove PASS")
+
+    def resume(self, *, max_steps: int = 64) -> dict[str, Any]:
+        if type(max_steps) is not int or not 1 <= max_steps <= 128:
+            raise ArtifactValidationError("Invalid strict deterministic step budget")
+        with self.store.writer():
+            state = self.store.load(recover=True)
+            for _ in range(max_steps):
+                if state["terminal_state"] or state["pending_gate"]:
+                    if state["pending_gate"] and state["pending_gate"]["gate_type"] == "GATE_B":
+                        self._baseline(state)
+                        self._candidate_authority(state)
+                        self._gate_b_evidence(state)
+                    break
+                try:
+                    next_state = self._step(state)
+                except (RunnerError, OSError) as exc:
+                    error_class = getattr(exc, "error_class", "GOVERNANCE_BLOCKER")
+                    error_class = getattr(error_class, "value", error_class)
+                    message = str(exc)[:512]
+                    exact_reasons = {
+                        "AMBIGUOUS_INTERRUPTED_ACTION", "REPAIR_BUDGET_EXHAUSTED", "TIMEOUT", "KILL",
+                        "OUTPUT_FLOOD", "NON_QUIESCENT_PROCESS_GROUP", "ATTESTATION_MISMATCH", "HASH_MISMATCH",
+                    }
+                    reason = message if message.split(":", 1)[0] in exact_reasons else f"{error_class}: {message}"
+                    state = self._block(self.store.load(), reason)
+                    break
+                except Exception as exc:
+                    state = self._block(self.store.load(), f"{type(exc).__name__}: {str(exc)[:512]}")
+                    break
+                if next_state == state:
+                    break
+                state = next_state
+            return self._report(state)
+
+    def reply(self, *, gate_id: str, revision: int, binding_digest: str, response: str) -> dict[str, Any]:
+        with self.store.writer():
+            state = self.store.load(recover=True)
+            gate = state["pending_gate"]
+            if gate is None or (gate_id, revision, binding_digest) != (gate["gate_id"], state["revision"], gate["binding_digest"]):
+                raise GovernanceBlockerError("Stale or replayed strict human gate reply")
+            if response not in {"approve", "deny"}:
+                raise GovernanceBlockerError("Human response must be literal approve or deny")
+            self._baseline(state)
+            if gate["gate_type"] == "GATE_B":
+                self._candidate_authority(state)
+                self._gate_b_evidence(state)
+            if gate["binding"] != strict_gate_binding(state, gate["gate_type"]):
+                raise GovernanceBlockerError("Strict human gate authority drift")
+            authorization = {"gate_id": gate_id, "binding_digest": binding_digest, "decision": "APPROVED"} if response == "approve" else None
+            entry = {"gate": gate, "human_response": response, "source": "local-cli", "authorization": authorization}
+            history_key = "gate_a_history" if gate["gate_type"] == "GATE_A" else "gate_b_history"
+            changes: dict[str, Any] = {history_key: state[history_key] + [entry], "pending_gate": None}
+            if response == "deny":
+                changes.update(phase="BLOCKED", terminal_state="BLOCKED", terminal_reason="HUMAN_DECLINED")
+            elif gate["gate_type"] == "GATE_A":
+                changes["phase"] = "BUILDING"
+            else:
+                changes.update(phase="COMPLETE", terminal_state="COMPLETE", terminal_reason="INTEGRATION_PREPARED_ONLY")
+            state = self._save(state, "strict_human_response_recorded", **changes)
+            return self._report(state)
+
+    def human_reply(self, **kwargs: Any) -> dict[str, Any]:
+        return self.reply(**kwargs)
+
+    def reply_to_gate(self, **kwargs: Any) -> dict[str, Any]:
+        return self.reply(**kwargs)
+
+    def wait(self, *, timeout: float = 30.0, interval: float = 0.1) -> dict[str, Any]:
+        if not 0 <= timeout <= 60 or not 0 < interval <= 1:
+            raise ArtifactValidationError("Wait requires timeout 0..60 seconds and interval 0..1")
+        deadline = time.monotonic() + timeout
+        while True:
+            report = self.status()
+            if report["status"] != "RUNNING" or time.monotonic() >= deadline:
+                return report
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+
+# Names used by early R3C callers are retained as aliases; all aliases select
+# the strict schema and never open a legacy store as a strict run.
+DurableExecutionController = StrictExecutionController
+R3CController = StrictExecutionController
+StrictController = StrictExecutionController
+ExecutionController = StrictExecutionController
+AutonomousExecutionController = StrictExecutionController
+
+
+def start_strict_controller(*args: Any, **kwargs: Any) -> StrictExecutionController:
+    return StrictExecutionController.start(*args, **kwargs)

@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from prj226_runner.calibration import (
     build_opencode_config_dict,
@@ -468,6 +468,159 @@ def _changed_paths(repo: Path, baseline: str) -> list[str]:
     tracked = _git(repo, ["diff", "--name-only", baseline]).splitlines()
     untracked = _git(repo, ["ls-files", "--others", "--exclude-standard"]).splitlines()
     return sorted(set(path for path in [*tracked, *untracked] if path))
+
+
+def freeze_strict_candidate(
+    repo: Path | str,
+    *,
+    baseline_head: str,
+    candidate_ref: str,
+    approved_changed_paths: Iterable[str],
+    commit_message: str,
+) -> dict[str, Any]:
+    """Freeze an R3C builder worktree after the durable FREEZING claim.
+
+    The function contains only deterministic Git work.  The controller owns
+    the PREPARED/STARTED/COMPLETED journal ordering around this call.
+    """
+    worktree = Path(repo).resolve()
+    expected = sorted(set(approved_changed_paths))
+    if not expected:
+        raise ImplementationFailureError("Builder produced no changes")
+    if _git(worktree, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
+        raise GovernanceBlockerError("Builder created an unexpected commit")
+    changed = _changed_paths(worktree, baseline_head)
+    if changed != expected:
+        raise GovernanceBlockerError("Changed paths differ from the approved strict scope")
+    check = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--check"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        shell=False,
+        check=False,
+    )
+    if check.returncode != 0:
+        raise ImplementationFailureError("git diff --check failed before strict freeze")
+    for path in expected:
+        _git(worktree, ["add", "--", path])
+    staged = _git(worktree, ["diff", "--cached", "--name-only", baseline_head]).splitlines()
+    if sorted(staged) != expected:
+        raise GovernanceBlockerError("Strict freeze staging did not exactly match scope")
+    _git(worktree, ["commit", "-m", commit_message])
+    head = _git(worktree, ["rev-parse", "HEAD"]).lower()
+    tree = _git(worktree, ["rev-parse", "HEAD^{tree}"]).lower()
+    parents = _git(worktree, ["rev-list", "--parents", "-n", "1", "HEAD"]).split()
+    if len(parents) != 2 or parents[1].lower() != baseline_head.lower():
+        raise GovernanceBlockerError("Strict candidate must have the canonical baseline as its only parent")
+    return {"head": head, "tree": tree, "ref": candidate_ref, "changed_paths": expected, "worktree": str(worktree)}
+
+
+def build_strict_candidate_authority(
+    repo: Path | str,
+    *,
+    candidate_head: str,
+    candidate_ref: str,
+    baseline_head: str,
+    approved_changed_paths: Iterable[str],
+    transient_paths: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Build the frozen R3C candidate-authority manifest."""
+    from prj226_runner.candidate_authority import build_candidate_authority
+    return build_candidate_authority(
+        repo,
+        candidate_head,
+        candidate_ref,
+        baseline_head,
+        approved_changed_paths,
+        transient_paths=transient_paths,
+    )
+
+
+def verify_strict_candidate_authority(
+    repo: Path | str,
+    authority: Mapping[str, Any],
+    *,
+    expected_ref: str | None = None,
+) -> None:
+    """Revalidate candidate HEAD/TREE/ref and filesystem authority."""
+    from prj226_runner.candidate_authority import verify_candidate_authority
+    verify_candidate_authority(Path(repo), authority, expected_ref=expected_ref)
+
+
+def run_strict_verifier(
+    worktree: Path | str,
+    *,
+    baseline_head: str,
+    candidate_head: str,
+    candidate_ref: str,
+    authority: Mapping[str, Any],
+    test_commands: Sequence[Sequence[str]],
+    canonical_repository: Path | str | None = None,
+    canonical_branch: str | None = None,
+    baseline_tree: str | None = None,
+    timeout_seconds: int = 300,
+) -> dict[str, Any]:
+    """Run the zero-model deterministic R3C verifier.
+
+    A nonzero approved command is an implementation failure eligible for
+    assessment; timeout, authority drift, and canonical drift are blockers.
+    """
+    candidate_path = Path(worktree).resolve()
+    from prj226_runner.candidate_authority import verify_candidate_authority
+    verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+    if canonical_repository is not None:
+        canonical = Path(canonical_repository).resolve()
+        if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
+            raise GovernanceBlockerError("Canonical baseline drift")
+        if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
+            raise GovernanceBlockerError("Canonical baseline drift")
+        if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
+            raise GovernanceBlockerError("Canonical baseline drift")
+        if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
+            raise GovernanceBlockerError("Canonical baseline drift")
+    results: list[dict[str, Any]] = []
+    for index, command in enumerate(test_commands, 1):
+        argv = list(command)
+        if not argv or not all(isinstance(arg, str) and arg for arg in argv):
+            raise ArtifactValidationError("Strict verifier commands must be non-empty argv arrays")
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=candidate_path,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                shell=False,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "BLOCKED", "eligible_repair": False, "reason": "TIMEOUT", "tests": results}
+        except OSError as exc:
+            raise RunnerEnvironmentError(f"Strict verifier command could not start: {exc}") from exc
+        item = {"index": index, "argv": argv, "exit_code": result.returncode}
+        results.append(item)
+        verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+        if result.returncode != 0:
+            return {"status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
+    diff = subprocess.run(
+        ["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        shell=False,
+        check=False,
+    )
+    if diff.returncode != 0:
+        return {"status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_DIFF_CHECK_FAILURE", "tests": results}
+    verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+    return {"status": "PASS", "eligible_repair": False, "reason": "ALL_DETERMINISTIC_CHECKS_PASSED", "tests": results}
+
+
+# Short aliases used by controller integrations.
+freeze_candidate_strict = freeze_strict_candidate
+verify_candidate_strict = verify_strict_candidate_authority
 
 
 def _verify_candidate_identity(

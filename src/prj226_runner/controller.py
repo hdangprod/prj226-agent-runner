@@ -30,6 +30,11 @@ from prj226_runner.errors import (
     GovernanceBlockerError,
     RunnerEnvironmentError,
 )
+from prj226_runner.control_protocol import (
+    STRICT_VERSION,
+    strict_gate_binding,
+    validate_strict_state,
+)
 from prj226_runner.codex_reviewer import (
     fingerprint_manifest,
     EvidenceRoot,
@@ -222,6 +227,44 @@ RUNNER_ARTIFACT_RELATIVE_PATHS = {
     "review_fingerprint_pre_artifact": "sos/fingerprint-pre.json",
     "review_fingerprint_post_artifact": "sos/fingerprint-post.json",
 }
+
+
+def validate_strict_gate_binding(state: Mapping[str, Any], gate_type: str, binding: Mapping[str, Any]) -> None:
+    """Validate the exact immutable authority for an R3C human gate."""
+    if not isinstance(state, dict) or state.get("schema_version") != STRICT_VERSION:
+        raise GovernanceBlockerError("Strict Gate validation requires a strict controller state")
+    validate_strict_state(state)
+    expected = strict_gate_binding(state, gate_type)
+    if dict(binding) != expected:
+        raise GovernanceBlockerError(f"{gate_type} strict authority binding drift")
+
+
+def validate_strict_gate_a(state: Mapping[str, Any], binding: Mapping[str, Any]) -> None:
+    validate_strict_gate_binding(state, "GATE_A", binding)
+
+
+def validate_strict_gate_b(state: Mapping[str, Any], binding: Mapping[str, Any]) -> None:
+    validate_strict_gate_binding(state, "GATE_B", binding)
+
+
+def validate_strict_session_isolation(state: Mapping[str, Any]) -> None:
+    """Expose the protocol's pairwise and cross-attempt session check."""
+    validate_strict_state(state)
+
+
+def start_strict_controller(*args: Any, **kwargs: Any) -> Any:
+    """Lazy factory avoiding a control/controller import cycle."""
+    from prj226_runner.control import StrictExecutionController
+    return StrictExecutionController.start(*args, **kwargs)
+
+
+def __getattr__(name: str) -> Any:
+    if name in {
+        "StrictExecutionController", "DurableExecutionController", "R3CController", "StrictController"
+    }:
+        from prj226_runner.control import StrictExecutionController
+        return StrictExecutionController
+    raise AttributeError(name)
 
 
 def _read_json(path: Path | str) -> Any:

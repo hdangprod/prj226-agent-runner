@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PRJ226 strict durable controller state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "controller_id", "task_id", "goal", "revision", "baseline",
+    "scope", "approved_scope", "contract_ref", "runtime_ref", "packet_ref",
+    "planner_profile_ref", "builder_profile_ref", "reviewer_profile_ref", "repair_policy",
+    "phase", "attempt_index", "repair_cycles", "planner_session", "builder_session",
+    "reviewer_session", "planner_sessions", "builder_sessions", "reviewer_sessions",
+    "gate_a", "gate_b", "gate_a_history", "gate_b_history", "pending_gate",
+    "pending_action", "action_history", "candidate", "verification", "review",
+    "evidence_refs", "latest_result_ref", "planner_invocations", "builder_invocations",
+    "freeze_invocations", "verifier_invocations", "reviewer_invocations", "terminal_state",
+    "terminal_reason"
+  ],
+  "properties": {
+    "schema_version": {"const": "PRJ226.CONTROL_STATE.v1"},
+    "controller_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1},
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "baseline": {"$ref": "#/$defs/baseline"},
+    "scope": {"$ref": "#/$defs/scope"},
+    "approved_scope": {"$ref": "#/$defs/scope"},
+    "contract_ref": {"$ref": "#/$defs/ref"},
+    "runtime_ref": {"$ref": "#/$defs/ref"},
+    "packet_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
+    "planner_profile_ref": {"type": "string", "minLength": 1},
+    "builder_profile_ref": {"type": "string", "minLength": 1},
+    "reviewer_profile_ref": {"type": "string", "minLength": 1},
+    "repair_policy": {
+      "type": "object", "additionalProperties": false, "required": ["max_repair_cycles"],
+      "properties": {"max_repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2}}
+    },
+    "phase": {"enum": ["START", "PLANNING", "WAITING_HUMAN_GATE_A", "BUILDING", "FREEZING", "VERIFYING", "REVIEWING", "ASSESSING", "WAITING_HUMAN_GATE_B", "COMPLETE", "BLOCKED"]},
+    "attempt_index": {"type": "integer", "minimum": 0, "maximum": 2},
+    "repair_cycles": {"type": "integer", "minimum": 0, "maximum": 2},
+    "planner_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "builder_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "reviewer_session": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "planner_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "builder_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "reviewer_sessions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "gate_a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gate"}]},
+    "gate_b": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gate"}]},
+    "gate_a_history": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/gate_entry"}},
+    "gate_b_history": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/gate_entry"}},
+    "pending_gate": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gate"}]},
+    "pending_action": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/action"}]},
+    "action_history": {"type": "array", "items": {"$ref": "#/$defs/completed_action"}},
+    "candidate": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/candidate"}]},
+    "verification": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
+    "review": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]},
+    "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}},
+    "latest_result_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]},
+    "planner_invocations": {"type": "integer", "minimum": 0},
+    "builder_invocations": {"type": "integer", "minimum": 0},
+    "freeze_invocations": {"type": "integer", "minimum": 0},
+    "verifier_invocations": {"type": "integer", "minimum": 0},
+    "reviewer_invocations": {"type": "integer", "minimum": 0},
+    "terminal_state": {"anyOf": [{"type": "null"}, {"enum": ["COMPLETE", "BLOCKED"]}]},
+    "terminal_reason": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
+  },
+  "$defs": {
+    "ref": {
+      "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "baseline": {
+      "type": "object", "additionalProperties": false, "required": ["repository", "branch", "head", "tree"],
+      "properties": {"repository": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}, "tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}}
+    },
+    "scope": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "gate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["gate_id", "gate_type", "revision", "binding", "binding_digest", "question"],
+      "properties": {
+        "gate_id": {"type": "string", "minLength": 1},
+        "gate_type": {"enum": ["GATE_A", "GATE_B"]},
+        "revision": {"type": "integer", "minimum": 1},
+        "binding": {"type": "object", "additionalProperties": true},
+        "binding_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "question": {"type": "string", "minLength": 1}
+      }
+    },
+    "gate_entry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["gate", "human_response", "source", "authorization"],
+      "properties": {
+        "gate": {"$ref": "#/$defs/gate"},
+        "human_response": {"enum": ["approve", "deny"]},
+        "source": {"const": "local-cli"},
+        "authorization": {"anyOf": [{"type": "null"}, {"type": "object"}]}
+      }
+    },
+    "action": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "status", "attempt_index", "revision"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^action-[A-Za-z0-9._-]+$"},
+        "kind": {"enum": ["PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"]},
+        "status": {"enum": ["PREPARED", "STARTED"]},
+        "attempt_index": {"type": "integer", "minimum": 0},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "completed_action": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "status", "attempt_index", "result_ref", "session_id", "revision"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^action-[A-Za-z0-9._-]+$"},
+        "kind": {"enum": ["PLANNER", "BUILDER", "FREEZE", "VERIFIER", "REVIEWER"]},
+        "status": {"const": "COMPLETED"},
+        "attempt_index": {"type": "integer", "minimum": 0},
+        "result_ref": {"$ref": "#/$defs/ref"},
+        "session_id": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "candidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["head", "tree", "ref", "authority_ref", "worktree", "attempt_index", "changed_paths"],
+      "properties": {
+        "head": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "ref": {"type": "string", "minLength": 1},
+        "authority_ref": {"$ref": "#/$defs/ref"},
+        "worktree": {"type": "string", "minLength": 1},
+        "attempt_index": {"type": "integer", "minimum": 0},
+        "changed_paths": {"$ref": "#/$defs/scope"}
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": true,
+      "required": ["status"],
+      "properties": {"status": {"type": "string", "minLength": 1}}
+    }
+  }
+}
