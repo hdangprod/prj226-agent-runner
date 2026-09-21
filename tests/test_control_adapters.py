@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -179,6 +180,17 @@ class ControlAdapterTests(unittest.TestCase):
             "provider_output_declaration": provider_output_declaration,
         }
 
+    def assert_non_builder_capability_breach(self, event):
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name, event=event):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    event,
+                ])
+                expected = f"{role_name.upper()}_CAPABILITY_BREACH"
+                with self.assertRaisesRegex(GovernanceBlockerError, expected):
+                    self.execute(role_name, supervisor)
+
     def test_planner_executing_command_is_blocked(self):
         supervisor = FakeSupervisor(events=[
             {"type": "thread.started", "thread_id": SESSION_ID},
@@ -213,12 +225,93 @@ class ControlAdapterTests(unittest.TestCase):
         receipt = self.execute("planner", supervisor)
         self.assertEqual(receipt.disposition, "SUCCESS")
 
-    def test_unknown_primitive_event_is_informational(self):
-        supervisor = FakeSupervisor(events=[
+    def test_unknown_typed_event_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "future_informational_event",
+            "message": "status",
+            "count": 1,
+            "ok": True,
+        })
+
+    def test_shell_command_typed_node_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {"type": "shell_command", "content": "touch candidate.py"},
+        })
+
+    def test_future_remove_typed_node_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "response.completed",
+            "response": {"output": [{"type": "future_remove", "path": "candidate.py"}]},
+        })
+
+    def test_untyped_interpreter_name_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {"name": "bash"},
+        })
+
+    def test_deeply_nested_unknown_typed_node_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "response.completed",
+            "response": {
+                "nested": {"type": "arbitrary_future_authority", "payload": "xyz"},
+            },
+        })
+
+    def test_unknown_future_tool_typed_node_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "response.completed",
+            "response": {"output": [{"type": "unknown_future_tool"}]},
+        })
+
+    def test_unknown_typed_node_with_only_scalars_is_blocked_for_planner_and_reviewer(self):
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {
+                "type": "unrecognized_scalar_type",
+                "message": "hello",
+                "code": 123,
+            },
+        })
+
+    def test_random_unknown_typed_node_is_blocked_for_planner_and_reviewer(self):
+        random_type = f"unknown_type_{uuid.uuid4().hex}"
+        self.assert_non_builder_capability_breach({
+            "type": "item.completed",
+            "item": {"type": random_type, "data": "value"},
+        })
+
+    def test_closed_allowlist_accepts_legitimate_informational_events(self):
+        events = [
             {"type": "thread.started", "thread_id": SESSION_ID},
-            {"type": "future_informational_event", "message": "status", "count": 1, "ok": True},
-        ])
-        receipt = self.execute("planner", supervisor)
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Plan complete."}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-astra"}},
+            {"type": "item.started", "item": {"type": "text", "text": "working"}},
+            {"type": "response.created", "response": {"status": "in_progress"}},
+            {
+                "type": "response.completed",
+                "response": {"output": [{"type": "output_text", "text": "done"}]},
+            },
+            {"type": "thread.completed", "reason": "done"},
+        ]
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                receipt = self.execute(role_name, FakeSupervisor(events=events))
+                self.assertEqual(receipt.disposition, "SUCCESS")
+
+    def test_builder_activity_remains_accepted_under_builder_rules(self):
+        supervisor = FakeSupervisor(
+            events=[
+                {"type": "thread.started", "thread_id": SESSION_ID},
+                {"type": "command_execution", "command": "echo safe"},
+                {"type": "future_builder_status", "message": "candidate work observed"},
+            ],
+            completion=self.completion(),
+        )
+        with mock.patch("prj226_runner.control_adapters.uuid.uuid4", return_value=mock.Mock(__str__=lambda _: FIXED_INVOCATION_ID)):
+            receipt = self.execute("builder", supervisor)
         self.assertEqual(receipt.disposition, "SUCCESS")
 
     def test_unknown_command_or_tool_structure_is_blocked_for_planner_and_reviewer(self):

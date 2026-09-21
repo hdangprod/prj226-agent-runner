@@ -53,6 +53,39 @@ ROLE_CONTEXT_LIMITS: dict[str, int] = {
     "reviewer": 512 * 1024,
 }
 
+SAFE_INFORMATIONAL_TYPES = {
+    "agent_message",
+    "assistant",
+    "user",
+    "system",
+    "message",
+    "reasoning",
+    "text",
+    "output_text",
+    "input_text",
+    "usage",
+    "token_count",
+    "model",
+    "session_meta",
+    "turn_context",
+    "event_msg",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+}
+
+LIFECYCLE_ENVELOPE_TYPES = {
+    "thread.started",
+    "thread.completed",
+    "turn.started",
+    "turn.completed",
+    "item.started",
+    "item.completed",
+    "item.updated",
+    "response.created",
+    "response.completed",
+}
+
 _MUTATION_TYPES = frozenset({
     "command_execution",
     "file_change",
@@ -493,17 +526,12 @@ def _is_safe_informational_key(key: Any) -> bool:
     )
 
 
-def _is_safe_informational_node(node: Any) -> bool:
-    """Prove that an authority-free event is informational JSON.
-
-    Unknown scalar fields are intentionally accepted as forward-compatible
-    metadata. Unknown structured fields are accepted only inside recognized
-    informational wrappers; this keeps future opaque objects fail-closed.
-    """
+def _is_builder_safe_informational_node(node: Any) -> bool:
+    """Retain the builder's pre-existing informational-event validation."""
     if _is_primitive_scalar(node):
         return True
     if isinstance(node, list):
-        return all(_is_safe_informational_node(child) for child in node)
+        return all(_is_builder_safe_informational_node(child) for child in node)
     if not isinstance(node, dict):
         return False
 
@@ -521,9 +549,141 @@ def _is_safe_informational_node(node: Any) -> bool:
             return False
         if normalized_key in {"metadata", "meta"} and _is_primitive_tree(value):
             continue
-        if not _is_safe_informational_node(value):
+        if not _is_builder_safe_informational_node(value):
             return False
     return True
+
+
+_EXECUTION_INDICATOR_KEY_TOKENS = (
+    "tool",
+    "func",
+    "cmd",
+    "command",
+    "shell",
+    "exec",
+    "script",
+    "call",
+    "patch",
+    "write",
+    "remove",
+    "delete",
+    "action",
+    "file",
+    "path",
+    "directory",
+    "cwd",
+    "workdir",
+    "rename",
+    "move",
+    "mkdir",
+    "rmdir",
+)
+_EXECUTION_INDICATOR_KEY_NAMES = frozenset({
+    "argv",
+    "args",
+    "arguments",
+    "parameters",
+})
+_INTERPRETER_OR_EXECUTOR_NAME_HINTS = frozenset({
+    "apply_patch",
+    "bash",
+    "bun",
+    "cargo",
+    "cmd",
+    "command",
+    "csh",
+    "deno",
+    "delete",
+    "edit",
+    "exec",
+    "execute",
+    "fish",
+    "git",
+    "go",
+    "grep",
+    "java",
+    "ksh",
+    "make",
+    "mkdir",
+    "move",
+    "node",
+    "nodejs",
+    "patch",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "python",
+    "python3",
+    "read_file",
+    "remove",
+    "rename",
+    "ruby",
+    "run",
+    "rmdir",
+    "search",
+    "sh",
+    "shell",
+    "tcsh",
+    "touch",
+    "write_file",
+    "zsh",
+})
+
+
+def _key_indicates_execution(key: Any) -> bool:
+    normalized = str(key).lower()
+    return normalized in _EXECUTION_INDICATOR_KEY_NAMES or any(
+        token in normalized for token in _EXECUTION_INDICATOR_KEY_TOKENS
+    )
+
+
+def _name_indicates_interpreter_or_executor(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    normalized = value.strip().lower()
+    return normalized in _INTERPRETER_OR_EXECUTOR_NAME_HINTS or any(
+        token in normalized for token in ("tool", "exec", "command", "shell", "script", "function", "call")
+    )
+
+
+def _is_safe_informational_node(node: Any) -> bool:
+    """Return whether a node is structurally known-safe informational data.
+
+    Planner and reviewer events use a closed allowlist. Unknown typed nodes are
+    never made safe by scalar children, and untyped dictionaries may contain
+    only recursively safe values without authority-bearing keys.
+    """
+    if _is_primitive_scalar(node):
+        return True
+    if isinstance(node, list):
+        return all(_is_safe_informational_node(child) for child in node)
+    if not isinstance(node, dict):
+        return False
+
+    if any(_key_indicates_execution(key) for key in node):
+        return False
+    if any(
+        str(key).lower() == "name" and _name_indicates_interpreter_or_executor(value)
+        for key, value in node.items()
+    ):
+        return False
+
+    type_key = next((key for key in node if str(key).lower() == "type"), None)
+    if type_key is not None:
+        node_type = node[type_key]
+        if not isinstance(node_type, str) or not node_type:
+            return False
+        normalized_type = node_type.lower()
+        if normalized_type not in SAFE_INFORMATIONAL_TYPES and normalized_type not in LIFECYCLE_ENVELOPE_TYPES:
+            return False
+        return all(
+            _is_safe_informational_node(value)
+            for key, value in node.items()
+            if key != type_key
+        )
+
+    return all(_is_safe_informational_node(value) for value in node.values())
 
 
 def _name_indicates_tool_invocation(node: Mapping[str, Any], value: Any) -> bool:
@@ -696,6 +856,17 @@ def _observe_builder_command_confinement(command: str, workspace: Path, executab
 
 
 def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Path, executable: str) -> None:
+    if role_name in ("planner", "reviewer"):
+        breach = (
+            "PLANNER_CAPABILITY_BREACH"
+            if role_name == "planner"
+            else "REVIEWER_CAPABILITY_BREACH"
+        )
+        for event in events:
+            if not _is_safe_informational_node(event):
+                raise GovernanceBlockerError(breach)
+        return
+
     workspace = cwd.resolve()
     for event in events:
         if _node_has_authority(event):
@@ -707,7 +878,7 @@ def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Pa
                 executable,
             )
             continue
-        if not _is_safe_informational_node(event):
+        if not _is_builder_safe_informational_node(event):
             raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
 
 
