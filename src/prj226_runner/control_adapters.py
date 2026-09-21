@@ -341,6 +341,25 @@ def _event_types(event: dict[str, Any]) -> set[str]:
 
 
 _AUTHORITY_COMMAND_KEYS = {"command", "cmd", "argv", "args"}
+_AUTHORITY_KEY_FRAGMENTS = (
+    "command",
+    "cmd",
+    "shell",
+    "exec",
+    "argv",
+    "args",
+    "tool",
+    "function",
+    "call",
+    "patch",
+    "write",
+    "edit",
+    "action",
+    "script",
+)
+_AUTHORITY_TYPE_FRAGMENTS = ("write", "patch", "edit", "delete", "exec", "tool")
+_PATH_MUTATION_KEYS = frozenset({"path", "file_path", "target_path"})
+_CONTENT_CHANGE_KEY_FRAGMENTS = ("content", "change", "diff")
 _TOOL_INVOCATION_NAME_HINTS = frozenset({
     "apply_patch",
     "bash",
@@ -369,6 +388,142 @@ _TOOL_INVOCATION_NAME_HINTS = frozenset({
 
 def _non_empty_string_or_list(value: Any) -> bool:
     return (isinstance(value, str) and bool(value)) or (isinstance(value, list) and bool(value))
+
+
+def _non_empty_authority_value(value: Any) -> bool:
+    """Return whether a JSON value carries non-empty authority-bearing data."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (dict, list)):
+        return bool(value)
+    return False
+
+
+def _type_has_authority(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.lower()
+    return (
+        normalized in AUTHORITY_ITEM_TYPES
+        or normalized in _MUTATION_TYPES
+        or any(fragment in normalized for fragment in _AUTHORITY_TYPE_FRAGMENTS)
+    )
+
+
+def _node_has_authority(node: Any) -> bool:
+    """Recursively classify JSON event nodes that carry execution authority.
+
+    This deliberately classifies by structure, rather than by a closed list of
+    known event names. Providers can add new envelopes or item types without
+    creating a capability-enforcement bypass.
+    """
+    if isinstance(node, dict):
+        has_path = False
+        has_content_or_changes = False
+        for key, value in node.items():
+            normalized_key = str(key).lower()
+            if normalized_key == "type" and _type_has_authority(value):
+                return True
+            if any(fragment in normalized_key for fragment in _AUTHORITY_KEY_FRAGMENTS):
+                if _non_empty_authority_value(value):
+                    return True
+            if normalized_key in _PATH_MUTATION_KEYS and _non_empty_authority_value(value):
+                has_path = True
+            if any(fragment in normalized_key for fragment in _CONTENT_CHANGE_KEY_FRAGMENTS):
+                if _non_empty_authority_value(value):
+                    has_content_or_changes = True
+        if has_path and has_content_or_changes:
+            return True
+        return any(_node_has_authority(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_node_has_authority(value) for value in node)
+    return False
+
+
+_SAFE_INFORMATIONAL_STRUCTURE_KEYS = frozenset({
+    "content",
+    "data",
+    "delta",
+    "details",
+    "info",
+    "item",
+    "items",
+    "metadata",
+    "meta",
+    "output",
+    "payload",
+    "parts",
+    "response",
+    "value",
+})
+
+
+def _is_safe_informational_type(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.lower()
+    return (
+        normalized in KNOWN_SAFE
+        or normalized.startswith("turn.")
+        or normalized.startswith("thread.")
+        or normalized.startswith("content_block_")
+    )
+
+
+def _is_primitive_scalar(value: Any) -> bool:
+    return type(value) in (str, int, float, bool) or value is None
+
+
+def _is_primitive_tree(value: Any) -> bool:
+    if _is_primitive_scalar(value):
+        return True
+    if isinstance(value, dict):
+        return all(_is_primitive_tree(child) for child in value.values())
+    if isinstance(value, list):
+        return all(_is_primitive_tree(child) for child in value)
+    return False
+
+
+def _is_safe_informational_key(key: Any) -> bool:
+    normalized = str(key).lower()
+    return (
+        normalized in KNOWN_SAFE
+        or normalized in _SAFE_INFORMATIONAL_STRUCTURE_KEYS
+        or normalized.startswith("content_block")
+    )
+
+
+def _is_safe_informational_node(node: Any) -> bool:
+    """Prove that an authority-free event is informational JSON.
+
+    Unknown scalar fields are intentionally accepted as forward-compatible
+    metadata. Unknown structured fields are accepted only inside recognized
+    informational wrappers; this keeps future opaque objects fail-closed.
+    """
+    if _is_primitive_scalar(node):
+        return True
+    if isinstance(node, list):
+        return all(_is_safe_informational_node(child) for child in node)
+    if not isinstance(node, dict):
+        return False
+
+    for key, value in node.items():
+        normalized_key = str(key).lower()
+        if normalized_key == "type":
+            if not _is_primitive_scalar(value):
+                return False
+            # Unknown type names remain compatible when all other fields are
+            # scalar or proven informational by the checks below.
+            continue
+        if _is_primitive_scalar(value):
+            continue
+        if not _is_safe_informational_key(key):
+            return False
+        if normalized_key in {"metadata", "meta"} and _is_primitive_tree(value):
+            continue
+        if not _is_safe_informational_node(value):
+            return False
+    return True
 
 
 def _name_indicates_tool_invocation(node: Mapping[str, Any], value: Any) -> bool:
@@ -543,40 +698,16 @@ def _observe_builder_command_confinement(command: str, workspace: Path, executab
 def _validate_capabilities(role_name: str, events: list[dict[str, Any]], cwd: Path, executable: str) -> None:
     workspace = cwd.resolve()
     for event in events:
-        types = _event_types(event)
-        authority_types = _authority_types(types)
-        if authority_types or _event_has_authority_indicator(event):
-            _validate_authority_event(role_name, event, authority_types, workspace, executable)
+        if _node_has_authority(event):
+            _validate_authority_event(
+                role_name,
+                event,
+                _authority_types(_event_types(event)),
+                workspace,
+                executable,
+            )
             continue
-
-        top_level_type = event.get("type")
-        if isinstance(top_level_type, str):
-            top_level_type = top_level_type.lower()
-
-        if top_level_type in SAFE_ITEM_TYPES:
-            continue
-
-        if top_level_type in ENVELOPE_TYPES:
-            inspected = event.get("item") if isinstance(event.get("item"), (dict, list)) else event
-            types = _event_types(inspected)
-            authority_types = _authority_types(types)
-            if authority_types:
-                _validate_authority_event(role_name, inspected, authority_types, workspace, executable)
-                continue
-            unknown_types = {
-                value.lower()
-                for value in types
-                if value.lower() not in ENVELOPE_TYPES | SAFE_ITEM_TYPES
-            }
-            if unknown_types and (_event_has_authority_structure(inspected) or not _event_has_only_primitive_values(inspected)):
-                raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
-            continue
-
-        if top_level_type in AUTHORITY_ITEM_TYPES:
-            _validate_authority_event(role_name, event, {top_level_type}, workspace, executable)
-            continue
-
-        if _unknown_mutation_event(event, types):
+        if not _is_safe_informational_node(event):
             raise GovernanceBlockerError("UNRECOGNIZED_MUTATION_EVENT")
 
 
@@ -600,10 +731,15 @@ def _validate_authority_event(
     command_texts = [text for command in command_values for text in _command_texts(command)]
     if "command_execution" in mutations and not command_texts:
         raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
-    if any(_non_empty_string_or_list(command) and not list(_command_texts(command)) for command in command_values):
+    if any(not list(_command_texts(command)) for command in command_values):
         raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
     explicit_paths = list(_explicit_paths(event_mapping))
     if mutations - {"command_execution"} and not explicit_paths:
+        raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
+    if not command_texts and not explicit_paths:
+        # An authority-bearing future event is not safe merely because its
+        # provider-specific type is unknown. It must expose an observable
+        # command or path that can be checked against the candidate workspace.
         raise GovernanceBlockerError("BUILDER_CAPABILITY_BREACH")
     for value in explicit_paths:
         if not _path_inside(value, workspace):
@@ -641,6 +777,13 @@ def _exception_supervision(exc: BaseException) -> dict[str, Any] | None:
     visited: set[int] = set()
     while current is not None and id(current) not in visited:
         visited.add(id(current))
+        is_flood = isinstance(current, AgentExecutionError) and (
+            "log limit exceeded" in str(current).lower()
+            or (
+                bool(current.args)
+                and "log limit exceeded" in str(current.args[0]).lower()
+            )
+        )
         evidence = getattr(current, "supervision", None)
         if evidence is None:
             details = getattr(current, "details", None)
@@ -656,10 +799,11 @@ def _exception_supervision(exc: BaseException) -> dict[str, Any] | None:
                 quiescent = _object_value(evidence, "quiescent")
             if quiescent is not None:
                 values["quiescent"] = bool(quiescent)
-            for key in ("timeout_event", "term_event", "kill_event", "output_flood"):
+            for key in ("timeout_event", "term_event", "kill_event"):
                 observed = _object_value(evidence, key)
                 if observed is not None:
                     values[key] = bool(observed)
+            values["output_flood"] = is_flood or bool(_object_value(evidence, "output_flood", False))
             return values
         current = current.__cause__ or current.__context__
     return None

@@ -236,6 +236,74 @@ class ControlAdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(GovernanceBlockerError, expected):
                     self.execute(role_name, supervisor)
 
+    def test_nested_structural_authority_cases_block_planner_and_reviewer(self):
+        cases = (
+            {"type": "item.completed", "item": {"shell_command": "touch candidate.py"}},
+            {
+                "type": "item.completed",
+                "item": {"mcp_tool_call": {"server": "x", "tool_name": "execute"}},
+            },
+            {"type": "response.completed", "response": {"function_call": {"arguments": "{}"}}},
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [{"type": "future_write", "path": "candidate.py", "content": "changed"}],
+                },
+            },
+        )
+        for event in cases:
+            for role_name in ("planner", "reviewer"):
+                with self.subTest(role_name=role_name, event=event):
+                    supervisor = FakeSupervisor(events=[
+                        {"type": "thread.started", "thread_id": SESSION_ID},
+                        event,
+                    ])
+                    expected = f"{role_name.upper()}_CAPABILITY_BREACH"
+                    with self.assertRaisesRegex(GovernanceBlockerError, expected):
+                        self.execute(role_name, supervisor)
+
+    def test_deeply_nested_unknown_authority_structure_is_blocked(self):
+        event = {
+            "type": "item.completed",
+            "item": {
+                "metadata": {
+                    "details": {
+                        "future_payload": {
+                            "next": {"action": {"payload": "write candidate.py"}},
+                        },
+                    },
+                },
+            },
+        }
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                supervisor = FakeSupervisor(events=[
+                    {"type": "thread.started", "thread_id": SESSION_ID},
+                    event,
+                ])
+                with self.assertRaisesRegex(
+                    GovernanceBlockerError,
+                    f"{role_name.upper()}_CAPABILITY_BREACH",
+                ):
+                    self.execute(role_name, supervisor)
+
+    def test_unknown_primitive_metadata_and_informational_lifecycle_events_pass(self):
+        supervisor = FakeSupervisor(events=[
+            {"type": "thread.started", "thread_id": SESSION_ID},
+            {
+                "type": "item.updated",
+                "item": {"metadata": {"phase": "planning", "count": 1, "complete": False}},
+            },
+            {"type": "turn.started", "turn_id": "turn-1"},
+            {"type": "turn.completed", "status": "ok"},
+            {"type": "thread.completed", "reason": "done"},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_tokens": 5}}},
+        ])
+        for role_name in ("planner", "reviewer"):
+            with self.subTest(role_name=role_name):
+                receipt = self.execute(role_name, supervisor)
+                self.assertEqual(receipt.disposition, "SUCCESS")
+
     def test_envelope_command_without_item_type_blocks_planner_and_reviewer(self):
         for role_name in ("planner", "reviewer"):
             with self.subTest(role_name=role_name):
@@ -384,6 +452,37 @@ class ControlAdapterTests(unittest.TestCase):
         self.assertEqual(len(evidence_files), 1)
         failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
         self.assertTrue(failure_record["supervision"]["kill_event"])
+
+    def test_output_flood_exception_is_persisted_as_output_flood(self):
+        supervision = SupervisionEvidence(1, 1, final_group_quiescent=False)
+        supervisor = FakeSupervisor(
+            error=AgentExecutionError(
+                "Process log limit exceeded while streaming",
+                {"supervision": supervision},
+            ),
+        )
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        with self.assertRaises(AgentExecutionError):
+            self.execute("builder", supervisor, evidence_dir=evidence_dir)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertTrue(failure_record["supervision"]["output_flood"])
+
+    def test_unrelated_supervision_exception_is_not_output_flood(self):
+        supervision = SupervisionEvidence(1, 1, final_group_quiescent=False)
+        supervisor = FakeSupervisor(
+            error=AgentExecutionError("Some other process failure", {"supervision": supervision}),
+        )
+        evidence_dir = Path(self.temp.name) / "evidence"
+        evidence_dir.mkdir()
+        with self.assertRaises(AgentExecutionError):
+            self.execute("builder", supervisor, evidence_dir=evidence_dir)
+        evidence_files = list(evidence_dir.glob("*.evidence.json"))
+        self.assertEqual(len(evidence_files), 1)
+        failure_record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertFalse(failure_record["supervision"]["output_flood"])
 
     def test_builder_valid_completion_succeeds(self):
         supervisor = FakeSupervisor(completion=self.completion())
