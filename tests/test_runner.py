@@ -16,11 +16,14 @@ from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 from prj226_runner.runner import (
     RoleConfig,
     _safe_relative_path,
+    _validate_confinement_overlap,
     _fresh_reviewer_env,
     _parse_reviewer_result,
+    build_confined_sandbox_profile,
     build_builder_invocation,
     build_reviewer_invocation,
     candidate_branch_name,
+    encode_sbpl_string,
     inspect_packet,
     load_config,
     parse_task_packet,
@@ -137,6 +140,66 @@ class TestHarn001Runner(unittest.TestCase):
                     authority={},
                     test_commands=[[sys.executable, "-c", "pass"]],
                 )
+
+    def test_confinement_overlap_is_bidirectional(self) -> None:
+        candidate = self.root / "candidate"
+        canonical = self.root / "canonical"
+        disjoint = self.root / "scratch"
+        candidate_container = self.root / "candidate-container"
+        canonical_container = self.root / "canonical-container"
+        cases = (
+            ("scratch inside candidate", candidate, canonical, candidate / "scratch"),
+            ("scratch inside canonical", candidate, canonical, canonical / "scratch"),
+            ("candidate inside scratch", candidate_container / "nested", canonical, candidate_container),
+            ("canonical inside scratch", candidate, canonical_container / "nested", canonical_container),
+            ("scratch equals candidate", candidate, canonical, candidate),
+            ("scratch equals canonical", candidate, canonical, canonical),
+        )
+        for name, repo_candidate, repo_canonical, scratch in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(GovernanceBlockerError, "overlap"):
+                    _validate_confinement_overlap(
+                        [repo_candidate, repo_canonical],
+                        [scratch, scratch / "home"],
+                    )
+
+        repositories, writable = _validate_confinement_overlap(
+            [candidate, canonical], [disjoint, disjoint / "home"]
+        )
+        self.assertEqual(repositories, [candidate.resolve(), canonical.resolve()])
+        self.assertEqual(writable, [disjoint.resolve(), (disjoint / "home").resolve()])
+
+    def test_sbpl_paths_with_spaces_and_parentheses_are_quoted(self) -> None:
+        path = "/private/tmp/path with (parentheses)"
+        encoded = encode_sbpl_string(path)
+        self.assertEqual(encoded, '"/private/tmp/path with (parentheses)"')
+        profile = build_confined_sandbox_profile(
+            [self.root / "candidate"], [Path(path), Path(path) / "home"]
+        )
+        self.assertIn(f"(subpath {encoded})", profile)
+
+    def test_sbpl_quotes_and_backslashes_are_escaped(self) -> None:
+        path = r'/private/tmp/quote"and\slash (safe)'
+        self.assertEqual(
+            encode_sbpl_string(path),
+            '"/private/tmp/quote\\"and\\\\slash (safe)"',
+        )
+
+    def test_sbpl_rejects_nul_and_newline(self) -> None:
+        for value in ("/private/tmp/bad\x00path", "/private/tmp/bad\npath", "/private/tmp/bad\rpath"):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(GovernanceBlockerError):
+                    encode_sbpl_string(value)
+
+    def test_sbpl_rule_injection_attempt_remains_one_quoted_subpath(self) -> None:
+        malicious = '/private/tmp/evil") (allow file-write* (subpath "/outside'
+        encoded = encode_sbpl_string(malicious)
+        profile = build_confined_sandbox_profile(
+            [self.root / "candidate"], [Path(malicious)]
+        )
+        self.assertIn(f"(subpath {encoded})", profile)
+        self.assertNotIn('(subpath "/outside")', profile)
+        self.assertEqual(profile.count("\n(allow file-write*"), 1)
 
     @unittest.skipUnless(
         sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"),

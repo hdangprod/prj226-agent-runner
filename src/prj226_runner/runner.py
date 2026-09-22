@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -556,6 +557,124 @@ def verify_strict_candidate_authority(
     verify_candidate_authority(Path(repo), authority, expected_ref=expected_ref)
 
 
+_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def encode_sbpl_string(value: str) -> str:
+    """Encode a value as a deterministic, quoted SBPL string literal."""
+    if not isinstance(value, str):
+        raise GovernanceBlockerError("SBPL string literal must be a string")
+    if "\x00" in value:
+        raise GovernanceBlockerError("SBPL string literal contains NUL")
+    if "\n" in value or "\r" in value:
+        raise GovernanceBlockerError("SBPL string literal contains a newline")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+# Keep the private spelling available to integrations that treat these policy
+# helpers as implementation-level runner primitives.
+_encode_sbpl_string = encode_sbpl_string
+
+
+def _resolved_paths(values: Iterable[Path | str], label: str) -> list[Path]:
+    resolved: list[Path] = []
+    for value in values:
+        try:
+            path = Path(value).resolve()
+        except (OSError, TypeError, ValueError) as exc:
+            raise GovernanceBlockerError(f"{label} contains an invalid path") from exc
+        if not path.is_absolute():  # pragma: no cover - Path.resolve() is absolute
+            raise GovernanceBlockerError(f"{label} must resolve to an absolute path")
+        resolved.append(path)
+    if not resolved:
+        raise GovernanceBlockerError(f"{label} must not be empty")
+    return resolved
+
+
+def _validate_confinement_overlap(
+    repository_roots: Iterable[Path | str],
+    writable_roots: Iterable[Path | str],
+) -> tuple[list[Path], list[Path]]:
+    """Require every writable root to be disjoint from every repository root."""
+    repositories = _resolved_paths(repository_roots, "Repository roots")
+    writable = _resolved_paths(writable_roots, "Writable roots")
+    for repository in repositories:
+        for root in writable:
+            if (
+                repository == root
+                or repository.is_relative_to(root)
+                or root.is_relative_to(repository)
+            ):
+                raise GovernanceBlockerError(
+                    "VERIFIER_SECURITY_VIOLATION: repository and writable roots overlap"
+                )
+    return repositories, writable
+
+
+def _require_qualified_sandbox() -> None:
+    if sys.platform != "darwin" or not os.path.exists(_SANDBOX_EXEC):
+        raise GovernanceBlockerError(
+            "UNSUPPORTED_VERIFIER_CONFINEMENT: Host does not provide qualified /usr/bin/sandbox-exec"
+        )
+
+
+def build_confined_sandbox_profile(
+    repository_roots: Iterable[Path | str],
+    writable_roots: Iterable[Path | str],
+) -> str:
+    """Build the strict verifier SBPL profile after validating its path boundary."""
+    _repositories, writable = _validate_confinement_overlap(repository_roots, writable_roots)
+    subpaths = "\n    ".join(
+        f"(subpath {encode_sbpl_string(str(root))})" for root in writable
+    )
+    return f"""(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+    {subpaths}
+)
+(allow file-write-data
+    (literal \"/dev/null\")
+    (literal \"/dev/zero\")
+    (literal \"/dev/dtracehelper\")
+    (literal \"/dev/tty\")
+    (literal \"/dev/ptmx\")
+)
+"""
+
+
+def execute_confined_command(
+    command: Sequence[str],
+    *,
+    cwd: Path | str,
+    timeout: float | None,
+    env: Mapping[str, str] | None,
+    repository_roots: Iterable[Path | str],
+    writable_roots: Iterable[Path | str],
+    supervisor: SupervisedProcessRunner | None = None,
+) -> Any:
+    """Execute one command under the qualified macOS verifier confinement."""
+    _require_qualified_sandbox()
+    argv = list(command)
+    if not argv or not all(isinstance(arg, str) and arg for arg in argv):
+        raise ArtifactValidationError("Confined commands must be non-empty argv arrays")
+    profile = build_confined_sandbox_profile(repository_roots, writable_roots)
+    runner = supervisor or SupervisedProcessRunner(
+        stdout_limit=10 * 1024 * 1024,
+        stderr_limit=10 * 1024 * 1024,
+    )
+    result = runner.run(
+        [_SANDBOX_EXEC, "-p", profile, *argv],
+        cwd=str(Path(cwd).resolve()),
+        timeout=timeout,
+        env=dict(env) if env is not None else None,
+    )
+    if result.returncode == 71 and b"sandbox_apply" in result.stderr:
+        raise GovernanceBlockerError("VERIFIER_SECURITY_VIOLATION: sandbox-exec could not apply confinement")
+    return result
+
+
 def run_strict_verifier(
     worktree: Path | str,
     *,
@@ -575,56 +694,50 @@ def run_strict_verifier(
     A nonzero approved command is an implementation failure eligible for
     assessment; timeout, authority drift, and canonical drift are blockers.
     """
-    if sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"):
-        raise GovernanceBlockerError(
-            "UNSUPPORTED_VERIFIER_CONFINEMENT: Host does not provide qualified /usr/bin/sandbox-exec"
-        )
+    _require_qualified_sandbox()
     candidate_path = Path(worktree).resolve()
     if not candidate_path.is_dir():
         raise GovernanceBlockerError("Strict verifier candidate worktree is missing")
-    scratch_temp = Path(runtime_directories[0]).resolve() if runtime_directories else candidate_path / ".verifier_tmp"
+    owns_scratch = not runtime_directories
+    scratch_temp = (
+        Path(runtime_directories[0]).resolve()
+        if runtime_directories
+        else Path(tempfile.mkdtemp(prefix="prj226-verifier-"))
+    )
     scratch_home = scratch_temp / "home"
-    writable_roots = [str(scratch_temp.resolve()), str(scratch_home.resolve())]
-    candidate_resolved = str(candidate_path.resolve())
-    for root in writable_roots:
-        if candidate_resolved == root or candidate_resolved.startswith(root + "/"):
-            raise GovernanceBlockerError("VERIFIER_SECURITY_VIOLATION: Candidate worktree overlaps writable root")
+    repository_roots: list[Path] = [candidate_path]
     if canonical_repository is not None:
-        canonical_resolved = str(Path(canonical_repository).resolve())
-        for root in writable_roots:
-            if canonical_resolved == root or canonical_resolved.startswith(root + "/"):
-                raise GovernanceBlockerError("VERIFIER_SECURITY_VIOLATION: Canonical repository overlaps writable root")
-    subpaths = "\n    ".join(f'(subpath "{root}")' for root in writable_roots)
-    profile = f"""(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-    {subpaths}
-)
-(allow file-write-data
-    (literal "/dev/null")
-    (literal "/dev/zero")
-    (literal "/dev/dtracehelper")
-    (literal "/dev/tty")
-    (literal "/dev/ptmx")
-)
-"""
-    from prj226_runner.candidate_authority import verify_candidate_authority
-    verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
-    if canonical_repository is not None:
-        canonical = Path(canonical_repository).resolve()
-        if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
-            raise GovernanceBlockerError("Canonical baseline drift")
-        if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
-            raise GovernanceBlockerError("Canonical baseline drift")
-        if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
-            raise GovernanceBlockerError("Canonical baseline drift")
-        if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
-            raise GovernanceBlockerError("Canonical baseline drift")
-    if not isinstance(test_commands, Sequence) or not test_commands:
-        raise ArtifactValidationError("Strict verifier requires at least one test command")
-    scratch_temp.mkdir(parents=True, exist_ok=True)
-    scratch_home.mkdir(parents=True, exist_ok=True)
+        repository_roots.append(Path(canonical_repository).resolve())
+    writable_roots = [scratch_temp, scratch_home]
+
+    def cleanup_scratch() -> None:
+        shutil.rmtree(scratch_temp, ignore_errors=True)
+
+    # Validate before creating the configured scratch directory.  In
+    # particular, a scratch path nested in either repository is never made
+    # writable as a side effect of verifier setup.
+    try:
+        _validate_confinement_overlap(repository_roots, writable_roots)
+        from prj226_runner.candidate_authority import verify_candidate_authority
+        verify_candidate_authority(candidate_path, authority, expected_ref=candidate_ref)
+        if canonical_repository is not None:
+            canonical = Path(canonical_repository).resolve()
+            if canonical_branch is not None and _git(canonical, ["branch", "--show-current"]) != canonical_branch:
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if _git(canonical, ["rev-parse", "HEAD"]).lower() != baseline_head.lower():
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if baseline_tree is not None and _git(canonical, ["rev-parse", "HEAD^{tree}"]).lower() != baseline_tree.lower():
+                raise GovernanceBlockerError("Canonical baseline drift")
+            if _git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"]):
+                raise GovernanceBlockerError("Canonical baseline drift")
+        if not isinstance(test_commands, Sequence) or not test_commands:
+            raise ArtifactValidationError("Strict verifier requires at least one test command")
+        scratch_temp.mkdir(parents=True, exist_ok=True)
+        scratch_home.mkdir(parents=True, exist_ok=True)
+    except BaseException:
+        if owns_scratch:
+            cleanup_scratch()
+        raise
     results: list[dict[str, Any]] = []
     supervisor = SupervisedProcessRunner(
         stdout_limit=10 * 1024 * 1024,
@@ -643,24 +756,23 @@ def run_strict_verifier(
         scratch_temp.mkdir(parents=True, exist_ok=True)
         scratch_home.mkdir(parents=True, exist_ok=True)
 
-    def cleanup_scratch() -> None:
-        shutil.rmtree(scratch_temp, ignore_errors=True)
-
-    def confined(command: Sequence[str]) -> list[str]:
-        return ["/usr/bin/sandbox-exec", "-p", profile, *command]
-
     try:
         for index, command in enumerate(test_commands, 1):
             argv = list(command)
             if not argv or not all(isinstance(arg, str) and arg for arg in argv):
                 raise ArtifactValidationError("Strict verifier commands must be non-empty argv arrays")
             try:
-                result = supervisor.run(
-                    confined(argv),
+                result = execute_confined_command(
+                    argv,
                     cwd=str(candidate_path),
                     timeout=timeout_seconds,
                     env=verifier_env,
+                    repository_roots=repository_roots,
+                    writable_roots=writable_roots,
+                    supervisor=supervisor,
                 )
+            except GovernanceBlockerError:
+                raise
             except Exception as exc:
                 message = str(exc).lower()
                 if "log limit" in message or "output flood" in message:
@@ -693,10 +805,14 @@ def run_strict_verifier(
                 return {"ok": False, "status": "FAIL", "eligible_repair": True, "reason": "DETERMINISTIC_TEST_FAILURE", "tests": results}
             prepare_scratch()
         prepare_scratch()
-        diff = supervisor.run(
-            confined(["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"]),
-            cwd=str(candidate_path), timeout=30,
+        diff = execute_confined_command(
+            ["git", "-C", str(candidate_path), "diff", "--check", f"{baseline_head}..{candidate_head}"],
+            cwd=str(candidate_path),
+            timeout=30,
             env=verifier_env,
+            repository_roots=repository_roots,
+            writable_roots=writable_roots,
+            supervisor=supervisor,
         )
         cleanup_scratch()
         if diff.supervision.timeout_event:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import errno
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,9 +13,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from prj226_runner.control import DurableController, StrictExecutionController
+from prj226_runner.control import DurableController, StrictExecutionController, _read_first_journal_line
 from prj226_runner.control_protocol import STRICT_VERSION, _validate_strict_binding, strict_gate_binding
 from prj226_runner.errors import ArtifactValidationError
+
+
+def sandbox_is_usable() -> bool:
+    if sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"):
+        return False
+    probe = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-p", "(version 1) (allow default)", sys.executable, "-c", "pass"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
 
 
 def git(repo: Path, *args: str) -> str:
@@ -95,6 +108,10 @@ class StrictLifecycleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def require_sandbox(self) -> None:
+        if not sandbox_is_usable():
+            self.skipTest("sandbox-exec cannot be applied by this host runner")
+
     def controller(self, **kwargs):
         runtime = {"roles": {
             "planner": {"profile_ref": "planner-profile"},
@@ -127,6 +144,7 @@ class StrictLifecycleTests(unittest.TestCase):
         self.assertEqual(controller.state()["terminal_reason"], "INTEGRATION_PREPARED_ONLY")
 
     def test_full_lifecycle_and_gate_bindings(self) -> None:
+        self.require_sandbox()
         controller = self.controller()
         self.assertEqual(controller.state()["schema_version"], STRICT_VERSION)
         self.reach_gate_a(controller)
@@ -139,11 +157,12 @@ class StrictLifecycleTests(unittest.TestCase):
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
     def test_deterministic_failure_repairs_with_fresh_attempt(self) -> None:
-        marker = self.root / "verification-count"
+        self.require_sandbox()
         command = [sys.executable, "-c", (
-            "from pathlib import Path; p=Path(%r); n=int(p.read_text()) if p.exists() else 0; "
+            "import os; from pathlib import Path; p=Path(os.environ['TMPDIR']) / 'verification-count'; "
+            "n=int(p.read_text()) if p.exists() else 0; "
             "p.write_text(str(n+1)); raise SystemExit(1 if n == 0 else 0)"
-        ) % str(marker)]
+        )]
         controller = self.controller(contract={"commit_message": "candidate", "acceptance_instruments": [command]})
         self.reach_gate_a(controller)
         report = controller.resume()
@@ -156,7 +175,56 @@ class StrictLifecycleTests(unittest.TestCase):
         self.approve(controller)
         self.assertEqual(controller.state()["phase"], "COMPLETE")
 
+    @unittest.skipUnless(sandbox_is_usable(), "qualified sandbox-exec is required")
+    def test_production_verifier_confines_repositories_scratch_and_descendant(self) -> None:
+        canonical_target = self.repo / "production-canonical-write.txt"
+        child_target = self.root / "production-child-write.txt"
+        child_script = (
+            "import errno, pathlib, sys\n"
+            "target = pathlib.Path(sys.argv[1])\n"
+            "try:\n"
+            "    target.write_text('blocked')\n"
+            "except OSError as exc:\n"
+            "    if exc.errno != errno.EPERM:\n"
+            "        raise\n"
+            "else:\n"
+            "    raise SystemExit(4)\n"
+        )
+        script = (
+            "import errno, os, pathlib, subprocess, sys\n"
+            "def assert_denied(target):\n"
+            "    try:\n"
+            "        target.write_text('blocked')\n"
+            "    except OSError as exc:\n"
+            "        if exc.errno != errno.EPERM:\n"
+            "            raise\n"
+            "    else:\n"
+            "        raise SystemExit('write unexpectedly succeeded')\n"
+            f"assert_denied(pathlib.Path({str(Path('production-candidate-write.txt'))!r}))\n"
+            f"assert_denied(pathlib.Path({str(canonical_target)!r}))\n"
+            "scratch = pathlib.Path(os.environ['TMPDIR'])\n"
+            "(scratch / 'allowed.txt').write_text('allowed')\n"
+            f"child = subprocess.run([sys.executable, '-c', {child_script!r}, {str(child_target)!r}], check=False)\n"
+            "if child.returncode != 0:\n"
+            "    raise SystemExit(child.returncode)\n"
+        )
+        controller = self.controller(
+            name="production-confinement",
+            contract={"commit_message": "candidate", "acceptance_instruments": [[sys.executable, "-c", script]]},
+        )
+        self.reach_gate_a(controller)
+        report = controller.resume()
+        self.assertEqual(report["status"], "HUMAN_GATE_REQUIRED", report)
+        scratch_target = controller.store.root / "verifier-scratch" / "allowed.txt"
+        candidate_target = Path(controller.state()["candidate"]["worktree"]) / "production-candidate-write.txt"
+        self.assertTrue(scratch_target.is_file())
+        self.assertFalse(canonical_target.exists())
+        self.assertFalse(child_target.exists())
+        self.assertFalse(candidate_target.exists())
+        self.approve(controller)
+
     def test_reviewer_needs_fix_repairs_and_budget_exhaustion_blocks(self) -> None:
+        self.require_sandbox()
         reviewer = ReviewerDouble(["NEEDS_FIX", "PASS"])
         controller = self.controller(reviewer=reviewer)
         self.reach_gate_a(controller)
@@ -239,6 +307,39 @@ class StrictLifecycleTests(unittest.TestCase):
         binding["repair_policy"]["max_repair_cycles"] = 3
         with self.assertRaisesRegex(ArtifactValidationError, "cannot exceed 2"):
             _validate_strict_binding(binding, "GATE_A")
+
+    def test_first_journal_event_streams_through_two_mebibytes(self) -> None:
+        journal = self.root / "streaming-journal.ndjson"
+        for size in (1, 64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024):
+            with self.subTest(size=size):
+                event = b"x" * size
+                journal.write_bytes(event + b"\n" + b"tail")
+                self.assertEqual(_read_first_journal_line(journal), event)
+
+    def test_first_journal_event_over_two_mebibytes_is_rejected(self) -> None:
+        journal = self.root / "oversized-event.ndjson"
+        journal.write_bytes(b"x" * (2 * 1024 * 1024 + 1) + b"\n")
+        with self.assertRaisesRegex(ArtifactValidationError, "2 MiB"):
+            _read_first_journal_line(journal)
+
+    def test_large_journal_with_small_first_event_is_accepted(self) -> None:
+        journal = self.root / "large-journal.ndjson"
+        first_event = json.dumps({"schema_version": STRICT_VERSION}, separators=(",", ":")).encode()
+        journal.write_bytes(first_event + b"\n" + b"x" * (2 * 1024 * 1024))
+        self.assertEqual(_read_first_journal_line(journal), first_event)
+
+    def test_journal_over_sixteen_mebibytes_is_rejected(self) -> None:
+        journal = self.root / "too-large-journal.ndjson"
+        journal.write_bytes(b"{}\n" + b"x" * (16 * 1024 * 1024))
+        with self.assertRaisesRegex(ArtifactValidationError, "bounded"):
+            _read_first_journal_line(journal)
+
+    def test_malformed_first_controller_event_is_rejected(self) -> None:
+        journal_root = self.root / "malformed-journal"
+        journal_root.mkdir()
+        (journal_root / "events.ndjson").write_bytes(b"not-json\n")
+        with self.assertRaises(ArtifactValidationError):
+            DurableController(journal_root)._strict_delegate()
 
     def test_strict_delegate_accepts_journal_between_two_and_sixteen_mebibytes(self) -> None:
         journal_root = self.root / "large-journal"

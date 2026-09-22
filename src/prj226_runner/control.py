@@ -31,7 +31,6 @@ from prj226_runner.codex_reviewer import EvidenceRoot
 from prj226_runner.candidate_authority import build_candidate_authority, verify_candidate_authority
 from prj226_runner.control_runtime import validate_runtime
 from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError, RunnerError
-from prj226_runner.process_supervisor import SupervisedProcessRunner
 
 
 def build_context(state: dict[str, Any], *, attachment: str | None = None,
@@ -151,16 +150,29 @@ def _read_first_journal_line(
     path: Path,
     *,
     max_file_size: int = 16 * 1024 * 1024,
-    max_line_length: int = 64 * 1024,
+    max_line_length: int = 2 * 1024 * 1024,
 ) -> bytes:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_file_size:
             raise ArtifactValidationError("Evidence must be a bounded single-link regular file")
-        chunk = os.read(fd, min(info.st_size, max_line_length))
-        newline_idx = chunk.find(b"\n")
-        return chunk[:newline_idx] if newline_idx != -1 else chunk
+        first_event = bytearray()
+        while True:
+            read_size = min(64 * 1024, max_line_length - len(first_event) + 1)
+            chunk = os.read(fd, read_size)
+            if not chunk:
+                if not first_event:
+                    return b""
+                raise ArtifactValidationError("Incomplete controller journal")
+            newline_idx = chunk.find(b"\n")
+            if newline_idx != -1:
+                if len(first_event) + newline_idx > max_line_length:
+                    raise ArtifactValidationError("Controller journal first event exceeds 2 MiB")
+                return bytes(first_event) + chunk[:newline_idx]
+            first_event.extend(chunk)
+            if len(first_event) > max_line_length:
+                raise ArtifactValidationError("Controller journal first event exceeds 2 MiB")
     finally:
         os.close(fd)
 
@@ -1296,17 +1308,33 @@ class StrictExecutionController:
             return result
         tests = self._test_commands()
         results: list[dict[str, Any]] = []
-        supervisor = SupervisedProcessRunner(
-            stdout_limit=10 * 1024 * 1024,
-            stderr_limit=10 * 1024 * 1024,
-        )
+        canonical = Path(state["baseline"]["repository"]).resolve()
+        scratch_temp = self.store.root / "verifier-scratch"
+        scratch_home = scratch_temp / "home"
+        scratch_temp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        scratch_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        writable_roots = [scratch_temp, scratch_home]
+        repository_roots = [worktree, canonical]
         verifier_env = os.environ.copy()
-        runtime_root = (self._packet_data or {}).get("runtime_root") or (self._runtime_data or {}).get("runtime_root")
-        if isinstance(runtime_root, str) and runtime_root.startswith("/"):
-            verifier_env.update({"TMPDIR": runtime_root, "TMP": runtime_root, "TEMP": runtime_root})
+        verifier_env.update({
+            "TMPDIR": str(scratch_temp),
+            "TMP": str(scratch_temp),
+            "TEMP": str(scratch_temp),
+            "HOME": str(scratch_home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
         for index, argv in enumerate(tests, 1):
             try:
-                completed = supervisor.run(argv, cwd=str(worktree), timeout=300, env=verifier_env)
+                completed = R.execute_confined_command(
+                    argv,
+                    cwd=worktree,
+                    timeout=300,
+                    env=verifier_env,
+                    repository_roots=repository_roots,
+                    writable_roots=writable_roots,
+                )
+            except GovernanceBlockerError:
+                raise
             except Exception as exc:
                 message = str(exc).lower()
                 if "log limit" in message or "output flood" in message:
@@ -1327,9 +1355,13 @@ class StrictExecutionController:
                     "ok": False, "status": "FAIL", "reason": "DETERMINISTIC_TEST_FAILURE",
                     "eligible_repair": True, "tests": results,
                 }
-        check = supervisor.run(
+        check = R.execute_confined_command(
             ["git", "-C", str(worktree), "diff", "--check", f"{state['baseline']['head']}..{candidate['head']}"],
-            cwd=str(worktree), timeout=30, env=verifier_env,
+            cwd=worktree,
+            timeout=30,
+            env=verifier_env,
+            repository_roots=repository_roots,
+            writable_roots=writable_roots,
         )
         if check.supervision.timeout_event:
             return {"ok": False, "status": "BLOCKED", "reason": "TIMEOUT", "eligible_repair": False, "tests": results}
