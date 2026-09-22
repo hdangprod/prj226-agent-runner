@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from prj226_runner.control import DurableController, StrictExecutionController, _read_first_journal_line
 from prj226_runner.control_protocol import STRICT_VERSION, _validate_strict_binding, strict_gate_binding
-from prj226_runner.errors import ArtifactValidationError
+from prj226_runner.errors import ArtifactValidationError, GovernanceBlockerError
 
 
 def sandbox_is_usable() -> bool:
@@ -231,14 +231,69 @@ class StrictLifecycleTests(unittest.TestCase):
         self.finish_gate_b(controller)
         self.assertEqual(reviewer.calls, 2)
 
-        failing_verifier = lambda request: {"status": "FAIL", "eligible_repair": True, "reason": "test"}
-        exhausted = self.controller(name="exhausted", verifier=failing_verifier)
+        exhausted = self.controller(
+            name="exhausted",
+            contract={"commit_message": "candidate", "acceptance_instruments": [[sys.executable, "-c", "raise SystemExit(1)"]]},
+        )
         self.reach_gate_a(exhausted)
         result = exhausted.resume()
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(result["terminal_reason"], "REPAIR_BUDGET_EXHAUSTED")
         self.assertEqual(exhausted.state()["attempt_index"], 2)
         self.assertEqual(self.builder.calls, 5)
+
+    def test_injected_callable_verifier_is_blocked(self) -> None:
+        calls = 0
+
+        def verifier(request):
+            nonlocal calls
+            calls += 1
+            return {"status": "PASS"}
+
+        with self.assertRaisesRegex(GovernanceBlockerError, "UNSUPPORTED_STRICT_VERIFIER_INJECTION"):
+            StrictExecutionController(self.root / "callable-verifier", verifier=verifier)
+
+        controller = self.controller(name="callable-verifier-operation")
+        controller.verifier = verifier
+        with self.assertRaisesRegex(GovernanceBlockerError, "UNSUPPORTED_STRICT_VERIFIER_INJECTION"):
+            controller._verifier_operation({}, {})
+        self.assertEqual(calls, 0)
+
+    def test_injected_object_verifier_is_blocked(self) -> None:
+        class Verifier:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def execute(self, request):
+                self.calls += 1
+                return {"status": "PASS"}
+
+        verifier = Verifier()
+        with self.assertRaisesRegex(GovernanceBlockerError, "UNSUPPORTED_STRICT_VERIFIER_INJECTION"):
+            StrictExecutionController(self.root / "object-verifier", verifier=verifier)
+
+        controller = self.controller(name="object-verifier-operation")
+        controller.verifier = verifier
+        with self.assertRaisesRegex(GovernanceBlockerError, "UNSUPPORTED_STRICT_VERIFIER_INJECTION"):
+            controller._verifier_operation({}, {})
+        self.assertEqual(verifier.calls, 0)
+
+    def test_overlap_blocks_before_mkdir(self) -> None:
+        controller = self.controller(name="overlap")
+        self.reach_gate_a(controller)
+        controller.resume(max_steps=5)
+        state = controller.state()
+        action = state["pending_action"]
+        self.assertIsNotNone(action)
+
+        overlap_target = self.repo / "verifier-overlap-target"
+        scratch_link = controller.store.root / "verifier-scratch"
+        scratch_link.symlink_to(overlap_target, target_is_directory=True)
+        scratch_temp = (controller.store.root / "verifier-scratch").resolve()
+        self.assertFalse(scratch_temp.exists())
+        with self.assertRaisesRegex(GovernanceBlockerError, "overlap|VERIFIER_SECURITY_VIOLATION"):
+            controller._verifier_operation(state, action)
+        self.assertFalse(scratch_temp.exists())
 
     def test_prepared_and_started_recovery_never_replays_started_builder(self) -> None:
         controller = self.controller()

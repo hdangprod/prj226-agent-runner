@@ -670,6 +670,10 @@ class StrictExecutionController:
         verifier: Any = None,
         reviewer: Any = None,
     ) -> None:
+        if verifier is not None:
+            raise GovernanceBlockerError(
+                "UNSUPPORTED_STRICT_VERIFIER_INJECTION: Strict execution does not support injected verifiers; use confined acceptance instruments"
+            )
         self.store = ControlStore(root)
         self.planner = planner
         self.builder = builder
@@ -1282,6 +1286,10 @@ class StrictExecutionController:
         return result
 
     def _verifier_operation(self, state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        if self.verifier is not None:
+            raise GovernanceBlockerError(
+                "UNSUPPORTED_STRICT_VERIFIER_INJECTION: Strict verifier execution must use the qualified confined command path"
+            )
         authority, worktree = self._candidate_authority(state)
         self._baseline(state)
         candidate = state["candidate"]
@@ -1292,29 +1300,16 @@ class StrictExecutionController:
             contract_json=encode(self._contract_data or {}), runtime_json=encode(self._runtime_data or {}),
             candidate_json=encode(candidate),
         )
-        if self.verifier is not None:
-            raw = self.verifier.execute(request) if callable(getattr(self.verifier, "execute", None)) else self.verifier(request) if callable(self.verifier) else None
-            if not isinstance(raw, Mapping):
-                raise ArtifactValidationError("Verifier result must be a JSON object")
-            result = _strict_jsonable(dict(raw))
-            status = result.get("status", result.get("verdict"))
-            if status not in {"PASS", "FAIL", "BLOCKED"}:
-                raise ArtifactValidationError("Verifier result must be PASS, FAIL, or BLOCKED")
-            result["status"] = status
-            if status == "FAIL":
-                result.setdefault("eligible_repair", True)
-            result["ok"] = status != "BLOCKED"
-            verify_candidate_authority(worktree, authority, expected_ref=candidate["ref"])
-            return result
         tests = self._test_commands()
         results: list[dict[str, Any]] = []
         canonical = Path(state["baseline"]["repository"]).resolve()
-        scratch_temp = self.store.root / "verifier-scratch"
-        scratch_home = scratch_temp / "home"
+        repository_roots = [worktree, canonical]
+        scratch_temp = (self.store.root / "verifier-scratch").resolve()
+        scratch_home = (scratch_temp / "home").resolve()
+        writable_roots = [scratch_temp, scratch_home]
+        R._validate_confinement_overlap(repository_roots, writable_roots)
         scratch_temp.mkdir(mode=0o700, parents=True, exist_ok=True)
         scratch_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-        writable_roots = [scratch_temp, scratch_home]
-        repository_roots = [worktree, canonical]
         verifier_env = os.environ.copy()
         verifier_env.update({
             "TMPDIR": str(scratch_temp),
